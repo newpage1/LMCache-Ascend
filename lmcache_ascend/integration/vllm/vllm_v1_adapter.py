@@ -108,7 +108,26 @@ def init_lmcache_engine(
         )
 
     # construct kv shape (for mem pool)
-    num_layer = model_config.get_num_layers(parallel_config)
+    # NOTE: For hybrid attention models (e.g., Qwen3.5-122B-A10B), only
+    # full_attention layers use traditional KV cache. linear_attention
+    # layers use MambaSpec (stateful) and should be excluded from caching.
+    hf_config = model_config.hf_config
+    layer_types = getattr(hf_config, "layer_types", None)
+
+    if layer_types is not None:
+        full_attention_indices = [
+            i for i, lt in enumerate(layer_types) if lt == "full_attention"
+        ]
+        num_layer = len(full_attention_indices)
+        logger.info(
+            f"Hybrid attention detected: {len(layer_types)} total layers, "
+            f"{num_layer} full_attention layers at indices "
+            f"{full_attention_indices}"
+        )
+    else:
+        full_attention_indices = None
+        num_layer = model_config.get_num_layers(parallel_config)
+
     num_draft_layers = _calculate_draft_layers(vllm_config, model_config)
     num_layer += num_draft_layers
     chunk_size = lmcache_config.chunk_size
@@ -120,7 +139,8 @@ def init_lmcache_engine(
         f"num_layer: {num_layer}, chunk_size: {chunk_size}, "
         f"num_kv_head (per gpu): {num_kv_head}, head_size: {head_size}, "
         f"hidden_dim (D) for KV (per gpu): {num_kv_head * head_size}, "
-        f"use mla: {use_mla}, kv shape: {kv_shape}, num_draft_layers:{num_draft_layers}"
+        f"use mla: {use_mla}, kv shape: {kv_shape}, "
+        f"num_draft_layers:{num_draft_layers}"
     )
 
     # Change current device.
@@ -149,6 +169,11 @@ def init_lmcache_engine(
             "We haven't supported MLA with Cacheblend yet. Please disable blending."
         )
 
+    # Common kwargs for connector creation (hybrid attention layer mapping)
+    connector_kwargs = {
+        "full_attention_indices": full_attention_indices,
+    }
+
     if role == "scheduler":
         vllm_gpu_connector = None
         # Create a dummy tpg object with broadcast and broadcast_object methods
@@ -159,11 +184,11 @@ def init_lmcache_engine(
         if lmcache_config.enable_blending:
             # Use layerwise connector for blending
             vllm_gpu_connector = VLLMBufferLayerwiseNPUConnector.from_metadata(
-                metadata, use_gpu, device
+                metadata, use_gpu, device, **connector_kwargs
             )
         else:
             vllm_gpu_connector = VLLMPagedMemLayerwiseNPUConnector.from_metadata(
-                metadata, use_gpu, device
+                metadata, use_gpu, device, **connector_kwargs
             )
         tpg = get_tp_group()
     else:
@@ -174,7 +199,7 @@ def init_lmcache_engine(
             )
         else:
             vllm_gpu_connector = VLLMPagedMemNPUConnectorV2.from_metadata(
-                metadata, use_gpu, device
+                metadata, use_gpu, device, **connector_kwargs
             )
         tpg = get_tp_group()
 

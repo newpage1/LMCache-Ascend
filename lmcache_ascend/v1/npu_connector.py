@@ -131,6 +131,12 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
         self.use_mla = bool(kwargs.get("use_mla", False))
         self.fused_rotary_emb: Any = None
 
+        # Hybrid attention: maps connector layer index to actual kv_caches index.
+        # None means all layers are full_attention (non-hybrid model).
+        self.full_attention_indices: Optional[List[int]] = kwargs.get(
+            "full_attention_indices", None
+        )
+
     def _lazy_initialize_buffer(self, kv_caches):
         """
         Lazily initialize the GPU buffer allocator if it is not initialized yet.
@@ -145,16 +151,24 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
             # is okay since fragmentation shouldn't exist in the `gpu_buffer_allocator`
             # in layerwise mode.
 
-            self.kv_format = KVCacheFormat.detect(kv_caches)
+            # Filter kv_caches for hybrid attention models
+            if self.full_attention_indices is not None:
+                filtered_kv_caches = [kv_caches[i] for i in self.full_attention_indices]
+            else:
+                filtered_kv_caches = kv_caches
+
+            self.kv_format = KVCacheFormat.detect(filtered_kv_caches)
             if self.kv_format == KVCacheFormat.UNDEFINED:
                 raise ValueError("Could not detect KV cache format.")
 
             ref_tensor = (
-                kv_caches[0][0] if self.kv_format.is_separate_format() else kv_caches[0]
+                filtered_kv_caches[0][0]
+                if self.kv_format.is_separate_format()
+                else filtered_kv_caches[0]
             )
             self.kv_device = ref_tensor.device
 
-            first_layer_cache = kv_caches[0]
+            first_layer_cache = filtered_kv_caches[0]
 
             # flash attention: [num_layers, 2, num_blocks,
             # block_size, num_heads, head_size]
@@ -214,7 +228,14 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
 
-        self._lazy_initialize_buffer(self.kvcaches)
+        # For hybrid attention, filter kvcaches to only full_attention layers
+        if self.full_attention_indices is not None:
+            filtered_kvcaches = [self.kvcaches[i] for i in self.full_attention_indices]
+        else:
+            filtered_kvcaches = self.kvcaches
+
+        self._lazy_initialize_buffer(filtered_kvcaches)
+        self._filtered_kvcaches = filtered_kvcaches
         return kwargs["slot_mapping"]
 
     def _get_full_slot_mapping(
@@ -320,7 +341,7 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
             if layer_id > 1:
                 lmc_ops.single_layer_kv_transfer(
                     self.buffer_mapping[layer_id - 2].tensor,
-                    self.kvcaches[layer_id - 2],
+                    self._filtered_kvcaches[layer_id - 2],
                     slot_mapping_full,
                     False,
                     self.kv_format.value,
@@ -460,7 +481,7 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
 
                 lmc_ops.single_layer_kv_transfer(
                     tmp_gpu_buffer_obj.tensor,
-                    self.kvcaches[layer_id],
+                    self._filtered_kvcaches[layer_id],
                     slot_mapping_full,
                     True,
                     self.kv_format.value,
@@ -513,6 +534,12 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
 
         self.kv_format: KVCacheFormat = KVCacheFormat.UNDEFINED
 
+        # Hybrid attention: maps connector layer index to actual kv_caches index.
+        # None means all layers are full_attention (non-hybrid model).
+        self.full_attention_indices: Optional[List[int]] = kwargs.get(
+            "full_attention_indices", None
+        )
+
         if is_310p():
             assert "num_kv_head" in kwargs, ("num_kv_head should be provided in 310p",)
             assert "head_size" in kwargs, ("head_size should be provided in 310p",)
@@ -527,6 +554,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         metadata: LMCacheEngineMetadata,
         use_gpu: bool = False,
         device: Optional[torch.device] = None,
+        **kwargs,
     ) -> "VLLMPagedMemGPUConnectorV2":
         """Create a connector from LMCacheEngineMetadata.
 
@@ -534,6 +562,9 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             metadata: The LMCache engine metadata containing model configuration.
             use_gpu: Whether to use GPU intermediate buffer.
             device: The device to use for the connector.
+            **kwargs: Additional keyword arguments passed to the constructor.
+                full_attention_indices: Optional list of layer indices for
+                    full_attention layers in hybrid attention models.
 
         Returns:
             A new instance of VLLMPagedMemGPUConnectorV2.
@@ -556,10 +587,18 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             use_mla=metadata.use_mla,
             num_kv_head=num_kv_head,
             head_size=head_size,
+            **kwargs,
         )
 
     def _initialize_pointers(self, kv_caches: List[torch.Tensor]) -> torch.Tensor:
-        self.kv_format = KVCacheFormat.detect(kv_caches, use_mla=self.use_mla)
+        # For hybrid attention models, filter kv_caches to only
+        # full_attention layers before building pointer arrays.
+        if self.full_attention_indices is not None:
+            filtered_kv_caches = [kv_caches[i] for i in self.full_attention_indices]
+        else:
+            filtered_kv_caches = kv_caches
+
+        self.kv_format = KVCacheFormat.detect(filtered_kv_caches, use_mla=self.use_mla)
 
         if self.kv_format == KVCacheFormat.UNDEFINED:
             raise ValueError(
@@ -568,9 +607,9 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             )
 
         if self.kv_format.is_separate_format():
-            self.kvcaches_device = kv_caches[0][0].device
+            self.kvcaches_device = filtered_kv_caches[0][0].device
         else:
-            self.kvcaches_device = kv_caches[0].device
+            self.kvcaches_device = filtered_kv_caches[0].device
 
         assert self.kvcaches_device.type == "npu", "The device should be Ascend NPU."
         idx = self.kvcaches_device.index
@@ -581,7 +620,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         if self.kv_format == KVCacheFormat.SEPARATE_KV:
             self.kv_size = 2
             pointers_list = []
-            for k, v in kv_caches:
+            for k, v in filtered_kv_caches:
                 pointers_list.append(k.data_ptr())
                 pointers_list.append(v.data_ptr())
 
@@ -590,7 +629,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             )
         else:
             self.kv_size = 1
-            pointers_list = [t.data_ptr() for t in kv_caches]
+            pointers_list = [t.data_ptr() for t in filtered_kv_caches]
 
             self.kv_cache_pointers = torch.empty(
                 self.num_layers, dtype=torch.int64, device="cpu"
@@ -605,13 +644,17 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         self.kv_cache_pointers_on_gpu[idx].copy_(self.kv_cache_pointers)
 
         first_tensor = (
-            kv_caches[0][0] if self.kv_format.is_separate_format() else kv_caches[0]
+            filtered_kv_caches[0][0]
+            if self.kv_format.is_separate_format()
+            else filtered_kv_caches[0]
         )
 
         if self.use_mla:
             # kv_caches[0].shape: [num_pages, page_size, head_size]
             # kv_caches[0].shape: [1, num_pages, page_size, head_size] (vllm-Ascend)
-            self.page_buffer_size = kv_caches[0].shape[-3] * kv_caches[0].shape[-2]
+            self.page_buffer_size = (
+                filtered_kv_caches[0].shape[-3] * filtered_kv_caches[0].shape[-2]
+            )
         else:
             if self.kv_format == KVCacheFormat.SEPARATE_KV:
                 # kv_caches[0]: [tuple(k,v)]
@@ -1107,6 +1150,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         # layerwise mode currently does not support MLA
         self.use_mla = kwargs.get("use_mla", False)
 
+        # Hybrid attention: maps connector layer index to actual kv_caches index.
+        # None means all layers are full_attention (non-hybrid model).
+        self.full_attention_indices: Optional[List[int]] = kwargs.get(
+            "full_attention_indices", None
+        )
+
     def _lazy_initialize_buffer(self, kv_caches):
         """
         Lazily initialize the GPU buffer allocator if it is not initialized yet.
@@ -1122,7 +1171,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if self.use_gpu and self.gpu_buffer_allocator is None:
             logger.info("Lazily initializing GPU buffer.")
 
-            self.kv_format = KVCacheFormat.detect(kv_caches, use_mla=self.use_mla)
+            # Filter kv_caches for hybrid attention models
+            if self.full_attention_indices is not None:
+                filtered_kv_caches = [kv_caches[i] for i in self.full_attention_indices]
+            else:
+                filtered_kv_caches = kv_caches
+
+            self.kv_format = KVCacheFormat.detect(
+                filtered_kv_caches, use_mla=self.use_mla
+            )
 
             if self.kv_format == KVCacheFormat.UNDEFINED:
                 raise ValueError(
@@ -1132,7 +1189,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
             logger.info(f"Detected KV cache format: {self.kv_format.name}")
 
-            first_layer_cache = kv_caches[0]
+            first_layer_cache = filtered_kv_caches[0]
 
             if self.kv_format == KVCacheFormat.SEPARATE_KV:
                 key_tensor = first_layer_cache[0]
@@ -1218,7 +1275,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         sync: bool = kwargs["sync"]
 
-        self._lazy_initialize_buffer(self.kvcaches)
+        # For hybrid attention, filter kvcaches to only full_attention layers
+        if self.full_attention_indices is not None:
+            filtered_kvcaches = [self.kvcaches[i] for i in self.full_attention_indices]
+        else:
+            filtered_kvcaches = self.kvcaches
+
+        self._lazy_initialize_buffer(filtered_kvcaches)
 
         slot_mapping_chunks = []
         for start, end in zip(starts, ends, strict=False):
@@ -1272,7 +1335,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     lmc_ops.batched_fused_single_layer_kv_transfer(
                         cpu_tensors,  # CPU memory objects
                         tmp_gpu_buffer_obj.tensor,  # GPU staging buffer
-                        self.kvcaches[layer_id],
+                        filtered_kvcaches[layer_id],
                         slot_mapping_full,
                         chunk_offsets,  # offset for each chunk
                         chunk_sizes,  # size for each chunk
@@ -1290,7 +1353,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
                         lmc_ops.single_layer_kv_transfer(
                             memory_obj.tensor,
-                            self.kvcaches[layer_id],
+                            filtered_kvcaches[layer_id],
                             slot_mapping[start:end],
                             False,
                             self.kv_format.value,  # 1:MERGED_KV / 2:SEPARATE_KV
@@ -1354,7 +1417,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         sync: bool = kwargs["sync"]
 
-        self._lazy_initialize_buffer(self.kvcaches)
+        # For hybrid attention, filter kvcaches to only full_attention layers
+        if self.full_attention_indices is not None:
+            filtered_kvcaches = [self.kvcaches[i] for i in self.full_attention_indices]
+        else:
+            filtered_kvcaches = self.kvcaches
+
+        self._lazy_initialize_buffer(filtered_kvcaches)
 
         slot_mapping_chunks = []
         for start, end in zip(starts, ends, strict=False):
@@ -1404,7 +1473,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     lmc_ops.batched_fused_single_layer_kv_transfer(
                         cpu_tensors,
                         tmp_gpu_buffer_obj.tensor,
-                        self.kvcaches[layer_id],
+                        filtered_kvcaches[layer_id],
                         slot_mapping_full,
                         chunk_offsets,
                         chunk_sizes,
@@ -1421,7 +1490,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
                         lmc_ops.single_layer_kv_transfer(
                             memory_obj.tensor,
-                            self.kvcaches[layer_id],
+                            filtered_kvcaches[layer_id],
                             slot_mapping[start:end],
                             True,
                             self.kv_format.value,  # 1:MERGED_KV / 2:SEPARATE_KV
