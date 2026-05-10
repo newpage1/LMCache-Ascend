@@ -10,6 +10,30 @@ import torch
 logger = init_logger(__name__)
 
 
+def get_tuple_bytes_per_token(kv_cache: Tuple[torch.Tensor, ...]) -> int:
+    first_shape = kv_cache[0].shape
+    for tensor in kv_cache[1:]:
+        if tensor.shape[:2] != first_shape[:2]:
+            raise ValueError(
+                "All KV tensors in a tuple must share [num_blocks, block_size], "
+                f"got {first_shape} and {tensor.shape}"
+            )
+    return sum(
+        tensor.shape[-2] * tensor.shape[-1] * tensor.element_size()
+        for tensor in kv_cache
+    )
+
+
+def get_tuple_byte_offsets(kv_cache: Tuple[torch.Tensor, ...]) -> list[tuple[int, int]]:
+    offsets: list[tuple[int, int]] = []
+    start = 0
+    for tensor in kv_cache:
+        width = tensor.shape[-2] * tensor.shape[-1] * tensor.element_size()
+        offsets.append((start, start + width))
+        start += width
+    return offsets
+
+
 class KVCacheFormat(Enum):
     """
     The storage format enumeration of KV cache is used to distinguish
@@ -145,6 +169,18 @@ class KVCacheFormat(Enum):
 
         if isinstance(first_cache, tuple):
             tuple_len = len(first_cache)
+            if not all(isinstance(cache, tuple) for cache in kvcaches):
+                logger.warning(
+                    "Mixed tuple and tensor KV cache layouts are not supported."
+                )
+                return KVCacheFormat.UNDEFINED
+            tuple_lens = {len(cache) for cache in kvcaches}
+            if len(tuple_lens) != 1:
+                logger.warning(
+                    "Mixed tuple KV cache lengths are not supported: %s",
+                    sorted(tuple_lens),
+                )
+                return KVCacheFormat.UNDEFINED
 
             # DSA_C8_KV: tuple with 4 elements for Sparse C8 DSA.
             if tuple_len == 4:

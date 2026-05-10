@@ -53,10 +53,13 @@ For Sparse C8, the current safe stage is:
 
 - detect 4-tensor DSA Sparse C8 layout.
 - preserve mixed dtype metadata as raw-byte storage.
-- fail fast before entering existing NPU transfer kernels.
+- use the VLLM paged NPU connector raw-byte fallback for functional validation.
+- keep non-paged and 310P paths fail-fast until they have dedicated validation.
 
-Do not add a Python enum value to the C++ ABI until the raw-byte transfer
-contract and kernel offsets are implemented.
+Do not add a Python enum value to the C++ ABI until a high-performance raw-byte
+kernel contract and offsets are implemented. The fallback path uses PyTorch
+`index_select` / `index_copy_` and does not call the existing C++ transfer
+kernel with `DSA_C8_KV`.
 
 ## Phase 3: Local Validation
 
@@ -133,6 +136,35 @@ Run targeted checks:
 ```bash
 python3 -m pytest tests/v1/test_deepseek_v4_kv_format.py
 python3 -c "import lmcache_ascend; print(lmcache_ascend.__version__)"
+```
+
+If package-level imports are blocked by missing LMCache dependencies, run a
+direct-file byte-layout check first:
+
+```bash
+PYTHONPATH=/work/LMCache:/work/LMCache-Ascend python3 - <<'PY'
+import torch
+from lmcache_ascend.v1.kv_format import (
+    KVCacheFormat,
+    get_tuple_byte_offsets,
+    get_tuple_bytes_per_token,
+)
+
+kv_cache = (
+    torch.rand([2, 16, 1, 512], dtype=torch.bfloat16),
+    torch.rand([2, 16, 1, 64], dtype=torch.bfloat16),
+    torch.randint(-128, 127, [2, 16, 64, 128], dtype=torch.int8),
+    torch.rand([2, 16, 64, 1], dtype=torch.float16),
+)
+assert KVCacheFormat.detect([kv_cache]) == KVCacheFormat.DSA_C8_KV
+assert get_tuple_bytes_per_token(kv_cache) == 9472
+assert get_tuple_byte_offsets(kv_cache) == [
+    (0, 1024),
+    (1024, 1152),
+    (1152, 9344),
+    (9344, 9472),
+]
+PY
 ```
 
 ## Phase 5: Runtime Layout Capture

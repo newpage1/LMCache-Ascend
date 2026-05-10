@@ -7,6 +7,9 @@ from lmcache.logging import init_logger
 from lmcache.v1.kv_layer_groups import KVLayerGroupInfo
 import torch
 
+# First Party
+from lmcache_ascend.v1.kv_format import get_tuple_bytes_per_token
+
 logger = init_logger(__name__)
 
 
@@ -44,10 +47,7 @@ def _get_tuple_storage_shape_bytes(kv_cache: tuple[torch.Tensor, ...]) -> torch.
                 f"got {first_shape} and {tensor.shape}"
             )
 
-    bytes_per_token = sum(
-        tensor.shape[-2] * tensor.shape[-1] * tensor.element_size()
-        for tensor in kv_cache
-    )
+    bytes_per_token = get_tuple_bytes_per_token(kv_cache)
     return torch.Size([first_shape[0], first_shape[1], bytes_per_token])
 
 

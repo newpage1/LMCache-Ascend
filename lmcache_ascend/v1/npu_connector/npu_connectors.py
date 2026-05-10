@@ -20,7 +20,11 @@ from lmcache.v1.metadata import LMCacheMetadata
 import torch
 
 # First Party
-from lmcache_ascend.v1.kv_format import KVCacheFormat
+from lmcache_ascend.v1.kv_format import (
+    KVCacheFormat,
+    get_tuple_byte_offsets,
+    get_tuple_bytes_per_token,
+)
 from lmcache_ascend.v1.proxy_memory_obj import ProxyMemoryObj
 from lmcache_ascend.v1.transfer_context import AscendBaseTransferContext
 import lmcache_ascend.c_ops as lmc_ops
@@ -447,6 +451,8 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         self.kv_lora_rank: int = 0
         self.qk_rope_head_dim: int = 0
         self.dsa_head_dim: int = 0
+        self.dsa_c8_bytes_per_token: int = 0
+        self.dsa_c8_byte_offsets: list[tuple[int, int]] = []
 
         super().__init__(hidden_dim_size, num_layers, use_gpu, **kwargs)
 
@@ -507,11 +513,6 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                 "Unable to determine the format of input kv_caches."
             )
 
-        if self.kv_format.requires_raw_byte_transfer():
-            raise NotImplementedError(
-                self.kv_format.unsupported_transfer_message(self.__class__.__name__)
-            )
-
         if self.kv_format.is_tuple_format():
             self.kvcaches_device = kv_caches[0][0].device
         else:
@@ -519,6 +520,10 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
 
         assert self.kvcaches_device.type == "npu", "The device should be Ascend NPU."
         idx = self.kvcaches_device.index
+
+        if self.kv_format == KVCacheFormat.DSA_C8_KV:
+            self._initialize_dsa_c8_layout(kv_caches)
+            return torch.empty(0, dtype=torch.int64, device=self.kvcaches_device)
 
         if idx in self.kv_cache_pointers_on_gpu:
             return self.kv_cache_pointers_on_gpu[idx]
@@ -618,6 +623,122 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
 
         return self.kv_cache_pointers_on_gpu[idx]
 
+    def _initialize_dsa_c8_layout(self, kv_caches: List[torch.Tensor]) -> None:
+        first_cache = kv_caches[0]
+        assert isinstance(first_cache, tuple)
+        first_tensor = first_cache[0]
+        self.page_buffer_size = first_tensor.shape[0] * first_tensor.shape[1]
+        self.dsa_c8_bytes_per_token = get_tuple_bytes_per_token(first_cache)
+        self.dsa_c8_byte_offsets = get_tuple_byte_offsets(first_cache)
+        self.kv_size = 1
+        for layer_idx, cache_tuple in enumerate(kv_caches[1:], start=1):
+            if not isinstance(cache_tuple, tuple) or len(cache_tuple) != len(
+                first_cache
+            ):
+                raise ValueError(
+                    "DSA_C8_KV fallback transfer requires every layer to use "
+                    "the same 4-tensor tuple layout."
+                )
+            if get_tuple_byte_offsets(cache_tuple) != self.dsa_c8_byte_offsets:
+                raise ValueError(
+                    "DSA_C8_KV fallback transfer requires identical byte "
+                    f"offsets across layers; layer {layer_idx} differs."
+                )
+
+    def _flatten_token_bytes(self, tensor: torch.Tensor) -> torch.Tensor:
+        if not tensor.is_contiguous():
+            raise ValueError(
+                "DSA_C8_KV fallback transfer requires contiguous KV tensors, "
+                f"got shape={tensor.shape}, dtype={tensor.dtype}."
+            )
+        bytes_per_token = tensor.shape[-2] * tensor.shape[-1] * tensor.element_size()
+        return tensor.view(torch.uint8).view(-1, bytes_per_token)
+
+    def _dsa_c8_memory_tensor(
+        self,
+        memory_obj: MemoryObj,
+        start: int,
+        end: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        assert memory_obj.tensor is not None
+        tensor = memory_obj.tensor
+        if tensor.dtype != torch.uint8:
+            raise ValueError(
+                "DSA_C8_KV fallback transfer expects uint8 memory storage, "
+                f"got {tensor.dtype}."
+            )
+        expected_shape = torch.Size(
+            [1, self.num_layers, end - start, self.dsa_c8_bytes_per_token]
+        )
+        if tensor.shape != expected_shape:
+            raise ValueError(
+                "DSA_C8_KV fallback transfer expects memory tensor shape "
+                f"{expected_shape}, got {tensor.shape}."
+            )
+        return tensor.to(device, non_blocking=True)
+
+    def _dsa_c8_slot_mapping(
+        self,
+        slot_mapping: torch.Tensor,
+        start: int,
+        end: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        slots = slot_mapping[start:end].to(device=device, dtype=torch.long)
+        if torch.any(slots < 0):
+            raise ValueError("DSA_C8_KV fallback transfer does not accept -1 slots.")
+        return slots
+
+    def _dsa_c8_to_gpu(
+        self,
+        memory_obj: MemoryObj,
+        start: int,
+        end: int,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        assert self.kvcaches is not None
+        src = self._dsa_c8_memory_tensor(memory_obj, start, end, self.kvcaches_device)
+        slots = self._dsa_c8_slot_mapping(
+            slot_mapping, start, end, self.kvcaches_device
+        )
+
+        for layer_idx, cache_tuple in enumerate(self.kvcaches):
+            assert isinstance(cache_tuple, tuple)
+            for tensor_idx, cache_tensor in enumerate(cache_tuple):
+                offset_start, offset_end = self.dsa_c8_byte_offsets[tensor_idx]
+                flat_cache = self._flatten_token_bytes(cache_tensor)
+                flat_cache.index_copy_(
+                    0,
+                    slots,
+                    src[0, layer_idx, :, offset_start:offset_end].contiguous(),
+                )
+
+    def _dsa_c8_from_gpu(
+        self,
+        memory_obj: MemoryObj,
+        start: int,
+        end: int,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        assert self.kvcaches is not None
+        dst = self._dsa_c8_memory_tensor(memory_obj, start, end, self.kvcaches_device)
+        slots = self._dsa_c8_slot_mapping(
+            slot_mapping, start, end, self.kvcaches_device
+        )
+
+        for layer_idx, cache_tuple in enumerate(self.kvcaches):
+            assert isinstance(cache_tuple, tuple)
+            for tensor_idx, cache_tensor in enumerate(cache_tuple):
+                offset_start, offset_end = self.dsa_c8_byte_offsets[tensor_idx]
+                flat_cache = self._flatten_token_bytes(cache_tensor)
+                dst[0, layer_idx, :, offset_start:offset_end].copy_(
+                    flat_cache.index_select(0, slots)
+                )
+
+        if memory_obj.tensor.device != dst.device:
+            memory_obj.tensor.copy_(dst.to(memory_obj.tensor.device))
+
     def to_gpu_310p(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.
         The kvcaches should correspond to the "WHOLE token sequence".
@@ -662,6 +783,11 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
         kv_cache_pointers = self._initialize_pointers(self.kvcaches)
+        if self.kv_format == KVCacheFormat.DSA_C8_KV:
+            raise NotImplementedError(
+                "DSA_C8_KV fallback transfer is only implemented for the "
+                "standard NPU paged connector path, not the 310P path."
+            )
 
         tmp_gpu_buffer = torch.empty(
             memory_obj.tensor.size(), dtype=self.dtype, device=self.device
@@ -714,6 +840,11 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
         kv_cache_pointers = self._initialize_pointers(self.kvcaches)
+        if self.kv_format == KVCacheFormat.DSA_C8_KV:
+            raise NotImplementedError(
+                "DSA_C8_KV fallback transfer is only implemented for the "
+                "standard NPU paged connector path, not the 310P path."
+            )
 
         assert self.gpu_buffer.device == self.kvcaches_device
 
@@ -764,7 +895,15 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
 
-        if self.use_mla:
+        kv_cache_pointers = self._initialize_pointers(self.kvcaches)
+
+        if self.kv_format == KVCacheFormat.DSA_C8_KV:
+            if memory_obj.metadata.fmt != MemoryFormat.KV_MLA_FMT:
+                raise ValueError(
+                    "The memory object should be in KV_MLA_FMT format for "
+                    "DSA_C8_KV fallback transfer."
+                )
+        elif self.use_mla:
             if memory_obj.metadata.fmt != MemoryFormat.KV_MLA_FMT:
                 raise ValueError(
                     "The memory object should be in KV_MLA_FMT format in"
@@ -782,7 +921,10 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
-        kv_cache_pointers = self._initialize_pointers(self.kvcaches)
+        if self.kv_format == KVCacheFormat.DSA_C8_KV:
+            self._dsa_c8_to_gpu(memory_obj, start, end, slot_mapping)
+            return
+
         lmc_ops.multi_layer_kv_transfer(
             memory_obj.tensor,
             kv_cache_pointers,
@@ -848,6 +990,15 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
 
         if self.kv_format == KVCacheFormat.UNDEFINED:
             raise ValueError("KV cache format is not initialized!")
+
+        if self.kv_format == KVCacheFormat.DSA_C8_KV:
+            with torch.npu.stream(self.store_stream):
+                self._dsa_c8_from_gpu(memory_obj, start, end, slot_mapping)
+            no_sync = kwargs.get("no_sync", False)
+            if not no_sync and not memory_obj.tensor.is_cuda:
+                self.store_stream.synchronize()
+            memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
+            return
 
         with torch.npu.stream(self.store_stream):
             # No staging buffer or token count mismatch
@@ -1113,6 +1264,10 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                 self.kv_lora_rank + self.qk_rope_head_dim + self.dsa_head_dim
             )
             return torch.Size([1, self.num_layers, num_tokens, total_hidden_dims])
+        elif self.kv_format == KVCacheFormat.DSA_C8_KV:
+            return torch.Size(
+                [1, self.num_layers, num_tokens, self.dsa_c8_bytes_per_token]
+            )
         else:
             kv_size = 2
             return torch.Size(

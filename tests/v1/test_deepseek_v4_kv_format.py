@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 import torch
 
-from lmcache_ascend.v1.kv_format import KVCacheFormat
+from lmcache_ascend.v1.kv_format import (
+    KVCacheFormat,
+    get_tuple_byte_offsets,
+    get_tuple_bytes_per_token,
+)
 from lmcache_ascend.v1.kv_layer_groups import _get_kv_cache_group_key_and_info
 from tests.v1.utils import generate_dsa_c8_kv_cache, generate_dsa_kv_cache
 
@@ -29,6 +33,31 @@ def test_detect_dsa_c8_kv_format():
     )
 
 
+def test_mixed_tuple_lengths_are_undefined():
+    dsa_c8_cache = generate_dsa_c8_kv_cache(
+        num_blocks=2,
+        device="cpu",
+        num_layers=1,
+        num_kv_heads=1,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        block_size=16,
+    )[0]
+    dsa_cache = generate_dsa_kv_cache(
+        num_blocks=2,
+        device="cpu",
+        num_layers=1,
+        num_kv_heads=1,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        dsa_head_dim=128,
+        block_size=16,
+        dtype=torch.bfloat16,
+    )[0]
+
+    assert KVCacheFormat.detect([dsa_c8_cache, dsa_cache]) == KVCacheFormat.UNDEFINED
+
+
 def test_dsa_c8_mixed_dtype_group_uses_raw_byte_storage():
     kv_cache = generate_dsa_c8_kv_cache(
         num_blocks=2,
@@ -49,6 +78,13 @@ def test_dsa_c8_mixed_dtype_group_uses_raw_byte_storage():
         for tensor in kv_cache
     )
 
+    assert get_tuple_bytes_per_token(kv_cache) == expected_bytes_per_token
+    assert get_tuple_byte_offsets(kv_cache) == [
+        (0, 1024),
+        (1024, 1152),
+        (1152, 9344),
+        (9344, 9472),
+    ]
     assert key[-1] == "raw_bytes"
     assert storage_shape == torch.Size([2, 16, expected_bytes_per_token])
     assert dtype == torch.uint8
