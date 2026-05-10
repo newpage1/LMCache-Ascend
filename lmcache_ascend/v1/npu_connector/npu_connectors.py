@@ -73,6 +73,12 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
             self.kv_format = KVCacheFormat.detect(kv_caches)
             if self.kv_format == KVCacheFormat.UNDEFINED:
                 raise ValueError("Could not detect KV cache format.")
+            if self.kv_format.requires_raw_byte_transfer():
+                raise NotImplementedError(
+                    self.kv_format.unsupported_transfer_message(
+                        self.__class__.__name__
+                    )
+                )
 
             ref_tensor = (
                 kv_caches[0][0] if self.kv_format.is_separate_format() else kv_caches[0]
@@ -499,6 +505,11 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             raise ValueError(
                 "Undefined KV cache format detected. "
                 "Unable to determine the format of input kv_caches."
+            )
+
+        if self.kv_format.requires_raw_byte_transfer():
+            raise NotImplementedError(
+                self.kv_format.unsupported_transfer_message(self.__class__.__name__)
             )
 
         if self.kv_format.is_tuple_format():
@@ -1146,6 +1157,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     "Undefined KV cache format detected. "
                     "Unable to determine the format of input kv_caches."
                 )
+            if self.kv_format.requires_raw_byte_transfer():
+                raise NotImplementedError(
+                    self.kv_format.unsupported_transfer_message(
+                        self.__class__.__name__
+                    )
+                )
 
             logger.info(f"Detected KV cache format: {self.kv_format.name}")
 
@@ -1494,6 +1511,10 @@ class SGLangLayerwiseNPUConnector(SGLangLayerwiseGPUConnector):
         self.kv_format = KVCacheFormat.detect(kv_caches)
         if self.kv_format == KVCacheFormat.UNDEFINED:
             raise ValueError("Could not detect KV cache format.")
+        if self.kv_format.requires_raw_byte_transfer():
+            raise NotImplementedError(
+                self.kv_format.unsupported_transfer_message(self.__class__.__name__)
+            )
 
         if self.use_gpu and self.gpu_buffer_allocator is None:
             k_cache_shape_per_layer = kv_caches[0][0].shape

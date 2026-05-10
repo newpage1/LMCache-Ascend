@@ -33,19 +33,36 @@ def _get_tuple_storage_shape(kv_cache: tuple[torch.Tensor, ...]) -> torch.Size:
     return torch.Size([first_shape[0], first_shape[1], total_hidden_dim])
 
 
+def _get_tuple_storage_shape_bytes(kv_cache: tuple[torch.Tensor, ...]) -> torch.Size:
+    """Return a raw-byte token-major storage shape for mixed-dtype tuples."""
+    first_shape = kv_cache[0].shape
+
+    for tensor in kv_cache[1:]:
+        if tensor.shape[:2] != first_shape[:2]:
+            raise ValueError(
+                "All KV tensors in a tuple must share [num_blocks, block_size], "
+                f"got {first_shape} and {tensor.shape}"
+            )
+
+    bytes_per_token = sum(
+        tensor.shape[-2] * tensor.shape[-1] * tensor.element_size()
+        for tensor in kv_cache
+    )
+    return torch.Size([first_shape[0], first_shape[1], bytes_per_token])
+
+
 def _get_kv_cache_group_key_and_info(
     kv_cache: torch.Tensor | tuple[torch.Tensor, ...],
 ) -> tuple[tuple[object, ...], torch.Size, torch.dtype]:
     """Build a stable grouping key plus the LMCache storage shape/dtype."""
     if isinstance(kv_cache, tuple):
         dtypes = tuple(tensor.dtype for tensor in kv_cache)
-        if len(set(dtypes)) != 1:
-            raise ValueError(
-                "Tuple-based KV caches with mixed dtypes are not supported by "
-                "LMCache-Ascend."
-            )
-
         shapes = tuple(tensor.shape for tensor in kv_cache)
+
+        if len(set(dtypes)) != 1:
+            storage_shape = _get_tuple_storage_shape_bytes(kv_cache)
+            return (shapes, dtypes, "raw_bytes"), storage_shape, torch.uint8
+
         storage_shape = _get_tuple_storage_shape(kv_cache)
         return (shapes, dtypes), storage_shape, dtypes[0]
 

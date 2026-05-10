@@ -259,3 +259,40 @@ def generate_dsa_kv_cache(
         dsa_k_cache = torch.rand(dsa_k_shape, dtype=dtype, device=device)
         ret.append((k_cache, v_cache, dsa_k_cache))
     return ret
+
+
+def generate_dsa_c8_kv_cache(
+    num_blocks: int,
+    device: str,
+    num_layers: int,
+    num_kv_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    indexer_heads: int = 64,
+    indexer_head_dim: int = 128,
+    block_size: int = 16,
+) -> List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """
+    Generate Sparse C8 DSA KV cache.
+    kv_lora.shape = [num_blocks, block_size, num_kv_heads, kv_lora_rank]
+    k_rope.shape = [num_blocks, block_size, num_kv_heads, qk_rope_head_dim]
+    indexer_k.shape = [num_blocks, block_size, indexer_heads, indexer_head_dim]
+    indexer_scale.shape = [num_blocks, block_size, indexer_heads, 1]
+    """
+    ret = []
+    kv_lora_shape = [num_blocks, block_size, num_kv_heads, kv_lora_rank]
+    k_rope_shape = [num_blocks, block_size, num_kv_heads, qk_rope_head_dim]
+    indexer_k_shape = [num_blocks, block_size, indexer_heads, indexer_head_dim]
+    indexer_scale_shape = [num_blocks, block_size, indexer_heads, 1]
+
+    for _ in range(num_layers):
+        kv_lora = torch.rand(kv_lora_shape, dtype=torch.bfloat16, device=device)
+        k_rope = torch.rand(k_rope_shape, dtype=torch.bfloat16, device=device)
+        indexer_k = torch.randint(
+            -128, 127, indexer_k_shape, dtype=torch.int8, device=device
+        )
+        indexer_scale = torch.rand(
+            indexer_scale_shape, dtype=torch.float16, device=device
+        )
+        ret.append((kv_lora, k_rope, indexer_k, indexer_scale))
+    return ret

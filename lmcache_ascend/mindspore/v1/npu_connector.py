@@ -97,6 +97,10 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                 "Undefined KV cache format detected. "
                 "Unable to determine the format of input kv_caches."
             )
+        if self.kv_format.requires_raw_byte_transfer():
+            raise NotImplementedError(
+                self.kv_format.unsupported_transfer_message(self.__class__.__name__)
+            )
 
         if self.kv_format.is_separate_format():
             self.kvcaches_device = kv_caches[0][0].device
