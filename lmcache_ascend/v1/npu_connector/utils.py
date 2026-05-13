@@ -3,7 +3,12 @@
 from typing import List, Tuple, Union
 
 # Third Party
-from lmcache.v1.gpu_connector.utils import permute_to_contiguous
+try:
+    from lmcache.v1.gpu_connector.utils import permute_to_contiguous
+except ImportError:
+    from lmcache.v1.gpu_connector.utils import (
+        attempt_permute_to_contiguous_view as permute_to_contiguous,
+    )
 import torch
 
 _KVTupleTwoOrMore = Tuple[torch.Tensor, ...]

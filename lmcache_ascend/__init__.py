@@ -321,7 +321,8 @@ def _patch_gpu_connector():
     as a factory function. We patch it to return Ascend NPU connectors
     instead of the default CUDA ones.
 
-    ``permute_kv_caches_to_contiguous`` must be patched on
+    ``permute_kv_caches_to_contiguous`` and newer
+    ``attempt_permute_to_contiguous_view`` must be patched on
     ``lmcache.v1.gpu_connector.utils`` *before* importing
     ``lmcache.v1.gpu_connector``, so the import in ``gpu_connectors`` binds
     the Ascend implementation. If ``gpu_connectors`` was already loaded,
@@ -337,12 +338,18 @@ def _patch_gpu_connector():
     from lmcache_ascend.v1.npu_connector.utils import permute_kv_caches_to_contiguous
 
     gpu_utils.permute_kv_caches_to_contiguous = permute_kv_caches_to_contiguous
+    if hasattr(gpu_utils, "attempt_permute_to_contiguous_view"):
+        gpu_utils.attempt_permute_to_contiguous_view = permute_kv_caches_to_contiguous
 
     _gpu_connectors_mod = sys.modules.get("lmcache.v1.gpu_connector.gpu_connectors")
     if _gpu_connectors_mod is not None:
         _gpu_connectors_mod.permute_kv_caches_to_contiguous = (
             permute_kv_caches_to_contiguous
         )
+        if hasattr(_gpu_connectors_mod, "attempt_permute_to_contiguous_view"):
+            _gpu_connectors_mod.attempt_permute_to_contiguous_view = (
+                permute_kv_caches_to_contiguous
+            )
 
     # Third Party
     import lmcache.v1.gpu_connector as lm_gpu_connector

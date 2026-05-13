@@ -27,7 +27,9 @@ from lmcache_ascend.v1.npu_connector.npu_connectors import (
     VLLMPagedMemNPUConnectorV2,
 )
 from tests.v1.utils import check_sglang_npu_kv_cache_equal, generate_sglang_npu_kv_cache
+from tests.v1.utils import generate_dsa_c8_kv_cache
 import lmcache_ascend.c_ops as lmc_ops
+from lmcache_ascend.v1.kv_format import get_tuple_bytes_per_token
 
 
 @pytest.mark.parametrize("use_npu", [True])
@@ -61,6 +63,85 @@ def test_vllm_paged_connector_v2_to_npu_bench(benchmark):
 
     with patch(target_patch, new=VLLMPagedMemNPUConnectorV2):
         original_test_vllm_paged_connector_v2_to_gpu_bench(benchmark)
+
+
+def test_vllm_paged_connector_v2_dsa_c8_roundtrip_with_npu():
+    num_blocks = 4
+    block_size = 16
+    num_layers = 2
+    num_tokens = 13
+    device = "npu"
+
+    kv_src = generate_dsa_c8_kv_cache(
+        num_blocks=num_blocks,
+        device=device,
+        num_layers=num_layers,
+        num_kv_heads=1,
+        kv_lora_rank=16,
+        qk_rope_head_dim=8,
+        indexer_heads=2,
+        indexer_head_dim=8,
+        block_size=block_size,
+    )
+    kv_dst = generate_dsa_c8_kv_cache(
+        num_blocks=num_blocks,
+        device=device,
+        num_layers=num_layers,
+        num_kv_heads=1,
+        kv_lora_rank=16,
+        qk_rope_head_dim=8,
+        indexer_heads=2,
+        indexer_head_dim=8,
+        block_size=block_size,
+    )
+
+    slot_mapping = torch.randperm(
+        num_blocks * block_size, device=device, dtype=torch.int64
+    )[:num_tokens]
+    bytes_per_token = get_tuple_bytes_per_token(kv_src[0])
+    memory_shape = torch.Size([1, num_layers, num_tokens, bytes_per_token])
+    allocator = PinMemoryAllocator(1024 * 1024 * 16)
+    memory_obj = allocator.allocate(
+        memory_shape,
+        torch.uint8,
+        fmt=MemoryFormat.KV_MLA_FMT,
+    )
+
+    store_connector = VLLMPagedMemNPUConnectorV2(
+        bytes_per_token,
+        num_layers,
+        use_gpu=False,
+    )
+    load_connector = VLLMPagedMemNPUConnectorV2(
+        bytes_per_token,
+        num_layers,
+        use_gpu=False,
+    )
+
+    store_connector.from_gpu(
+        memory_obj,
+        0,
+        num_tokens,
+        kvcaches=kv_src,
+        slot_mapping=slot_mapping,
+    )
+    load_connector.to_gpu(
+        memory_obj,
+        0,
+        num_tokens,
+        kvcaches=kv_dst,
+        slot_mapping=slot_mapping,
+    )
+    torch.npu.synchronize()
+
+    for src_layer, dst_layer in zip(kv_src, kv_dst, strict=True):
+        for src_tensor, dst_tensor in zip(src_layer, dst_layer, strict=True):
+            assert torch.equal(
+                src_tensor.reshape(num_blocks * block_size, -1)[slot_mapping],
+                dst_tensor.reshape(num_blocks * block_size, -1)[slot_mapping],
+            )
+
+    allocator.free(memory_obj)
 
 
 @pytest.mark.parametrize("use_gpu", [True])
