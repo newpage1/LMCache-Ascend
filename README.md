@@ -110,73 +110,11 @@ quay.io/ascend/vllm-ascend:v0.18.0
 NO_CUDA_EXT=1 pip install lmcache==0.4.2
 ```
 
-- from local source
-
-This is recommended on shared or offline Ascend machines where the source code
-should be prepared outside the machine and mounted into the container. The
-container must already have LMCache runtime dependencies installed, or you must
-also mount a local wheelhouse and install dependencies from it.
-
-On the host, place both repositories under a private working directory:
-
-```bash
-mkdir -p /path/to/lmcache-work
-# Copy or mount your prepared local checkouts here:
-# /path/to/lmcache-work/LMCache
-# /path/to/lmcache-work/LMCache-Ascend
-```
-
-Run the vLLM-Ascend container with the local source mounted:
-
-```bash
-docker run -it \
---shm-size=200g --privileged --net=host \
---runtime=ascend \
--v /path/to/lmcache-work:/work \
---name lmcache-ascend-local-build \
---entrypoint /bin/bash \
-quay.io/ascend/vllm-ascend:v0.18.0
-```
-
-Install LMCache from the mounted source inside the container:
-
-```bash
-cd /work/LMCache
-NO_CUDA_EXT=1 pip install -v --no-build-isolation -e .
-```
-
-If the mounted source was copied without its `.git` directory, provide an
-explicit version for `setuptools_scm`:
-
-```bash
-cd /work/LMCache
-SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE=0.4.3 \
-NO_CUDA_EXT=1 pip install -v --no-build-isolation -e .
-```
-
-For fully offline validation, prepare dependency wheels outside the shared
-machine and install them from a mounted wheelhouse before installing LMCache:
-
-```bash
-pip install --no-index --find-links=/work/wheelhouse -r /work/LMCache/requirements/common.txt
-pip install --no-index --find-links=/work/wheelhouse -r /work/LMCache/requirements/test.txt
-```
-
 3. Install LMCache-Ascend Repo
 
 ```bash
 git clone --recurse-submodules -b v0.4.2 https://github.com/LMCache/LMCache-Ascend.git
 cd LMCache-Ascend
-pip install -v --no-build-isolation -e .
-```
-
-If you mounted a local LMCache-Ascend checkout instead of cloning inside the
-container:
-
-```bash
-cd /work/LMCache-Ascend
-SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE_ASCEND=0.4.2 \
-SOC_VERSION=Ascend910_9382 \
 pip install -v --no-build-isolation -e .
 ```
 
