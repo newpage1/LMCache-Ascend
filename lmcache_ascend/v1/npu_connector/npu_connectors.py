@@ -505,6 +505,11 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         )
 
     def _initialize_pointers(self, kv_caches: List[torch.Tensor]) -> torch.Tensor:
+        kv_caches = [
+            tuple(cache) if isinstance(cache, list) else cache
+            for cache in kv_caches
+        ]
+        self.kvcaches = kv_caches
         self.kv_format = KVCacheFormat.detect(kv_caches, use_mla=self.use_mla)
 
         if self.kv_format == KVCacheFormat.UNDEFINED:
@@ -522,8 +527,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         idx = self.kvcaches_device.index
 
         if self.kv_format == KVCacheFormat.DSA_C8_KV:
-            self._initialize_dsa_c8_layout(kv_caches)
-            return torch.empty(0, dtype=torch.int64, device=self.kvcaches_device)
+            return self._initialize_dsa_c8_layout(kv_caches)
 
         if idx in self.kv_cache_pointers_on_gpu:
             return self.kv_cache_pointers_on_gpu[idx]
@@ -623,15 +627,22 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
 
         return self.kv_cache_pointers_on_gpu[idx]
 
-    def _initialize_dsa_c8_layout(self, kv_caches: List[torch.Tensor]) -> None:
+    def _initialize_dsa_c8_layout(
+        self, kv_caches: List[torch.Tensor]
+    ) -> torch.Tensor:
         first_cache = kv_caches[0]
         assert isinstance(first_cache, tuple)
         first_tensor = first_cache[0]
         self.page_buffer_size = first_tensor.shape[0] * first_tensor.shape[1]
         self.dsa_c8_bytes_per_token = get_tuple_bytes_per_token(first_cache)
         self.dsa_c8_byte_offsets = get_tuple_byte_offsets(first_cache)
+        self.dsa_c8_max_tensor_bytes = max(
+            offset_end - offset_start
+            for offset_start, offset_end in self.dsa_c8_byte_offsets
+        )
         self.kv_size = 1
-        for layer_idx, cache_tuple in enumerate(kv_caches[1:], start=1):
+        pointers_list = []
+        for layer_idx, cache_tuple in enumerate(kv_caches):
             if not isinstance(cache_tuple, tuple) or len(cache_tuple) != len(
                 first_cache
             ):
@@ -644,6 +655,28 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                     "DSA_C8_KV fallback transfer requires identical byte "
                     f"offsets across layers; layer {layer_idx} differs."
                 )
+            for cache_tensor in cache_tuple:
+                pointers_list.append(cache_tensor.data_ptr())
+
+        byte_offsets = [0]
+        byte_offsets.extend(offset_end for _, offset_end in self.dsa_c8_byte_offsets)
+
+        self.dsa_c8_cache_pointers = torch.empty(
+            len(pointers_list), dtype=torch.int64, device="cpu"
+        )
+        self.dsa_c8_cache_pointers.numpy()[:] = pointers_list
+        self.dsa_c8_cache_pointers_npu = torch.empty(
+            self.dsa_c8_cache_pointers.shape,
+            dtype=torch.int64,
+            device=self.kvcaches_device,
+        )
+        self.dsa_c8_cache_pointers_npu.copy_(self.dsa_c8_cache_pointers)
+        self.dsa_c8_byte_offsets_npu = torch.tensor(
+            byte_offsets,
+            dtype=torch.int64,
+            device=self.kvcaches_device,
+        )
+        return self.dsa_c8_cache_pointers_npu
 
     def _flatten_token_bytes(self, tensor: torch.Tensor) -> torch.Tensor:
         if not tensor.is_contiguous():
@@ -678,6 +711,29 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             )
         return tensor.to(device, non_blocking=True)
 
+    def _validate_dsa_c8_memory_tensor(
+        self,
+        memory_obj: MemoryObj,
+        start: int,
+        end: int,
+    ) -> torch.Tensor:
+        assert memory_obj.tensor is not None
+        tensor = memory_obj.tensor
+        if tensor.dtype != torch.uint8:
+            raise ValueError(
+                "DSA_C8_KV transfer expects uint8 memory storage, "
+                f"got {tensor.dtype}."
+            )
+        expected_shape = torch.Size(
+            [1, self.num_layers, end - start, self.dsa_c8_bytes_per_token]
+        )
+        if tensor.shape != expected_shape:
+            raise ValueError(
+                "DSA_C8_KV transfer expects memory tensor shape "
+                f"{expected_shape}, got {tensor.shape}."
+            )
+        return tensor
+
     def _dsa_c8_slot_mapping(
         self,
         slot_mapping: torch.Tensor,
@@ -698,6 +754,10 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         slot_mapping: torch.Tensor,
     ) -> None:
         assert self.kvcaches is not None
+        if self._dsa_c8_raw_bytes_kernel_available():
+            self._dsa_c8_kernel_transfer(memory_obj, start, end, slot_mapping, False)
+            return
+
         src = self._dsa_c8_memory_tensor(memory_obj, start, end, self.kvcaches_device)
         slots = self._dsa_c8_slot_mapping(
             slot_mapping, start, end, self.kvcaches_device
@@ -722,6 +782,10 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         slot_mapping: torch.Tensor,
     ) -> None:
         assert self.kvcaches is not None
+        if self._dsa_c8_raw_bytes_kernel_available():
+            self._dsa_c8_kernel_transfer(memory_obj, start, end, slot_mapping, True)
+            return
+
         dst = self._dsa_c8_memory_tensor(memory_obj, start, end, self.kvcaches_device)
         slots = self._dsa_c8_slot_mapping(
             slot_mapping, start, end, self.kvcaches_device
@@ -738,6 +802,35 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
 
         if memory_obj.tensor.device != dst.device:
             memory_obj.tensor.copy_(dst.to(memory_obj.tensor.device))
+
+    def _dsa_c8_raw_bytes_kernel_available(self) -> bool:
+        return (
+            hasattr(lmc_ops, "multi_layer_raw_bytes_transfer")
+            and hasattr(self, "dsa_c8_cache_pointers_npu")
+            and hasattr(self, "dsa_c8_byte_offsets_npu")
+        )
+
+    def _dsa_c8_kernel_transfer(
+        self,
+        memory_obj: MemoryObj,
+        start: int,
+        end: int,
+        slot_mapping: torch.Tensor,
+        direction: bool,
+    ) -> None:
+        tensor = self._validate_dsa_c8_memory_tensor(memory_obj, start, end)
+        slots = self._dsa_c8_slot_mapping(
+            slot_mapping, start, end, self.kvcaches_device
+        )
+        lmc_ops.multi_layer_raw_bytes_transfer(
+            tensor,
+            self.dsa_c8_cache_pointers_npu,
+            self.dsa_c8_byte_offsets_npu,
+            slots,
+            self.kvcaches_device,
+            direction,
+            self.dsa_c8_max_tensor_bytes,
+        )
 
     def to_gpu_310p(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.

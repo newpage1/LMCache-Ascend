@@ -33,6 +33,13 @@ void multi_layer_kv_transfer_kernel_v2(
     const int64_t kHiddenDims = 0, const int64_t vHiddenDims = 0,
     const int64_t dsaHiddenDims = 0);
 
+void multi_layer_raw_bytes_transfer_kernel(
+    kvcache_ops::AscendType slotType, uint32_t blockDim, void *stream,
+    uint8_t *pagedKVCaches, uint8_t *dstCacheTensor, uint8_t *byteOffsets,
+    uint8_t *slotmappings, const int32_t numLayers, const int32_t numTensors,
+    const int32_t numTokensChunk, const int64_t bytesPerToken,
+    const int64_t maxTensorBytes, const bool page2L);
+
 void single_layer_kv_transfer_kernel_v2(
     kvcache_ops::AscendType type, kvcache_ops::AscendType slotType,
     uint32_t blockDim, void *stream, uint8_t *lmcKeyValueCache,
@@ -81,6 +88,12 @@ void fused_multi_layer_kv_transfer(
     const bool direction, const bool use_mla, const int kvcache_format_raw,
     const int64_t k_hidden_dims = 0, const int64_t v_hidden_dims = 0,
     const int64_t dsa_hidden_dims = 0);
+
+void multi_layer_raw_bytes_transfer(
+    torch::Tensor &key_value, const torch::Tensor &key_value_ptrs,
+    const torch::Tensor &byte_offsets, const torch::Tensor &slot_mapping,
+    const torch::Device &paged_memory_device, const bool direction,
+    const int64_t max_tensor_bytes);
 
 void multi_layer_kv_transfer_310p(
     torch::Tensor &key_value,            // [kv, num_layer, num_tokens, hidden]

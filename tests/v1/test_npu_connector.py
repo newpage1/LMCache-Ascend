@@ -23,6 +23,7 @@ import torch
 # First Party
 from lmcache_ascend.v1.npu_connector.npu_connectors import (
     SGLangLayerwiseNPUConnector,
+    VLLMBufferLayerwiseNPUConnector,
     VLLMPagedMemLayerwiseNPUConnector,
     VLLMPagedMemNPUConnectorV2,
 )
@@ -142,6 +143,38 @@ def test_vllm_paged_connector_v2_dsa_c8_roundtrip_with_npu():
             )
 
     allocator.free(memory_obj)
+
+
+@pytest.mark.parametrize(
+    "connector_cls",
+    [
+        VLLMBufferLayerwiseNPUConnector,
+        VLLMPagedMemLayerwiseNPUConnector,
+        SGLangLayerwiseNPUConnector,
+    ],
+)
+def test_dsa_c8_layerwise_connectors_fail_fast(connector_cls):
+    kv_caches = generate_dsa_c8_kv_cache(
+        num_blocks=2,
+        device="cpu",
+        num_layers=1,
+        num_kv_heads=1,
+        kv_lora_rank=16,
+        qk_rope_head_dim=8,
+        indexer_heads=2,
+        indexer_head_dim=8,
+        block_size=16,
+    )
+    connector = object.__new__(connector_cls)
+    connector.use_gpu = True
+    connector.use_mla = False
+    connector.gpu_buffer_allocator = None
+
+    with pytest.raises(
+        NotImplementedError,
+        match="raw-byte NPU transfer support is not implemented",
+    ):
+        connector._lazy_initialize_buffer(kv_caches)
 
 
 @pytest.mark.parametrize("use_gpu", [True])

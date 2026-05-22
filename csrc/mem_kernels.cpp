@@ -3,6 +3,7 @@
 #include "utils.h"
 #include <ATen/ATen.h>
 #include <Python.h>
+#include <algorithm>
 #include <pybind11/pybind11.h>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <torch_npu/csrc/framework/OpCommand.h>
@@ -164,6 +165,85 @@ void fused_multi_layer_kv_transfer(
   });
   cmd.Run();
   return;
+}
+
+void multi_layer_raw_bytes_transfer(
+    torch::Tensor &key_value,            // [1, num_layer, num_tokens, bytes]
+    const torch::Tensor &key_value_ptrs, // [num_layers * num_tensors]
+    const torch::Tensor &byte_offsets,   // [num_tensors + 1]
+    const torch::Tensor &slot_mapping,   // [num_tokens]
+    const torch::Device &paged_memory_device, const bool direction,
+    const int64_t max_tensor_bytes) {
+  TORCH_CHECK(key_value.scalar_type() == at::ScalarType::Byte,
+              "raw-byte transfer expects uint8 key_value tensor.");
+  TORCH_CHECK(key_value.dim() == 4 && key_value.size(0) == 1,
+              "raw-byte transfer expects shape [1, layers, tokens, bytes], got ",
+              key_value.sizes());
+  TORCH_CHECK(byte_offsets.scalar_type() == at::ScalarType::Long,
+              "raw-byte transfer expects int64 byte_offsets tensor.");
+  TORCH_CHECK(byte_offsets.dim() == 1 && byte_offsets.size(0) >= 2,
+              "raw-byte transfer expects byte_offsets shape [num_tensors + 1].");
+  TORCH_CHECK(key_value_ptrs.scalar_type() == at::ScalarType::Long,
+              "raw-byte transfer expects int64 key_value_ptrs tensor.");
+  TORCH_CHECK(slot_mapping.scalar_type() == at::ScalarType::Long ||
+                  slot_mapping.scalar_type() == at::ScalarType::Int,
+              "raw-byte transfer expects int32 or int64 slot_mapping tensor.");
+  TORCH_CHECK(max_tensor_bytes > 0,
+              "raw-byte transfer expects positive max_tensor_bytes.");
+
+  const int32_t num_layers = static_cast<int32_t>(key_value.size(1));
+  const int32_t num_tokens = static_cast<int32_t>(slot_mapping.size(0));
+  const int32_t num_tensors = static_cast<int32_t>(byte_offsets.size(0) - 1);
+  const int64_t bytes_per_token = key_value.size(3);
+
+  TORCH_CHECK(key_value.size(2) == num_tokens,
+              "raw-byte transfer token count mismatch: key_value has ",
+              key_value.size(2), " tokens, slot_mapping has ", num_tokens);
+  TORCH_CHECK(key_value_ptrs.numel() == num_layers * num_tensors,
+              "raw-byte transfer expects key_value_ptrs numel == layers * "
+              "num_tensors, got ",
+              key_value_ptrs.numel(), " vs ", num_layers * num_tensors);
+
+  const c10::OptionalDeviceGuard device_guard(paged_memory_device);
+  const c10::OptionalDeviceGuard ptr_device_guard(device_of(key_value_ptrs));
+
+  uint8_t *key_value_ptr = get_kernel_ptr<uint8_t, torch::Tensor>(key_value);
+  uint8_t *key_value_ptrs_ptr =
+      get_kernel_ptr<uint8_t, const torch::Tensor>(key_value_ptrs);
+  uint8_t *byte_offsets_ptr =
+      get_kernel_ptr<uint8_t, const torch::Tensor>(byte_offsets);
+  uint8_t *slot_mapping_ptr =
+      get_kernel_ptr<uint8_t, const torch::Tensor>(slot_mapping);
+
+  const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  auto slot_num = vllm_ascend::get_dtype_from_torch(slot_mapping.scalar_type());
+
+  const char *socName = aclrtGetSocName();
+  auto ascendcPlatform =
+      platform_ascendc::PlatformAscendCManager::GetInstance(socName);
+  uint64_t ubSize;
+  ascendcPlatform->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
+  constexpr int32_t numBuffsOnDev = 2;
+  const int64_t baseBuffSize = numBuffsOnDev * max_tensor_bytes;
+  TORCH_CHECK(static_cast<uint64_t>(baseBuffSize) <= ubSize,
+              "raw-byte transfer per-token buffer size exceeds UB size: need ",
+              baseBuffSize, " bytes, got ", ubSize);
+
+  uint32_t aiv_num = static_cast<uint32_t>(std::min(num_layers, 4));
+
+  at_npu::native::OpCommand cmd;
+  cmd.Name("multi_layer_raw_bytes_transfer_kernel");
+  cmd.SetCustomHandler([slot_num, aiv_num, stream, key_value_ptrs_ptr,
+                        key_value_ptr, byte_offsets_ptr, slot_mapping_ptr,
+                        num_layers, num_tensors, num_tokens, bytes_per_token,
+                        max_tensor_bytes, direction]() -> int {
+    kvcache_ops::multi_layer_raw_bytes_transfer_kernel(
+        slot_num, aiv_num, stream, key_value_ptrs_ptr, key_value_ptr,
+        byte_offsets_ptr, slot_mapping_ptr, num_layers, num_tensors, num_tokens,
+        bytes_per_token, max_tensor_bytes, direction);
+    return 0;
+  });
+  cmd.Run();
 }
 
 void multi_layer_kv_transfer_310p(
