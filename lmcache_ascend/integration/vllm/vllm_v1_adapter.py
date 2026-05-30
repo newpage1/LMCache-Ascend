@@ -20,6 +20,9 @@ from vllm.distributed.parallel_state import get_pp_group
 from vllm.v1.request import RequestStatus
 import torch
 
+# First Party
+from lmcache_ascend.v1.kv_format import KVCacheFormat
+
 if TYPE_CHECKING:
     # Third Party
     from vllm.forward_context import ForwardContext
@@ -48,6 +51,32 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         self.current_layer = 0
         self._wait_for_save_done = False
         super().start_load_kv(forward_context, **kwargs)
+
+    @_lmcache_nvtx_annotate
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        logger.info("Registering KV caches")
+        assert len(self.kv_caches) == 0 and len(kv_caches) > 0
+        self.kv_caches = kv_caches
+        self._prepare_ascend_layerwise_connector()
+        self._manager.post_init()
+
+    def _prepare_ascend_layerwise_connector(self) -> None:
+        if not getattr(self, "use_layerwise", False) or self.lmcache_engine is None:
+            return
+        connector = self.lmcache_engine.gpu_connector
+        if connector is None:
+            return
+
+        kvcaches = list(self.kv_caches.values())
+        if not kvcaches:
+            return
+
+        connector.initialize_kvcaches_ptr(kvcaches=kvcaches)
+        if hasattr(connector, "_lazy_initialize_buffer"):
+            connector._lazy_initialize_buffer(connector.kvcaches)
+
+        if getattr(connector, "kv_format", None) == KVCacheFormat.DSA_C8_KV:
+            self.lmcache_engine.metadata.kv_dtype = torch.uint8
 
     @_lmcache_nvtx_annotate
     def wait_for_save(self):

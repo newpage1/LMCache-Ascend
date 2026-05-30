@@ -34,6 +34,136 @@ logger = init_logger(__name__)
 _IS_310P = None
 
 
+class DsaC8LayerwiseRawByteMixin:
+    def _initialize_dsa_c8_layerwise_layout(self, kv_caches):
+        kv_caches = [
+            tuple(cache) if isinstance(cache, list) else cache
+            for cache in kv_caches
+        ]
+        self.kvcaches = kv_caches
+        self.kv_format = KVCacheFormat.detect(kv_caches, use_mla=self.use_mla)
+        if self.kv_format != KVCacheFormat.DSA_C8_KV:
+            return False
+
+        first_cache = kv_caches[0]
+        assert isinstance(first_cache, tuple)
+        first_tensor = first_cache[0]
+        self.kv_device = first_tensor.device
+        self.kvcaches_device = first_tensor.device
+        self.dsa_c8_bytes_per_token = get_tuple_bytes_per_token(first_cache)
+        self.dsa_c8_byte_offsets = get_tuple_byte_offsets(first_cache)
+
+        for layer_idx, cache_tuple in enumerate(kv_caches):
+            if not isinstance(cache_tuple, tuple) or len(cache_tuple) != len(
+                first_cache
+            ):
+                raise ValueError(
+                    "DSA_C8_KV layerwise transfer requires every layer to use "
+                    "the same 4-tensor tuple layout."
+                )
+            if get_tuple_byte_offsets(cache_tuple) != self.dsa_c8_byte_offsets:
+                raise ValueError(
+                    "DSA_C8_KV layerwise transfer requires identical byte "
+                    f"offsets across layers; layer {layer_idx} differs."
+                )
+        return True
+
+    def _dsa_c8_layerwise_dtype(self) -> torch.dtype:
+        if self.kv_format == KVCacheFormat.DSA_C8_KV:
+            return torch.uint8
+        return self.dtype
+
+    def _dsa_c8_layerwise_shape(self, num_tokens: int) -> torch.Size:
+        return torch.Size([num_tokens, self.dsa_c8_bytes_per_token])
+
+    def _validate_dsa_c8_layerwise_memory_tensor(
+        self,
+        memory_obj: MemoryObj,
+        num_tokens: int,
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
+        assert memory_obj.tensor is not None
+        tensor = memory_obj.tensor
+        if tensor.dtype != torch.uint8:
+            raise ValueError(
+                "DSA_C8_KV layerwise transfer expects uint8 memory storage, "
+                f"got {tensor.dtype}."
+            )
+        expected_shape = self._dsa_c8_layerwise_shape(num_tokens)
+        if tensor.shape != expected_shape:
+            raise ValueError(
+                "DSA_C8_KV layerwise transfer expects memory tensor shape "
+                f"{expected_shape}, got {tensor.shape}."
+            )
+        if device is None or tensor.device == device:
+            return tensor
+        return tensor.to(device, non_blocking=True)
+
+    def _flatten_dsa_c8_token_bytes(self, tensor: torch.Tensor) -> torch.Tensor:
+        if not tensor.is_contiguous():
+            raise ValueError(
+                "DSA_C8_KV layerwise transfer requires contiguous KV tensors, "
+                f"got shape={tensor.shape}, dtype={tensor.dtype}."
+            )
+        bytes_per_token = tensor.shape[-2] * tensor.shape[-1] * tensor.element_size()
+        return tensor.view(torch.uint8).view(-1, bytes_per_token)
+
+    def _dsa_c8_layerwise_slots(
+        self,
+        slot_mapping: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        slots = slot_mapping.to(device=device, dtype=torch.long)
+        if torch.any(slots < 0):
+            raise ValueError("DSA_C8_KV layerwise transfer does not accept -1 slots.")
+        return slots
+
+    def _dsa_c8_layerwise_to_gpu(
+        self,
+        memory_obj: MemoryObj,
+        layer_id: int,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        assert self.kvcaches is not None
+        num_tokens = len(slot_mapping)
+        src = self._validate_dsa_c8_layerwise_memory_tensor(
+            memory_obj, num_tokens, self.kvcaches_device
+        )
+        slots = self._dsa_c8_layerwise_slots(slot_mapping, self.kvcaches_device)
+        cache_tuple = self.kvcaches[layer_id]
+        assert isinstance(cache_tuple, tuple)
+        for tensor_idx, cache_tensor in enumerate(cache_tuple):
+            offset_start, offset_end = self.dsa_c8_byte_offsets[tensor_idx]
+            flat_cache = self._flatten_dsa_c8_token_bytes(cache_tensor)
+            flat_cache.index_copy_(
+                0,
+                slots,
+                src[:, offset_start:offset_end].contiguous(),
+            )
+
+    def _dsa_c8_layerwise_from_gpu(
+        self,
+        memory_obj: MemoryObj,
+        layer_id: int,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        assert self.kvcaches is not None
+        num_tokens = len(slot_mapping)
+        dst = self._validate_dsa_c8_layerwise_memory_tensor(
+            memory_obj, num_tokens, self.kvcaches_device
+        )
+        slots = self._dsa_c8_layerwise_slots(slot_mapping, self.kvcaches_device)
+        cache_tuple = self.kvcaches[layer_id]
+        assert isinstance(cache_tuple, tuple)
+        for tensor_idx, cache_tensor in enumerate(cache_tuple):
+            offset_start, offset_end = self.dsa_c8_byte_offsets[tensor_idx]
+            flat_cache = self._flatten_dsa_c8_token_bytes(cache_tensor)
+            dst[:, offset_start:offset_end].copy_(flat_cache.index_select(0, slots))
+
+        if memory_obj.tensor.device != dst.device:
+            memory_obj.tensor.copy_(dst.to(memory_obj.tensor.device))
+
+
 def is_310p():
     global _IS_310P
     if _IS_310P is None:
@@ -44,7 +174,9 @@ def is_310p():
     return _IS_310P
 
 
-class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
+class VLLMBufferLayerwiseNPUConnector(
+    DsaC8LayerwiseRawByteMixin, VLLMBufferLayerwiseGPUConnector
+):
     def __init__(
         self,
         hidden_dim_size: int,
@@ -74,15 +206,13 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
             # is okay since fragmentation shouldn't exist in the `gpu_buffer_allocator`
             # in layerwise mode.
 
+            if self._initialize_dsa_c8_layerwise_layout(kv_caches):
+                logger.info("Detected KV cache format: %s", self.kv_format.name)
+                return
+
             self.kv_format = KVCacheFormat.detect(kv_caches)
             if self.kv_format == KVCacheFormat.UNDEFINED:
                 raise ValueError("Could not detect KV cache format.")
-            if self.kv_format.requires_raw_byte_transfer():
-                raise NotImplementedError(
-                    self.kv_format.unsupported_transfer_message(
-                        self.__class__.__name__
-                    )
-                )
 
             ref_tensor = (
                 kv_caches[0][0] if self.kv_format.is_separate_format() else kv_caches[0]
@@ -217,6 +347,19 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
             token sequence.
         """
         slot_mapping = self._prepare_transfer_context(kwargs)
+        if self.kv_format == KVCacheFormat.DSA_C8_KV:
+            for layer_id in range(self.num_layers):
+                memory_objs_layer = yield
+                for start, end, memory_obj in zip(
+                    starts, ends, memory_objs_layer, strict=False
+                ):
+                    self._dsa_c8_layerwise_to_gpu(
+                        memory_obj, layer_id, slot_mapping[start:end]
+                    )
+                logger.debug(f"Finished loading layer {layer_id}")
+            yield
+            yield
+            return
 
         if self.fused_rotary_emb is None and self.cache_positions:
             # TODO(Jiayi): Make this more elegant
@@ -366,6 +509,19 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
         slot_mapping = self._prepare_transfer_context(kwargs)
+        if self.kv_format == KVCacheFormat.DSA_C8_KV:
+            for layer_id in range(self.num_layers):
+                memory_objs_layer = memory_objs[layer_id]
+                for start, end, memory_obj in zip(
+                    starts, ends, memory_objs_layer, strict=False
+                ):
+                    self._dsa_c8_layerwise_from_gpu(
+                        memory_obj, layer_id, slot_mapping[start:end]
+                    )
+                yield
+                logger.debug(f"Finished offloading layer {layer_id}")
+            yield
+            return
 
         buf_start = 0
         buf_starts_ends = []
@@ -428,6 +584,14 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
         # free the buffer memory
         tmp_gpu_buffer_obj.ref_count_down()
         yield
+
+    def get_shape(self, num_tokens: int) -> torch.Size:
+        if self.kv_format == KVCacheFormat.DSA_C8_KV:
+            return self._dsa_c8_layerwise_shape(num_tokens)
+        return super().get_shape(num_tokens)
+
+    def get_dtype(self) -> torch.dtype:
+        return self._dsa_c8_layerwise_dtype()
 
 
 class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
@@ -1368,7 +1532,9 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             )
 
 
-class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
+class VLLMPagedMemLayerwiseNPUConnector(
+    DsaC8LayerwiseRawByteMixin, VLLMPagedMemLayerwiseGPUConnector
+):
     def __init__(
         self,
         hidden_dim_size: int,
@@ -1395,8 +1561,17 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         - New SEPARATE_KV: tuple(key_tensor, value_tensor) where each is
           [num_blocks, block_size, num_heads, head_size]
         """
+        if self.kv_format == KVCacheFormat.UNDEFINED:
+            if self._initialize_dsa_c8_layerwise_layout(kv_caches):
+                logger.info("Detected KV cache format: %s", self.kv_format.name)
+                return
+
         if self.use_gpu and self.gpu_buffer_allocator is None:
             logger.info("Lazily initializing GPU buffer.")
+
+            if self._initialize_dsa_c8_layerwise_layout(kv_caches):
+                logger.info("Detected KV cache format: %s", self.kv_format.name)
+                return
 
             self.kv_format = KVCacheFormat.detect(kv_caches, use_mla=self.use_mla)
 
@@ -1404,12 +1579,6 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 raise ValueError(
                     "Undefined KV cache format detected. "
                     "Unable to determine the format of input kv_caches."
-                )
-            if self.kv_format.requires_raw_byte_transfer():
-                raise NotImplementedError(
-                    self.kv_format.unsupported_transfer_message(
-                        self.__class__.__name__
-                    )
                 )
 
             logger.info(f"Detected KV cache format: {self.kv_format.name}")
@@ -1501,6 +1670,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sync: bool = kwargs["sync"]
 
         self._lazy_initialize_buffer(self.kvcaches)
+        if self.kv_format == KVCacheFormat.DSA_C8_KV:
+            for layer_id in range(self.num_layers):
+                memory_objs_layer = yield
+                for start, end, memory_obj in zip(
+                    starts, ends, memory_objs_layer, strict=False
+                ):
+                    self._dsa_c8_layerwise_to_gpu(
+                        memory_obj, layer_id, slot_mapping[start:end]
+                    )
+                logger.debug(f"Finished loading layer {layer_id}")
+            yield
+            yield
+            return
 
         slot_mapping_chunks = []
         for start, end in zip(starts, ends, strict=False):
@@ -1637,6 +1819,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         sync: bool = kwargs["sync"]
 
         self._lazy_initialize_buffer(self.kvcaches)
+        if self.kv_format == KVCacheFormat.DSA_C8_KV:
+            for layer_id in range(self.num_layers):
+                memory_objs_layer = memory_objs[layer_id]
+                for start, end, memory_obj in zip(
+                    starts, ends, memory_objs_layer, strict=False
+                ):
+                    self._dsa_c8_layerwise_from_gpu(
+                        memory_obj, layer_id, slot_mapping[start:end]
+                    )
+                yield
+                logger.debug(f"Finished offloading layer {layer_id}")
+            yield
+            return
 
         slot_mapping_chunks = []
         for start, end in zip(starts, ends, strict=False):
@@ -1720,6 +1915,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if self.use_gpu and tmp_gpu_buffer_obj is not None:
             tmp_gpu_buffer_obj.ref_count_down()
         yield
+
+    def get_shape(self, num_tokens: int) -> torch.Size:
+        if self.kv_format == KVCacheFormat.DSA_C8_KV:
+            return self._dsa_c8_layerwise_shape(num_tokens)
+        return super().get_shape(num_tokens)
+
+    def get_dtype(self) -> torch.dtype:
+        return self._dsa_c8_layerwise_dtype()
 
 
 class SGLangNPUConnector(SGLangGPUConnector):

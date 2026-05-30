@@ -150,10 +150,110 @@ def test_vllm_paged_connector_v2_dsa_c8_roundtrip_with_npu():
     [
         VLLMBufferLayerwiseNPUConnector,
         VLLMPagedMemLayerwiseNPUConnector,
-        SGLangLayerwiseNPUConnector,
     ],
 )
-def test_dsa_c8_layerwise_connectors_fail_fast(connector_cls):
+def test_dsa_c8_vllm_layerwise_connectors_roundtrip_with_npu(connector_cls):
+    num_blocks = 4
+    block_size = 16
+    num_layers = 2
+    num_tokens = 11
+    device = "npu"
+
+    kv_src = generate_dsa_c8_kv_cache(
+        num_blocks=num_blocks,
+        device=device,
+        num_layers=num_layers,
+        num_kv_heads=1,
+        kv_lora_rank=16,
+        qk_rope_head_dim=8,
+        indexer_heads=2,
+        indexer_head_dim=8,
+        block_size=block_size,
+    )
+    kv_dst = generate_dsa_c8_kv_cache(
+        num_blocks=num_blocks,
+        device=device,
+        num_layers=num_layers,
+        num_kv_heads=1,
+        kv_lora_rank=16,
+        qk_rope_head_dim=8,
+        indexer_heads=2,
+        indexer_head_dim=8,
+        block_size=block_size,
+    )
+
+    slot_mapping = torch.randperm(
+        num_blocks * block_size, device=device, dtype=torch.int64
+    )[:num_tokens]
+    bytes_per_token = get_tuple_bytes_per_token(kv_src[0])
+    allocator = PinMemoryAllocator(1024 * 1024 * 16)
+    memory_objs = [
+        [
+            allocator.allocate(
+                torch.Size([num_tokens, bytes_per_token]),
+                torch.uint8,
+                fmt=MemoryFormat.KV_T2D,
+            )
+        ]
+        for _ in range(num_layers)
+    ]
+    assert all(layer_objs[0] is not None for layer_objs in memory_objs)
+
+    connector_kwargs = {
+        "chunk_size": num_tokens,
+        "dtype": torch.uint8,
+        "device": torch.device(device),
+    }
+    use_gpu = connector_cls is VLLMBufferLayerwiseNPUConnector
+    store_connector = connector_cls(
+        bytes_per_token,
+        num_layers,
+        use_gpu=use_gpu,
+        **connector_kwargs,
+    )
+    load_connector = connector_cls(
+        bytes_per_token,
+        num_layers,
+        use_gpu=use_gpu,
+        **connector_kwargs,
+    )
+
+    store_gen = store_connector.batched_from_gpu(
+        memory_objs,
+        [0],
+        [num_tokens],
+        kvcaches=kv_src,
+        slot_mapping=slot_mapping,
+        sync=True,
+    )
+    for _ in range(num_layers + 1):
+        next(store_gen)
+
+    load_gen = load_connector.batched_to_gpu(
+        [0],
+        [num_tokens],
+        kvcaches=kv_dst,
+        slot_mapping=slot_mapping,
+        sync=True,
+    )
+    next(load_gen)
+    for layer_id in range(num_layers):
+        load_gen.send(memory_objs[layer_id])
+    next(load_gen)
+    torch.npu.synchronize()
+
+    for src_layer, dst_layer in zip(kv_src, kv_dst, strict=True):
+        for src_tensor, dst_tensor in zip(src_layer, dst_layer, strict=True):
+            assert torch.equal(
+                src_tensor.reshape(num_blocks * block_size, -1)[slot_mapping],
+                dst_tensor.reshape(num_blocks * block_size, -1)[slot_mapping],
+            )
+
+    for layer_objs in memory_objs:
+        allocator.free(layer_objs[0])
+
+
+def test_dsa_c8_sglang_layerwise_connector_fail_fast():
     kv_caches = generate_dsa_c8_kv_cache(
         num_blocks=2,
         device="cpu",
@@ -165,7 +265,7 @@ def test_dsa_c8_layerwise_connectors_fail_fast(connector_cls):
         indexer_head_dim=8,
         block_size=16,
     )
-    connector = object.__new__(connector_cls)
+    connector = object.__new__(SGLangLayerwiseNPUConnector)
     connector.use_gpu = True
     connector.use_mla = False
     connector.gpu_buffer_allocator = None
