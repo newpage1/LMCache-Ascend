@@ -64,6 +64,7 @@ class AscendPDReceiverMixin:
         Used in **push mode** only.  The receiver pre-allocates NPU pages
         and returns their HCCL buffer references so the sender can write.
         """
+        allocate_start = time.perf_counter()
         total_allocs = len(alloc_request.keys)
         fmt = MemoryFormat(alloc_request.fmt)
         dtype = STR_DTYPE_TO_TORCH_DTYPE[alloc_request.dtype]
@@ -110,6 +111,12 @@ class AscendPDReceiverMixin:
                     for k in allocated_keys:
                         self.data.pop(k, None)
                 release_memory_objects(allocated_objs + already_sent_objs)
+                self.backend_metrics.record_operation(
+                    "allocate", "error", time.perf_counter() - allocate_start
+                )
+                self.backend_metrics.record_chunks(
+                    "allocate", "error", len(new_indexes)
+                )
                 return AscendAllocResponse(
                     already_sent_indexes=already_sent_indexes,
                     remote_buffer_uuids=[],
@@ -126,6 +133,10 @@ class AscendPDReceiverMixin:
             allocated_objs.append(mem_obj)
 
         release_memory_objects(already_sent_objs)
+        self.backend_metrics.record_operation(
+            "allocate", "success", time.perf_counter() - allocate_start
+        )
+        self.backend_metrics.record_chunks("allocate", "success", len(allocated_objs))
 
         return AscendAllocResponse(
             already_sent_indexes=already_sent_indexes,
@@ -162,6 +173,7 @@ class AscendPDReceiverMixin:
         before the ``PullDoneSignal`` arrives on the listener thread,
         eliminating the race between the two sender threads.
         """
+        allocate_start = time.perf_counter()
         total_allocs = len(msg.keys)
         fmt = MemoryFormat(msg.fmt)
         dtype = STR_DTYPE_TO_TORCH_DTYPE[msg.dtype]
@@ -206,6 +218,12 @@ class AscendPDReceiverMixin:
                 )
                 # release the mem objs + sent
                 release_memory_objects(mem_objs + already_sent_objs)
+                self.backend_metrics.record_operation(
+                    "allocate", "error", time.perf_counter() - allocate_start
+                )
+                self.backend_metrics.record_chunks(
+                    "allocate", "error", len(new_indexes)
+                )
                 return (
                     PullReadyDoneAck(
                         already_sent_indexes=already_sent_indexes,
@@ -219,22 +237,44 @@ class AscendPDReceiverMixin:
             remote_mem_indexes.append(msg.sender_mem_indexes[idx])
             mem_keys.append(key)
 
+        self.backend_metrics.record_operation(
+            "allocate", "success", time.perf_counter() - allocate_start
+        )
+        self.backend_metrics.record_chunks("allocate", "success", len(mem_objs))
+
         channel_transfer_spec = build_channel_transfer_spec(
             sender_id,
             remote_buffer_uuids,
             remote_mem_indexes,
+            self.backend_metrics.get_transfer_completion_callback(),
         )
-        self.transfer_channel.batched_read(
-            buffers=mem_objs,
-            transfer_spec=channel_transfer_spec,
+        transfer_start = time.perf_counter()
+        try:
+            self.transfer_channel.batched_read(
+                buffers=mem_objs,
+                transfer_spec=channel_transfer_spec,
+            )
+        except Exception:
+            self.backend_metrics.record_operation(
+                "transfer", "error", time.perf_counter() - transfer_start
+            )
+            raise
+        self.backend_metrics.record_operation(
+            "transfer", "success", time.perf_counter() - transfer_start
         )
+        self.backend_metrics.record_chunks("transfer", "success", len(mem_objs))
 
         # batched_read() synchronizes the transport stream, so all RDMA
         # reads are complete at this point.  Store the received data.
+        store_start = time.perf_counter()
         for mem_obj, key in zip(mem_objs, mem_keys, strict=False):
             self.put(key, mem_obj)
 
         release_memory_objects(already_sent_objs)
+        self.backend_metrics.record_operation(
+            "store", "success", time.perf_counter() - store_start
+        )
+        self.backend_metrics.record_chunks("store", "success", len(mem_objs))
 
         # Build a callback that sends PullDoneSignal AFTER the ack reply
         # has been sent on the REP socket.  This prevents the sender's
@@ -309,6 +349,9 @@ class AscendPDReceiverMixin:
                 shapes=sender_shapes,
                 dtypes=sender_dtypes,
                 fmt=fmt,
+                transfer_completion_callback=(
+                    self.backend_metrics.get_transfer_completion_callback()
+                ),
             )
 
             for proxy_seq, msg_idx in enumerate(new_indexes):

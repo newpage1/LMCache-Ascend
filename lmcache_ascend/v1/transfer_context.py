@@ -67,6 +67,7 @@ class AscendBaseTransferContext:
         shapes: Optional[List[torch.Size]] = None,
         dtypes: Optional[List[torch.dtype]] = None,
         fmt: MemoryFormat = MemoryFormat.UNDEFINED,
+        transfer_completion_callback: Any = None,
     ):
         self._ref_count = num_proxies
         self._done_sent = False
@@ -76,6 +77,7 @@ class AscendBaseTransferContext:
         self._shapes = shapes
         self._dtypes = dtypes
         self._fmt = fmt
+        self.transfer_completion_callback = transfer_completion_callback
 
     @property
     def _allocator_type(self) -> str:
@@ -175,6 +177,7 @@ class P2PTransferContext(AscendBaseTransferContext):
         dtypes: Optional[List[torch.dtype]] = None,
         fmt: MemoryFormat = MemoryFormat.UNDEFINED,
         use_npu: bool = False,
+        transfer_completion_callback: Any = None,
     ):
         super().__init__(
             num_proxies=num_proxies,
@@ -182,6 +185,7 @@ class P2PTransferContext(AscendBaseTransferContext):
             shapes=shapes,
             dtypes=dtypes,
             fmt=fmt,
+            transfer_completion_callback=transfer_completion_callback,
         )
         self._p2p_backend = p2p_backend
         self._target_peer_url = target_peer_url
@@ -284,6 +288,7 @@ class PDTransferContext(AscendBaseTransferContext):
         shapes: List[torch.Size],
         dtypes: List[torch.dtype],
         fmt: MemoryFormat,
+        transfer_completion_callback: Any = None,
     ):
         super().__init__(
             num_proxies=num_proxies,
@@ -291,6 +296,7 @@ class PDTransferContext(AscendBaseTransferContext):
             shapes=shapes,
             dtypes=dtypes,
             fmt=fmt,
+            transfer_completion_callback=transfer_completion_callback,
         )
         self._sender_id = sender_id
         self._done_callback = done_callback

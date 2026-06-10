@@ -22,6 +22,7 @@ import torch
 # First Party
 from lmcache_ascend.v1.kv_format import KVCacheFormat
 from lmcache_ascend.v1.proxy_memory_obj import ProxyMemoryObj
+from lmcache_ascend.v1.transfer_channel.transfer_spec import TimedTransferEvent
 from lmcache_ascend.v1.transfer_context import AscendBaseTransferContext
 import lmcache_ascend.c_ops as lmc_ops
 
@@ -927,7 +928,8 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         cross-stream synchronization.
         """
         if event is not None:
-            self.load_stream.wait_event(event)
+            npu_event = event.event if isinstance(event, TimedTransferEvent) else event
+            self.load_stream.wait_event(npu_event)
         with torch.cuda.stream(self.load_stream):
             for proxy, start, end in batch:
                 self.to_gpu(proxy.backing_obj, start, end, **kwargs)
@@ -979,6 +981,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             pool_size = min(pipeline_depth, len(proxy_items))
             pool_a = None
             pool_b = None
+            timed_transfer_events: list[TimedTransferEvent] = []
 
             try:
                 pool_a = first_ctx.allocate_buffers(pool_size)
@@ -1027,6 +1030,8 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
 
                     # Submit RDMA read for current batch → transport_stream.
                     cur_read_event = ProxyMemoryObj.submit_resolve_batch(proxies)
+                    if isinstance(cur_read_event, TimedTransferEvent):
+                        timed_transfer_events.append(cur_read_event)
 
                     # While the current batch is being read on
                     # transport_stream, scatter the previous batch on
@@ -1060,6 +1065,14 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                 # exception would leak NPU pages and leave the sender's
                 # pinned resources stuck until its TTL expires.
                 self.load_stream.synchronize()
+                for event in timed_transfer_events:
+                    try:
+                        event.report()
+                    except Exception:
+                        logger.warning(
+                            "Failed to report delayed transfer timing",
+                            exc_info=True,
+                        )
                 if pool_a is not None:
                     first_ctx.release_buffers(pool_a)
                 if pool_b is not None:

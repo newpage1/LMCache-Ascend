@@ -405,11 +405,25 @@ class AscendPDSenderMixin:
                 receiver_id,
                 send_buffer_uuids,
                 send_mem_indexes,
+                self.backend_metrics.get_transfer_completion_callback(),
             )
 
-            self.transfer_channel.batched_write(
-                objects=mem_objs_to_send,
-                transfer_spec=channel_transfer_spec,
+            transfer_start = time.perf_counter()
+            try:
+                self.transfer_channel.batched_write(
+                    objects=mem_objs_to_send,
+                    transfer_spec=channel_transfer_spec,
+                )
+            except Exception:
+                self.backend_metrics.record_operation(
+                    "transfer", "error", time.perf_counter() - transfer_start
+                )
+                raise
+            self.backend_metrics.record_operation(
+                "transfer", "success", time.perf_counter() - transfer_start
+            )
+            self.backend_metrics.record_chunks(
+                "transfer", "success", len(mem_objs_to_send)
             )
 
             release_memory_objects(mem_objs_to_send)

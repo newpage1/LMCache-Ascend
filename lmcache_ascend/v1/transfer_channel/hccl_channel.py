@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import Dict, Optional, Union
+from typing import Any, Dict, Optional, Union
 import asyncio
 import pickle
 import threading
@@ -28,7 +28,11 @@ from .buffer_config import (
     RemotePeerBufferList,
 )
 from .hccl_agent import HcclAgentWrapper
-from .transfer_spec import TS_RECEIVER_ID
+from .transfer_spec import (
+    TS_RECEIVER_ID,
+    TS_TRANSFER_COMPLETION_CALLBACK,
+    TimedTransferEvent,
+)
 
 logger = init_logger(__name__)
 
@@ -117,6 +121,33 @@ class HcclChannel(BaseMultiBufferChannel):
             lock = asyncio.Lock()
             self._peer_handshake_locks[peer_id] = lock
         return lock
+
+    def _start_transfer_timing(self, transfer_spec: dict):
+        callback = transfer_spec.get(TS_TRANSFER_COMPLETION_CALLBACK)
+        if callback is None:
+            return None, None
+        start_event = torch.npu.Event(enable_timing=True)
+        end_event = torch.npu.Event(enable_timing=True)
+        start_event.record(self.transport_stream)
+        return start_event, end_event
+
+    def _report_transfer_timing(
+        self,
+        transfer_spec: dict,
+        start_event,
+        end_event,
+        num_objects: int,
+    ) -> None:
+        callback = transfer_spec.get(TS_TRANSFER_COMPLETION_CALLBACK)
+        if callback is None or start_event is None or end_event is None:
+            return
+        try:
+            callback(
+                start_event.elapsed_time(end_event) / 1000,
+                num_objects * self.page_size,
+            )
+        except Exception:
+            logger.warning("HCCL transfer completion callback failed", exc_info=True)
 
     def lazy_init_peer_connection(
         self,
@@ -485,11 +516,17 @@ class HcclChannel(BaseMultiBufferChannel):
         """
         assert transfer_spec is not None
         conn_handle, write_ops = self._build_write_ops(objects, transfer_spec)
+        start_event, end_event = self._start_transfer_timing(transfer_spec)
 
         self.hccl_agent.write_batch(
             conn_handle, write_ops, self.transport_stream.npu_stream
         )
+        if end_event is not None:
+            end_event.record(self.transport_stream)
         self.transport_stream.synchronize()
+        self._report_transfer_timing(
+            transfer_spec, start_event, end_event, len(objects)
+        )
         return len(objects)
 
     def batched_read(
@@ -505,8 +542,11 @@ class HcclChannel(BaseMultiBufferChannel):
 
         :return: Number of successfully transferred objects.
         """
-        self.submit_batched_read(buffers, transfer_spec)
+        assert transfer_spec is not None
+        completion = self.submit_batched_read(buffers, transfer_spec)
         self.transport_stream.synchronize()
+        if isinstance(completion, TimedTransferEvent):
+            completion.report()
         return len(buffers)
 
     async def async_batched_write(
@@ -525,16 +565,20 @@ class HcclChannel(BaseMultiBufferChannel):
         """
         assert transfer_spec is not None
         conn_handle, write_ops = self._build_write_ops(objects, transfer_spec)
+        start_event, end_event = self._start_transfer_timing(transfer_spec)
 
         self.hccl_agent.write_batch(
             conn_handle, write_ops, self.transport_stream.npu_stream
         )
 
-        event = torch.npu.Event()
+        event = end_event if end_event is not None else torch.npu.Event()
         event.record(self.transport_stream)
         while not event.query():
             await asyncio.sleep(0.001)
 
+        self._report_transfer_timing(
+            transfer_spec, start_event, end_event, len(objects)
+        )
         return len(objects)
 
     def _build_read_ops(
@@ -582,23 +626,27 @@ class HcclChannel(BaseMultiBufferChannel):
         """
         assert transfer_spec is not None
         conn_handle, read_ops = self._build_read_ops(buffers, transfer_spec)
+        start_event, end_event = self._start_transfer_timing(transfer_spec)
 
         self.hccl_agent.read_batch(
             conn_handle, read_ops, self.transport_stream.npu_stream
         )
 
-        event = torch.npu.Event()
+        event = end_event if end_event is not None else torch.npu.Event()
         event.record(self.transport_stream)
         while not event.query():
             await asyncio.sleep(0.001)
 
+        self._report_transfer_timing(
+            transfer_spec, start_event, end_event, len(buffers)
+        )
         return len(buffers)
 
     def submit_batched_read(
         self,
         buffers: Union[list[bytes], list[MemoryObj]],
         transfer_spec: Optional[dict] = None,
-    ) -> torch.npu.Event:
+    ) -> Any:
         """Submit a batched read to the transport stream without waiting.
 
         Unlike async_batched_read, this returns immediately after submitting
@@ -618,13 +666,23 @@ class HcclChannel(BaseMultiBufferChannel):
         """
         assert transfer_spec is not None
         conn_handle, read_ops = self._build_read_ops(buffers, transfer_spec)
+        start_event, end_event = self._start_transfer_timing(transfer_spec)
 
         self.hccl_agent.read_batch(
             conn_handle, read_ops, self.transport_stream.npu_stream
         )
 
-        event = torch.npu.Event()
+        event = end_event if end_event is not None else torch.npu.Event()
         event.record(self.transport_stream)
+        callback = transfer_spec.get(TS_TRANSFER_COMPLETION_CALLBACK)
+        if callback is not None and start_event is not None and end_event is not None:
+            return TimedTransferEvent(
+                event=event,
+                start_event=start_event,
+                end_event=end_event,
+                callback=callback,
+                num_bytes=len(buffers) * self.page_size,
+            )
         return event
 
     def close(self):

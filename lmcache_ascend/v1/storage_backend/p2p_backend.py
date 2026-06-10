@@ -51,6 +51,10 @@ import zmq.asyncio
 
 # First Party
 from lmcache_ascend.v1.proxy_memory_obj import ProxyMemoryObj
+from lmcache_ascend.v1.storage_backend.backend_metrics import (
+    AscendBackendMetrics,
+    lookup_result,
+)
 from lmcache_ascend.v1.storage_backend.utils import (
     build_channel_transfer_spec,
     release_memory_objects,
@@ -220,6 +224,23 @@ class AscendP2PBackend(P2PBackend):
                     "P2P delay pull enabled. "
                     "The npu connector will pull the data on-the-fly."
                 )
+
+        mode = (
+            "delay_pull" if self.delay_pull else "pull" if self.pull_mode else "push"
+        )
+        device = "npu" if self.use_npu else "cpu"
+        self.backend_metrics = AscendBackendMetrics(
+            backend="p2p",
+            backend_role="client",
+            mode=mode,
+            device=device,
+        )
+        self.server_backend_metrics = AscendBackendMetrics(
+            backend="p2p",
+            backend_role="server",
+            mode=mode,
+            device=device,
+        )
 
         self.full_size_shapes = self.memory_allocator.cpu_allocator.shapes
         self.dtypes = self.memory_allocator.cpu_allocator.dtypes
@@ -599,6 +620,8 @@ class AscendP2PBackend(P2PBackend):
         self, msg: AscendBatchedLookupAndGetMsg
     ) -> Union[AscendBatchedLookupAndGetRetMsg, P2PErrorMsg]:
         lookup_id = msg.lookup_id
+        requested_chunks = len(msg.keys)
+        lookup_recorded = False
         mem_objs = None
         should_release = True
         try:
@@ -611,6 +634,11 @@ class AscendP2PBackend(P2PBackend):
                     "Receiver %s does not exist in transfer channel",
                     receiver_id,
                 )
+                self.server_backend_metrics.record_operation("lookup", "error")
+                self.server_backend_metrics.record_chunks(
+                    "lookup", "miss", requested_chunks
+                )
+                lookup_recorded = True
                 return P2PErrorMsg(
                     error_code=P2PErrorCode.REMOTE_XFER_HANDLER_NOT_INITIALIZED
                 )
@@ -620,6 +648,7 @@ class AscendP2PBackend(P2PBackend):
             # TODO(Jiayi): Optimally, there's no need to use async call
             # for some backends (e.g., local cpu) as there's overhead for
             # async function call.
+            lookup_start = time.perf_counter()
             num_hit_chunks = await self.local_cpu_backend.batched_async_contains(
                 lookup_id=lookup_id,
                 keys=keys,
@@ -630,6 +659,18 @@ class AscendP2PBackend(P2PBackend):
                 lookup_id=lookup_id,
                 keys=keys[:num_hit_chunks],
             )
+            lookup_duration = time.perf_counter() - lookup_start
+            result = lookup_result(num_hit_chunks, requested_chunks)
+            self.server_backend_metrics.record_operation(
+                "lookup", result, lookup_duration
+            )
+            self.server_backend_metrics.record_chunks(
+                "lookup", "hit", num_hit_chunks
+            )
+            self.server_backend_metrics.record_chunks(
+                "lookup", "miss", requested_chunks - num_hit_chunks
+            )
+            lookup_recorded = True
 
             if msg.pull_mode:
                 # actual data transfer will be triggered
@@ -669,14 +710,33 @@ class AscendP2PBackend(P2PBackend):
                 receiver_id,
                 remote_buffer_uuids[:num_hit_chunks],
                 remote_mem_indexes[:num_hit_chunks],
+                self.server_backend_metrics.get_transfer_completion_callback(),
             )
-            await self.transfer_channel.async_batched_write(
-                objects=mem_objs,
-                transfer_spec=channel_transfer_spec,
+            transfer_start = time.perf_counter()
+            try:
+                await self.transfer_channel.async_batched_write(
+                    objects=mem_objs,
+                    transfer_spec=channel_transfer_spec,
+                )
+            except Exception:
+                self.server_backend_metrics.record_operation(
+                    "transfer", "error", time.perf_counter() - transfer_start
+                )
+                raise
+            self.server_backend_metrics.record_operation(
+                "transfer", "success", time.perf_counter() - transfer_start
+            )
+            self.server_backend_metrics.record_chunks(
+                "transfer", "success", num_hit_chunks
             )
 
             return AscendBatchedLookupAndGetRetMsg(num_hit_chunks=num_hit_chunks)
         except Exception as e:
+            if not lookup_recorded:
+                self.server_backend_metrics.record_operation("lookup", "error")
+                self.server_backend_metrics.record_chunks(
+                    "lookup", "miss", requested_chunks
+                )
             logger.error(
                 "Error during P2P batched lookup and get operation "
                 "for lookup_id %s: %s",
@@ -1205,11 +1265,13 @@ class AscendP2PBackend(P2PBackend):
             return False
 
         read_success = False
+        transfer_start = time.perf_counter()
         try:
             channel_transfer_spec = build_channel_transfer_spec(
                 target_peer_url,
                 remote_buffer_uuids,
                 remote_mem_indexes,
+                self.backend_metrics.get_transfer_completion_callback(),
             )
             await self.transfer_channel.async_batched_read(
                 buffers=hit_mem_objs,
@@ -1217,6 +1279,9 @@ class AscendP2PBackend(P2PBackend):
             )
             read_success = True
         except Exception as e:
+            self.backend_metrics.record_operation(
+                "transfer", "error", time.perf_counter() - transfer_start
+            )
             logger.error(
                 "Error during P2P batched read operation for lookup_id %s: %s",
                 lookup_id,
@@ -1225,6 +1290,13 @@ class AscendP2PBackend(P2PBackend):
             )
             # Do not return yet — must send Done signal to server
 
+        if read_success:
+            self.backend_metrics.record_operation(
+                "transfer", "success", time.perf_counter() - transfer_start
+            )
+            self.backend_metrics.record_chunks(
+                "transfer", "success", len(hit_mem_objs)
+            )
         await self._send_done_signal(lookup_id, target_peer_url)
         return read_success
 
@@ -1277,10 +1349,15 @@ class AscendP2PBackend(P2PBackend):
             pull_mode=self.pull_mode,
         )
 
+        lookup_start = time.perf_counter()
         ret_msg = await self._run_on_p2p_loop(
             self._send_lookup_request_with_retry(lookup_id, target_peer_url, msg)
         )
         if ret_msg is None or isinstance(ret_msg, P2PErrorMsg):
+            self.backend_metrics.record_operation(
+                "lookup", "error", time.perf_counter() - lookup_start
+            )
+            self.backend_metrics.record_chunks("lookup", "miss", len(keys))
             if isinstance(ret_msg, P2PErrorMsg):
                 logger.error(
                     "P2P error for lookup_id %s, error code: %s",
@@ -1292,6 +1369,14 @@ class AscendP2PBackend(P2PBackend):
             return []
 
         num_hit_chunks = ret_msg.num_hit_chunks
+        result = lookup_result(num_hit_chunks, len(keys))
+        self.backend_metrics.record_operation(
+            "lookup", result, time.perf_counter() - lookup_start
+        )
+        self.backend_metrics.record_chunks("lookup", "hit", num_hit_chunks)
+        self.backend_metrics.record_chunks(
+            "lookup", "miss", len(keys) - num_hit_chunks
+        )
 
         if num_hit_chunks > 0 and self.pull_mode and self.delay_pull:
             # Create lightweight ProxyMemoryObjs (no backing memory).
@@ -1309,6 +1394,9 @@ class AscendP2PBackend(P2PBackend):
                 dtypes=self.dtypes,
                 fmt=self.fmt,
                 use_npu=self.use_npu,
+                transfer_completion_callback=(
+                    self.backend_metrics.get_transfer_completion_callback()
+                ),
             )
 
             proxy_objs: list[MemoryObj] = []
