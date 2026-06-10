@@ -20,6 +20,7 @@ from lmcache_ascend.v1.transfer_channel.transfer_spec import (
     TS_RECEIVER_ID,
     TS_REMOTE_BUFFER_UUIDS,
     TS_REMOTE_MEM_INDEXES,
+    TS_TRANSFER_COMPLETION_CALLBACK,
 )
 
 logger = init_logger(__name__)
@@ -34,13 +35,17 @@ def build_channel_transfer_spec(
     receiver_id: str,
     remote_buffer_uuids: list[str],
     remote_mem_indexes: list[int],
+    transfer_completion_callback: Optional[Callable[[float, int], None]] = None,
 ) -> dict[str, Any]:
     """Build a transfer-spec dict consumed by the transfer channel."""
-    return {
+    transfer_spec = {
         TS_RECEIVER_ID: receiver_id,
         TS_REMOTE_BUFFER_UUIDS: remote_buffer_uuids,
         TS_REMOTE_MEM_INDEXES: remote_mem_indexes,
     }
+    if transfer_completion_callback is not None:
+        transfer_spec[TS_TRANSFER_COMPLETION_CALLBACK] = transfer_completion_callback
+    return transfer_spec
 
 
 def release_memory_objects(

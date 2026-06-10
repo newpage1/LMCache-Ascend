@@ -27,6 +27,7 @@ from lmcache_ascend.v1.transfer_channel.transfer_spec import (
     TS_RECEIVER_ID,
     TS_REMOTE_BUFFER_UUIDS,
     TS_REMOTE_MEM_INDEXES,
+    TS_TRANSFER_COMPLETION_CALLBACK,
 )
 from lmcache_ascend.v1.transfer_context import AscendBaseTransferContext
 
@@ -221,6 +222,9 @@ class ProxyMemoryObj(MemoryObj):
             TS_REMOTE_BUFFER_UUIDS: remote_buffer_uuids,
             TS_REMOTE_MEM_INDEXES: remote_mem_indexes,
         }
+        callback = unresolved[0]._transfer_context.transfer_completion_callback
+        if callback is not None:
+            channel_transfer_spec[TS_TRANSFER_COMPLETION_CALLBACK] = callback
         return buffers, channel_transfer_spec
 
     @staticmethod

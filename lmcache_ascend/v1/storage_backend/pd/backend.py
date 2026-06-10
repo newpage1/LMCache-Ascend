@@ -10,6 +10,7 @@ allocation, and key lookup/partitioning.
 # Standard
 from typing import Optional, Union
 import threading
+import time
 
 # Third Party
 from lmcache.integration.vllm.utils import get_size_bytes
@@ -31,6 +32,10 @@ import zmq
 # First Party
 from lmcache_ascend.v1.proxy_memory_obj import ProxyMemoryObj
 from lmcache_ascend.v1.rpc_utils import _find_free_port
+from lmcache_ascend.v1.storage_backend.backend_metrics import (
+    AscendBackendMetrics,
+    lookup_result,
+)
 from lmcache_ascend.v1.storage_backend.pd.receiver_mixin import AscendPDReceiverMixin
 from lmcache_ascend.v1.storage_backend.pd.sender_mixin import AscendPDSenderMixin
 from lmcache_ascend.v1.storage_backend.utils import resolve_memory_format
@@ -94,6 +99,17 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
             assert self.pd_config.buffer_device.startswith("npu"), (
                 "Delay pull only works when buffer device is NPU"
             )
+
+        mode = (
+            "delay_pull" if self.delay_pull else "pull" if self.pull_mode else "push"
+        )
+        device = "npu" if self.pd_config.buffer_device.startswith("npu") else "cpu"
+        self.backend_metrics = AscendBackendMetrics(
+            backend="pd",
+            backend_role=self.pd_config.role,
+            mode=mode,
+            device=device,
+        )
 
         # Keep config ref for extra_config access (e.g., pull_done_port)
         self._config = config
@@ -323,6 +339,7 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
         new_indexes : list[int]
             Indexes (into *keys*) of chunks that need to be fetched.
         """
+        lookup_start = time.perf_counter()
         already_sent_indexes: list[int] = []
         already_sent_objs: list[MemoryObj] = []
         new_indexes: list[int] = []
@@ -334,4 +351,11 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
                 already_sent_objs.append(pinned)
             else:
                 new_indexes.append(idx)
+        reused = len(already_sent_indexes)
+        result = lookup_result(reused, len(keys))
+        self.backend_metrics.record_operation(
+            "lookup", result, time.perf_counter() - lookup_start
+        )
+        self.backend_metrics.record_chunks("lookup", "reused", reused)
+        self.backend_metrics.record_chunks("lookup", "miss", len(new_indexes))
         return already_sent_indexes, already_sent_objs, new_indexes
