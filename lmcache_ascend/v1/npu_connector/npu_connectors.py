@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import time
 from typing import Any, List, Optional, Set, Union
 
 # Third Party
@@ -20,6 +21,7 @@ from lmcache.v1.metadata import LMCacheMetadata
 import torch
 
 # First Party
+from lmcache_ascend.v1 import cost_model as _cost_model_mod
 from lmcache_ascend.v1.kv_format import (
     KVCacheFormat,
     get_tuple_byte_offsets,
@@ -1317,6 +1319,16 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             # and can race ahead.
             torch.npu.current_stream().wait_stream(self.load_stream)
         else:
+            # ---- Fetch-bandwidth sampling for the cost gate ------------
+            # Time the full blocking fetch path (H2D memcpy + scatter +
+            # load-stream sync) and report the effective bandwidth to the
+            # cost model, if one is registered for this device. This is the
+            # signal that lets the gate decide fetch-vs-recompute. Sampling
+            # is a no-op when no model is registered (gate disabled).
+            cm = _cost_model_mod.get_cost_model()
+            _sample = cm is not None and cm.enabled
+            if _sample:
+                _t0 = time.perf_counter()
             with torch.cuda.stream(self.load_stream):
                 for memory_obj, start, end in zip(
                     memory_objs, starts, ends, strict=False
@@ -1326,6 +1338,11 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                     else:
                         self.to_gpu(memory_obj, start, end, **kwargs)
             self.load_stream.synchronize()
+            if _sample:
+                _elapsed = time.perf_counter() - _t0
+                # Token count for this batch = sum of (end - start) spans.
+                _n_tokens = int(sum(e - s for s, e in zip(starts, ends)))
+                cm.observe_fetch(_n_tokens, _elapsed)
 
     def _clear_proxy_batch(self, batch) -> None:
         """Clear the backing objects of the proxy batch."""

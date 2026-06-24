@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import time
 from typing import TYPE_CHECKING, Any, Optional
 
 # Third Party
@@ -21,6 +22,8 @@ from vllm.v1.request import RequestStatus
 import torch
 
 # First Party
+from lmcache_ascend.v1 import cost_model
+from lmcache_ascend.v1.cost_model import FetchRecomputeCostModel
 from lmcache_ascend.v1.kv_format import KVCacheFormat
 
 if TYPE_CHECKING:
@@ -46,11 +49,156 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         self._late_finished_sending: set[str] = set()
         logger.debug("store_async: %s", self.store_async)
 
+        # ---- Fetch-vs-Recompute cost gate -------------------------------
+        # A coarse-grained (per-request, all-or-nothing) decision: when the
+        # storage backend is slow, pulling N cached tokens may be slower than
+        # recomputing them. See cost_model.py for the full rationale.
+        self._cost_model = FetchRecomputeCostModel(
+            enabled=bool(getattr(self.config, "fetch_recompute_gate_enable", False)),
+            ema_alpha=float(getattr(self.config, "cost_ema_alpha", 0.2)),
+            min_samples=int(getattr(self.config, "cost_min_samples", 5)),
+            log_decisions=bool(getattr(self.config, "cost_gate_log_enable", True)),
+        )
+        # Configure per-token KV size from model geometry. This is the K+V
+        # footprint of one token across all layers, in bytes.
+        try:
+            model_config = vllm_config.model_config
+            num_layers = model_config.get_num_layers(vllm_config.parallel_config)
+            num_kv_heads = model_config.get_num_kv_heads(
+                vllm_config.parallel_config
+            )
+            head_size = model_config.get_head_size()
+            # Element width from the model dtype (e.g. bfloat16 -> 2 bytes).
+            dtype_size = max(
+                torch.tensor([], dtype=model_config.dtype).element_size(), 1
+            )
+            self._cost_model.set_bytes_per_token(
+                num_layers, num_kv_heads, head_size, dtype_size
+            )
+        except Exception:  # pragma: no cover - best-effort init
+            logger.exception("CostGate: failed to initialize bytes_per_token; "
+                             "gate will stay conservative.")
+        # State for step-level prefill (recompute) sampling. We measure the
+        # wall-clock span of a prefill step at the next step's start_load_kv,
+        # so we only need a (prev_step_time, prev_step_prefill_tokens) tuple.
+        self._prefill_sample_time: Optional[float] = None
+        self._prefill_sample_tokens: int = 0
+        if self._cost_model.enabled:
+            logger.info(
+                "CostGate enabled (ema_alpha=%.2f, min_samples=%d).",
+                self._cost_model.ema_alpha, self._cost_model.min_samples,
+            )
+            # Publish the cost model so the NPU connector can feed it fetch
+            # bandwidth samples. Keyed by the NPU device id this process owns.
+            try:
+                device_id = int(torch.npu.current_device())
+            except Exception:  # pragma: no cover - non-NPU test envs
+                device_id = 0
+            cost_model.register_cost_model(device_id, self._cost_model)
+
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         self.current_layer = 0
         self._wait_for_save_done = False
+
+        # ---- Step-level recompute (prefill) sampling --------------------
+        # Measure the wall-clock span of the *previous* step now that the
+        # current step is starting. If the previous step was a no-cache
+        # prefill (PrefillNoCache), the elapsed time approximates the NPU's
+        # recompute throughput for that many tokens.
+        now = time.perf_counter()
+        if (
+            self._cost_model.enabled
+            and self._prefill_sample_time is not None
+            and self._prefill_sample_tokens > 0
+        ):
+            elapsed = now - self._prefill_sample_time
+            self._cost_model.observe_recompute(
+                self._prefill_sample_tokens, elapsed
+            )
+        self._prefill_sample_time = now
+        # Probe the attn state for the upcoming step to decide whether this
+        # step qualifies as a recompute sample.
+        self._prefill_sample_tokens = self._probe_recompute_tokens(
+            forward_context
+        )
+
         super().start_load_kv(forward_context, **kwargs)
+
+    def _probe_recompute_tokens(
+        self, forward_context: "ForwardContext"
+    ) -> int:
+        """Return the number of tokens about to be prefilled *without* a KV
+        cache hit, i.e. genuinely recomputed on the NPU this step.
+
+        Returns 0 if the signal is unavailable (e.g. attn_metadata missing,
+        decode step, or a cache-hit prefill). We deliberately keep this
+        best-effort: a missed sample just delays EMA convergence.
+        """
+        if not self._cost_model.enabled:
+            return 0
+        try:
+            attn_metadata = forward_context.attn_metadata
+            if attn_metadata is None:
+                return 0
+            # forward_context.attn_metadata is a PerLayerAttnMetadata dict
+            # (layer_name -> AscendMetadata). Any single entry carries the
+            # step-level attn_state and num_actual_tokens; pick the first.
+            meta = None
+            if isinstance(attn_metadata, dict):
+                if not attn_metadata:
+                    return 0
+                meta = next(iter(attn_metadata.values()))
+            else:
+                meta = attn_metadata
+            if meta is None:
+                return 0
+            # PrefillNoCache == 0 in AscendAttentionState. Accept both the
+            # enum and the raw int to stay robust to upstream changes.
+            state = getattr(meta, "attn_state", None)
+            state_val = getattr(state, "value", state)
+            if state_val != 0:
+                return 0
+            num_actual_tokens = int(getattr(meta, "num_actual_tokens", 0) or 0)
+            return num_actual_tokens
+        except Exception:  # pragma: no cover - best-effort sampling
+            return 0
+
+    @property
+    def cost_model(self) -> FetchRecomputeCostModel:
+        """Expose the cost model so the NPU connector can feed fetch samples."""
+        return self._cost_model
+
+    @_lmcache_nvtx_annotate
+    def get_num_new_matched_tokens(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+    ) -> Optional[int]:
+        """Ascend override: insert the fetch-vs-recompute cost gate.
+
+        Delegates to the upstream lookup to get the raw number of externally
+        cached tokens, then — if the cost gate is enabled and warmed up —
+        downgrades a fetch to a recompute (returns 0) when pulling those
+        tokens from a slow backend would be slower than recomputing them.
+        """
+        num_hit = super().get_num_new_matched_tokens(request, num_computed_tokens)
+        # None  -> async lookup not ready yet (keep waiting).
+        # 0     -> upstream already decided not to fetch.
+        if num_hit is None or num_hit == 0:
+            return num_hit
+
+        if not self._cost_model.enabled:
+            return num_hit
+
+        if not self._cost_model.should_fetch(num_hit):
+            logger.info(
+                "CostGate RECOMPUTE: req %s hit_tokens=%d, fetching would be "
+                "slower than recomputing on NPU -> skip fetch.",
+                request.request_id, num_hit,
+            )
+            return 0
+        return num_hit
 
     @_lmcache_nvtx_annotate
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):

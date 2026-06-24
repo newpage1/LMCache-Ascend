@@ -192,6 +192,46 @@ def _patch_config():
         "Set 0 for an unbounded queue; values > 0 enable bounded backpressure.",
     }
 
+    # --- Fetch-vs-Recompute cost gate -----------------------------------
+    # When the storage backend is slow (remote DDR / SSD / constrained link),
+    # pulling N cached KV tokens can take longer than recomputing them on the
+    # NPU. This gate estimates T_fetch vs T_recompute from runtime samples and
+    # drops the fetch (forcing a PrefillNoCache recompute) when fetching would
+    # be slower. Disabled by default for zero behavioural change.
+    lmcache.v1.config._CONFIG_DEFINITIONS["fetch_recompute_gate_enable"] = {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+        "description": "Enable the fetch-vs-recompute cost gate for the Ascend "
+        "connector. When True, a cached prefix whose estimated fetch time "
+        "exceeds its recompute time is skipped (recomputed on the NPU) "
+        "instead of being pulled from a slow backend. See cost_model.py.",
+    }
+    lmcache.v1.config._CONFIG_DEFINITIONS["cost_ema_alpha"] = {
+        "type": float,
+        "default": 0.2,
+        "env_converter": float,
+        "description": "EMA smoothing factor (0,1] for the fetch-bandwidth and "
+        "recompute-rate estimates used by the cost gate. Higher adapts faster "
+        "but is noisier.",
+    }
+    lmcache.v1.config._CONFIG_DEFINITIONS["cost_min_samples"] = {
+        "type": int,
+        "default": 5,
+        "env_converter": int,
+        "description": "Minimum samples required for BOTH the fetch-bandwidth "
+        "and recompute-rate estimates before the cost gate is allowed to "
+        "override a fetch. Below this the gate is conservative (always fetch).",
+    }
+    lmcache.v1.config._CONFIG_DEFINITIONS["cost_gate_log_enable"] = {
+        "type": bool,
+        "default": True,
+        "env_converter": _to_bool,
+        "description": "Log every cost-gate decision (T_fetch, T_recompute, "
+        "FETCH/RECOMPUTE verdict). Useful for validation; disable to reduce "
+        "log volume in steady state.",
+    }
+
     namespace_extras = {
         "validate": lmcache.v1.config._validate_config,
         "log_config": lmcache.v1.config._log_config,
