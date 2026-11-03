@@ -30,6 +30,7 @@ In the table above, “hybrid KV cache management formats” means **MLA/DSA mul
 
 ## Documents
 
+- [dsv41_layerwise_prototype.md](dsv41_layerwise_prototype.md) — experimental resource manifest; does not enable layerwise serving.
 - [lmcache_driven.md](lmcache_driven.md) — the `lmcache_driven` transfer mode full deployment guide: environment preparation, container startup, source installation, server/vLLM startup, and verification (DeepSeek-V4 example).
 - [engine_driven.md](engine_driven.md) — deploy and run the `engine_driven` transfer mode (Qwen3 example).
 - [qwen3_5.md](qwen3_5.md) — hybrid Mamba models (for example Qwen3.5, Qwen3.6, and Qwen3.8) on Ascend: same flags as the [LMCache recipe](https://docs.lmcache.ai/recipes/qwen3_5.html), plus the Ascend differences.
