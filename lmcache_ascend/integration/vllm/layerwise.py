@@ -10,8 +10,8 @@ explicit so a token-range hit cannot silently omit required runtime state.
 from __future__ import annotations
 
 # Standard
-from collections.abc import Collection, Sequence
-from typing import TYPE_CHECKING, Literal
+from collections.abc import Collection, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Literal
 
 # Third Party
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
@@ -22,7 +22,10 @@ from lmcache.v1.multiprocess.layerwise import (
 
 if TYPE_CHECKING:
     # Third Party
-    from vllm_ascend.models.deepseek_v41.topology import DeepseekV41Topology
+    from vllm_ascend.models.deepseek_v41.topology import (
+        DSV41LayerBinding,
+        DeepseekV41Topology,
+    )
 
 
 def build_dsv41_layerwise_plan(
@@ -122,3 +125,107 @@ def build_dsv41_layerwise_plan(
             f"Unsupported caches outside the DSV4.1 backbone: {sorted(unexpected)}"
         )
     return LayerwiseTransferPlan(layer_order=layer_names, resources=tuple(resources))
+
+
+def build_dsv41_layer_bindings(
+    topology: DeepseekV41Topology,
+    static_forward_context: Mapping[str, Any],
+    plan: LayerwiseTransferPlan,
+) -> tuple[DSV41LayerBinding, ...]:
+    """Bind plan execution layers to the live attention objects.
+
+    Identity is read from the real ``DeepseekV41Attention`` modules in the
+    static forward context (``role.layer_idx``, ``prefix``,
+    ``v41_layer_name``, ``layerwise_execution_layer``). Names are never
+    derived from one another by rewriting ``v41_attn``/``attn`` strings:
+    the declared attributes are only *validated* against their structural
+    equalities, and any mismatch rejects the registration.
+
+    Args:
+        topology: Backbone topology from vLLM-Ascend.
+        static_forward_context: The engine's static forward context mapping
+            dispatch keys to live modules.
+        plan: The validated layerwise plan this engine registered.
+
+    Returns:
+        Bindings ordered by backbone layer index.
+
+    Raises:
+        ValueError: On missing/extra/duplicate backbone bindings, a dispatch
+            key not resolving to the module that declared it, attribute
+            structure mismatches, or execution names disagreeing with
+            ``plan.layer_order``.
+    """
+    # Local (deferred so plan building stays importable without vLLM-Ascend;
+    # the binding step always runs inside an engine process).
+    from vllm_ascend.models.deepseek_v41.topology import DSV41LayerBinding
+
+    bindings: dict[int, DSV41LayerBinding] = {}
+    for name, module in static_forward_context.items():
+        execution_name = getattr(module, "layerwise_execution_layer", None)
+        if execution_name is None:
+            continue  # Not a DSV4.1 attention module; not part of the backbone.
+        prefix = getattr(module, "prefix", None)
+        dispatch_name = getattr(module, "v41_layer_name", None)
+        role = getattr(module, "role", None)
+        layer_idx = getattr(role, "layer_idx", None)
+        if not isinstance(prefix, str) or not isinstance(dispatch_name, str):
+            raise ValueError(
+                f"Module '{name}' declares partial layerwise identity attributes"
+            )
+        if not isinstance(layer_idx, int):
+            raise ValueError(
+                f"Module '{name}' has no backbone layer index for layerwise binding"
+            )
+        if layer_idx in bindings:
+            raise ValueError(
+                f"Duplicate layerwise binding for backbone layer {layer_idx}: "
+                f"{bindings[layer_idx].attention_prefix} and {prefix}"
+            )
+        # Structural validation of the declared attributes: the dispatch key
+        # must point back at the very same object and both names must hang
+        # off the module's own prefix.
+        if static_forward_context.get(dispatch_name) is not module:
+            raise ValueError(
+                f"Dispatch key '{dispatch_name}' does not resolve to the "
+                f"module that declared it ('{name}')"
+            )
+        if dispatch_name != f"{prefix}.v41_attn":
+            raise ValueError(
+                f"Dispatch name '{dispatch_name}' is not the v41_attn key of "
+                f"prefix '{prefix}'"
+            )
+        if not isinstance(execution_name, str) or (
+            execution_name != f"{prefix}.attn"
+        ):
+            raise ValueError(
+                f"Execution name '{execution_name}' is not the attn key of "
+                f"prefix '{prefix}'"
+            )
+        bindings[layer_idx] = DSV41LayerBinding(
+            layer_idx=layer_idx,
+            attention_prefix=prefix,
+            dispatch_layer_name=dispatch_name,
+            execution_layer_name=execution_name,
+        )
+
+    expected = {role.layer_idx for role in topology.layers}
+    missing = expected - set(bindings)
+    if missing:
+        raise ValueError(
+            f"Missing layerwise bindings for backbone layers {sorted(missing)}"
+        )
+    unexpected_layers = set(bindings) - expected
+    if unexpected_layers:
+        raise ValueError(
+            f"Layerwise bindings outside the backbone: {sorted(unexpected_layers)}"
+        )
+    ordered = tuple(bindings[layer_idx] for layer_idx in sorted(bindings))
+    if tuple(b.execution_layer_name for b in ordered) != tuple(plan.layer_order):
+        raise ValueError(
+            "Execution-layer names do not equal plan.layer_order in layer order"
+        )
+    roots = {b.attention_prefix.rsplit(".layers.", 1)[0] for b in ordered}
+    if len(roots) != 1:
+        raise ValueError(f"Bindings span multiple model roots: {sorted(roots)}")
+    return ordered
