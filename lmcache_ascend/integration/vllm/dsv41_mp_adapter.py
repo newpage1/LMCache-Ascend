@@ -13,6 +13,12 @@ cold-only snapshots (empty boundaries — lookup cannot hit without the C2
 boundary codec, and says so). One request may be in flight per step;
 overlapping multi-request scheduling is a fail-closed boundary reserved
 for the scheduler-MQ milestone.
+
+Since t94 the boundary pass and the snapshot commits are per request: a
+multi-request step stores each attributable request's boundary page and
+commits one snapshot per request (own snapshot id, own prefix key), so
+sibling requests never overwrite each other server-side and a request
+that cannot be attributed stays cold alone.
 """
 
 # Standard
@@ -475,9 +481,12 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         # boundary-state resource. ``None`` (default) leaves snapshots
         # cold-only — the adapter never invents row indices.
         self._boundary_provider: Any = None
-        # step id -> resource id -> descriptor of the boundary rows
-        # dispatched for that step, folded into the snapshot commit.
-        self._step_boundary_descriptors: dict[int, dict[str, BoundaryStateDescriptor]] = {}
+        # step id -> request id -> resource id -> descriptor of the
+        # boundary rows dispatched for that step (t94: per request), each
+        # request's descriptors folded into that request's snapshot commit.
+        self._step_boundary_descriptors: dict[
+            int, dict[str, dict[str, BoundaryStateDescriptor]]
+        ] = {}
 
     def set_boundary_provider(self, provider: Any) -> None:
         """Install the engine-side boundary-row provider (S1).
@@ -507,6 +516,14 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
           rebases the full page onto the target page instead. A missing
           hook or ``None`` fails the transfer closed rather than
           restoring onto a guessed page.
+
+        Provider protocol v3 (t92/t94 per-request attribution). The
+        engine provider may accept a ``request_id`` keyword on both the
+        call body and ``restore_target``: the adapter always passes it so
+        a multi-request step resolves each request's own rows and own
+        restore page. Providers built before t92 take only three
+        arguments and keep working — the adapter retries the call
+        positionally, preserving their single-request semantics.
 
         Raises:
             TypeError: If ``provider`` is not callable.
@@ -855,7 +872,7 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             raise
 
     def enqueue_step_transports(self, step_id: int) -> None:
-        """Dispatch a step's submitted transfers over the MP wire (S0).
+        """Dispatch a step's submitted transfers over the MP wire.
 
         Every submitted-but-undispatched spec of ``step_id`` is sent
         synchronously through the request client: stores carry the real
@@ -864,14 +881,18 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         into the runtime index before returning, so admission gates and
         store waits observe terminal state, not promises.
 
-        Fail-closed S0 boundary: exactly one request may be in flight per
-        step. A step carrying specs of several requests raises instead of
-        interleaving transfers the index cannot order yet; overlapping
-        multi-request scheduling arrives with the scheduler-MQ milestone.
+        Multi-request steps dispatch since t94. The S0 milestone refused
+        to interleave requests a single index could not order; the
+        runtime index keys every transfer by (epoch, request, step,
+        resource, direction), the server-side single-owner election
+        (t75) dedups replicated sibling workers, and snapshot commits
+        are per request (t94), so sibling requests of one step now
+        dispatch in deterministic (request, resource) order — each with
+        its own pages, ranges and prefix key.
 
         Raises:
-            RuntimeError: No runtime registered, or the step carries more
-                than one request's transfers (S0 boundary).
+            RuntimeError: No runtime registered, or a dispatched
+                transfer failed (propagated from the S0 wire path).
         """
         if self.index is None:
             raise RuntimeError("layerwise runtime is not registered yet")
@@ -879,7 +900,7 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             spec
             for (_, spec_step_id, _, _), spec in self._step_specs.items()
             if spec_step_id == step_id
-            and spec.operation_id not in self._dispatched_ops
+                and spec.operation_id not in self._dispatched_ops
         ]
         if not specs:
             logger.debug(
@@ -888,16 +909,9 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                 step_id,
             )
             return
-        requests = sorted({spec.request_id for spec in specs})
-        if len(requests) > 1:
-            raise RuntimeError(
-                "layerwise S0 transport dispatches one request per step; "
-                f"step {step_id} carries {len(requests)}: "
-                f"{', '.join(requests)}. Overlapping multi-request "
-                "scheduling arrives with the scheduler-MQ milestone; "
-                "refusing to interleave fail-closed"
-            )
-        for spec in specs:
+        for spec in sorted(
+            specs, key=lambda s: (s.request_id, s.resource_id, s.operation_id)
+        ):
             self._dispatch_spec(spec)
 
     def notify_layer_produced(self, layer_name: str) -> None:
@@ -1158,19 +1172,54 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                 )
                 self._wait_store_handled.add(step_id)
 
-    def _snapshot_id_for(self, step_id: int) -> str:
-        """Deterministic per-worker snapshot id for ``step_id`` (t75)."""
-        return (
+    def _snapshot_id_for(self, step_id: int, request_id: str | None = None) -> str:
+        """Deterministic per-worker snapshot id (t75), per request (t94).
+
+        The base id stays derived from (plan, epoch, step, worker owner)
+        so a retried commit is idempotent server-side. A named request
+        appends an 8-hex digest: sibling requests of the same step
+        commit their own snapshots, and the t75 "reused with different
+        content" collision can no longer eat a batch mate.
+        """
+        base = (
             f"snap-{self.plan_hash[:8]}-{self.registration_epoch}"
             f"-{step_id}-{self._op_owner.rstrip('-')}"
         )
+        if request_id is None:
+            return base
+        digest = hashlib.sha256(request_id.encode("utf-8")).hexdigest()[:8]
+        return f"{base}-r{digest}"
+
+    def _call_boundary_provider(
+        self,
+        resource_id: str,
+        snapshot_id: str,
+        boundary_token: str,
+        request_id: str,
+    ) -> tuple[int, int, tuple[int, ...]] | None:
+        """Ask the provider for one request's boundary rows (t94).
+
+        The engine provider (t92) records boundaries per request and
+        accepts a ``request_id`` keyword; naming the request resolves a
+        multi-request step to each request's own rows. A provider built
+        before t92 takes only the three positional arguments — the
+        keyword call fails to bind and the positional retry keeps its
+        single-request semantics working.
+        """
+        assert self._boundary_provider is not None
+        try:
+            return self._boundary_provider(
+                resource_id, snapshot_id, boundary_token, request_id=request_id
+            )
+        except TypeError:
+            return self._boundary_provider(resource_id, snapshot_id, boundary_token)
 
     def _store_step_boundaries(
         self,
         step_id: int,
         entries: list[tuple[str, int, int, tuple]],
     ) -> None:
-        """Encode and dispatch the step's boundary-state pages (S1).
+        """Encode and dispatch the step's boundary-state pages (S1, t94).
 
         Boundary rows are the engine-side ring-buffer slots a later hit
         must restore, so they ride the same snapshot as the token-range
@@ -1179,6 +1228,12 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         ``None``, or a provider without ring geometry leaves the
         resource out of the snapshot with a loud warning: the adapter
         never invents row indices and never guesses pages.
+
+        Every recorded request of the step gets its own boundary spec
+        (t94): the provider is called with that request's id, its answer
+        frames that request's page under that request's prefix key, and
+        a request the provider cannot attribute stays cold alone — the
+        rest of the batch is unaffected.
 
         Stores frame the **complete ring page** (schema v2): the
         provider's written rows prove which slots hold real bytes, the
@@ -1201,9 +1256,6 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         if step_id in self._step_boundary_descriptors:
             # Already dispatched for this step (idempotent wait pass).
             return
-        request_id, start_token, end_token, _blocks = entries[0]
-        boundary_token = str(end_token)
-        snapshot_id = self._snapshot_id_for(step_id)
         if self._boundary_provider is None:
             logger.warning(
                 "[dsv41_layerwise] step %d has boundary-state resources "
@@ -1224,103 +1276,112 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             )
             self._step_boundary_descriptors[step_id] = {}
             return
-        dispatched: dict[str, BoundaryStateDescriptor] = {}
-        for resource in boundary_resources:
-            provided = self._boundary_provider(
-                resource.resource_id, snapshot_id, boundary_token
-            )
-            if provided is None:
-                logger.warning(
-                    "[dsv41_layerwise] boundary provider returned no rows "
-                    "for resource %s in step %d; resource stays out of the "
-                    "snapshot (cold-only for this resource)",
-                    resource.resource_id,
-                    step_id,
+        dispatched: dict[str, dict[str, BoundaryStateDescriptor]] = {}
+        for request_id, start_token, end_token, _blocks in entries:
+            boundary_token = str(end_token)
+            snapshot_id = self._snapshot_id_for(step_id, request_id)
+            for resource in boundary_resources:
+                provided = self._call_boundary_provider(
+                    resource.resource_id, snapshot_id, boundary_token, request_id
                 )
-                continue
-            ring_cursor, compression_phase, row_indices = provided
-            ring_length = int(ring_rows_hook(resource.resource_id))
-            tensor_index = resource.tensor_indices[0]
-            name = self._cache_names[tensor_index]
-            value = self.kv_caches[name]
-            tensor = value[0] if isinstance(value, tuple) else value
-            descriptor, payload = encode_boundary_rows(
-                tensor,
-                row_indices,
-                snapshot_id=snapshot_id,
-                resource_id=resource.resource_id,
-                boundary_token=boundary_token,
-                ring_cursor=ring_cursor,
-                compression_phase=compression_phase,
-                ring_length=ring_length,
-            )
-            spec = ResourceTransferSpec(
-                operation_id=self.next_operation_id("store"),
-                request_id=request_id,
-                step_id=step_id,
-                registration_epoch=self.registration_epoch,
-                server_generation=self.server_generation,
-                plan_hash=self.plan_hash,
-                layout_hash=self.layout_hash,
-                resource_id=resource.resource_id,
-                key=f"{request_id}:layerwise",
-                engine_group_id=None,
-                block_ids=(),
-                start_token=start_token,
-                end_token=end_token,
-                skip_first_n_tokens=0,
-                boundary=descriptor,
-            )
-            self._step_specs[
-                (request_id, step_id, resource.resource_id, "store")
-            ] = spec
-            self.index.submit_transfer(spec)
-            result = self.req_client.store_resource(spec, payload).result(
-                timeout=self._mq_timeout
-            )
-            error_code = getattr(result, "error_code", "") or ""
-            if (
-                getattr(result, "status", None) == "invalid"
-                and error_code == "DUPLICATE_OPERATION"
-            ):
-                logger.warning(
-                    "[dsv41_layerwise] boundary store lost the single-owner "
-                    "election for (request %s, step %d, resource %s); "
-                    "another worker already stored this key - skipping",
+                if provided is None:
+                    logger.warning(
+                        "[dsv41_layerwise] boundary provider returned no "
+                        "rows for resource %s of request %s in step %d; "
+                        "that request's boundary stays out of the "
+                        "snapshot (cold-only for this request, the rest "
+                        "of the batch is unaffected)",
+                        resource.resource_id,
+                        request_id,
+                        step_id,
+                    )
+                    continue
+                ring_cursor, compression_phase, row_indices = provided
+                ring_length = int(ring_rows_hook(resource.resource_id))
+                tensor_index = resource.tensor_indices[0]
+                name = self._cache_names[tensor_index]
+                value = self.kv_caches[name]
+                tensor = value[0] if isinstance(value, tuple) else value
+                descriptor, payload = encode_boundary_rows(
+                    tensor,
+                    row_indices,
+                    snapshot_id=snapshot_id,
+                    resource_id=resource.resource_id,
+                    boundary_token=boundary_token,
+                    ring_cursor=ring_cursor,
+                    compression_phase=compression_phase,
+                    ring_length=ring_length,
+                )
+                spec = ResourceTransferSpec(
+                    operation_id=self.next_operation_id("store"),
+                    request_id=request_id,
+                    step_id=step_id,
+                    registration_epoch=self.registration_epoch,
+                    server_generation=self.server_generation,
+                    plan_hash=self.plan_hash,
+                    layout_hash=self.layout_hash,
+                    resource_id=resource.resource_id,
+                    key=f"{request_id}:layerwise",
+                    engine_group_id=None,
+                    block_ids=(),
+                    start_token=start_token,
+                    end_token=end_token,
+                    skip_first_n_tokens=0,
+                    boundary=descriptor,
+                )
+                self._step_specs[
+                    (request_id, step_id, resource.resource_id, "store")
+                ] = spec
+                self.index.submit_transfer(spec)
+                result = self.req_client.store_resource(spec, payload).result(
+                    timeout=self._mq_timeout
+                )
+                error_code = getattr(result, "error_code", "") or ""
+                if (
+                    getattr(result, "status", None) == "invalid"
+                    and error_code == "DUPLICATE_OPERATION"
+                ):
+                    logger.warning(
+                        "[dsv41_layerwise] boundary store lost the "
+                        "single-owner election for (request %s, step %d, "
+                        "resource %s); another worker already stored this "
+                        "key - skipping",
+                        request_id,
+                        step_id,
+                        resource.resource_id,
+                    )
+                    self.complete_transfer(result)
+                    continue
+                if getattr(result, "status", None) != "ok":
+                    raise RuntimeError(
+                        "boundary store failed with status "
+                        f"{getattr(result, 'status', None)} ({error_code})"
+                    )
+                if not self.complete_transfer(result):
+                    raise RuntimeError(
+                        "boundary store completion was ignored (stale "
+                        "epoch or duplicate)"
+                    )
+                self._dispatched_ops.add(spec.operation_id)
+                self._step_store_ops.setdefault(step_id, {})[
+                    spec.operation_id
+                ] = (spec, None)
+                self._uncommitted_store_steps.add(step_id)
+                dispatched.setdefault(request_id, {})[
+                    resource.resource_id
+                ] = descriptor
+                logger.info(
+                    "[dsv41_layerwise] boundary store dispatched over the "
+                    "wire op=%s request=%s resource=%s full_page_rows=%d "
+                    "written_rows=%d bytes=%d token=%s",
+                    spec.operation_id,
                     request_id,
-                    step_id,
                     resource.resource_id,
+                    len(descriptor.row_indices),
+                    len(row_indices),
+                    len(payload),
+                    boundary_token,
                 )
-                self.complete_transfer(result)
-                continue
-            if getattr(result, "status", None) != "ok":
-                raise RuntimeError(
-                    "boundary store failed with status "
-                    f"{getattr(result, 'status', None)} ({error_code})"
-                )
-            if not self.complete_transfer(result):
-                raise RuntimeError(
-                    "boundary store completion was ignored (stale epoch or "
-                    "duplicate)"
-                )
-            self._dispatched_ops.add(spec.operation_id)
-            self._step_store_ops.setdefault(step_id, {})[
-                spec.operation_id
-            ] = (spec, None)
-            self._uncommitted_store_steps.add(step_id)
-            dispatched[resource.resource_id] = descriptor
-            logger.info(
-                "[dsv41_layerwise] boundary store dispatched over the wire "
-                "op=%s request=%s resource=%s full_page_rows=%d "
-                "written_rows=%d bytes=%d token=%s",
-                spec.operation_id,
-                request_id,
-                resource.resource_id,
-                len(descriptor.row_indices),
-                len(row_indices),
-                len(payload),
-                boundary_token,
-            )
         self._step_boundary_descriptors[step_id] = dispatched
 
     def _dispatch_spec(self, spec: ResourceTransferSpec) -> None:
@@ -1569,9 +1630,19 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                     "target page (no restore_target hook); refusing to "
                     "restore boundary bytes onto a guessed page fail-closed"
                 )
-            target = target_hook(
-                spec.resource_id, spec.boundary.boundary_token
-            )
+            # t94: name the restoring request so a multi-request step
+            # resolves to this request's own ring page. Pre-t92 hooks take
+            # only two arguments and keep their single-request semantics.
+            try:
+                target = target_hook(
+                    spec.resource_id,
+                    spec.boundary.boundary_token,
+                    request_id=spec.request_id,
+                )
+            except TypeError:
+                target = target_hook(
+                    spec.resource_id, spec.boundary.boundary_token
+                )
             if target is None:
                 raise RuntimeError(
                     "boundary provider returned no target page for "
@@ -1633,62 +1704,80 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                 target[rows] = tensor.to(device=target.device)
 
     def _commit_step_snapshot(self, step_id: int) -> None:
-        """Commit one step's dispatched stores as a server snapshot (S0).
+        """Commit one step's dispatched stores as server snapshots (S0).
 
-        The snapshot id is derived from (plan, epoch, step) so a retried
-        commit stays idempotent server-side. Boundaries are empty on
-        purpose: without the C2 codec the snapshot is cold-only storage
-        that lookups refuse to hit (design 4.0/6).
+        One snapshot per request (t94): a multi-request step's ops are
+        grouped by request, and each group commits under its own prefix
+        key with its own snapshot id (plan/epoch/step/owner plus a
+        request digest) carrying that request's boundary descriptors.
+        Sibling requests therefore publish independent snapshots — one
+        request's boundary can never overwrite a batch mate's — and a
+        retried commit stays idempotent server-side. Steps without
+        recorded boundaries still commit cold-only: lookups refuse to
+        hit them, by design.
 
         Raises:
-            RuntimeError: If the server refuses the commit.
+            RuntimeError: If the server refuses any request's commit.
         """
         ops = self._step_store_ops.get(step_id)
         if not ops:
             self._uncommitted_store_steps.discard(step_id)
             return
-        spec = next(iter(ops.values()))[0]
-        # The id stays deterministic per worker (plan/epoch/step plus the
-        # per-worker owner tag): sibling TP workers commit their own op
-        # sets for the same plan/step, and a shared id collided on the
-        # server as "reused with different content" (t75).
-        boundaries = tuple(
-            self._step_boundary_descriptors.get(step_id, {}).values()
-        )
-        commit = LayerwiseSnapshotCommit(
-            snapshot_id=self._snapshot_id_for(step_id),
-            key=spec.key,
-            registration_epoch=self.registration_epoch,
-            server_generation=self.server_generation,
-            plan_hash=self.plan_hash,
-            layout_hash=self.layout_hash,
-            operation_ids=tuple(sorted(ops)),
-            # S1: boundary descriptors ride the commit when the engine
-            # provided real rows; empty boundaries keep the snapshot
-            # cold-only (lookups refuse to hit it, by design).
-            boundaries=tuple(
-                sorted(boundaries, key=lambda item: item.resource_id)
-            ),
-        )
-        ok = self.req_client.commit_layerwise_snapshot(commit).result(
-            timeout=self._mq_timeout
-        )
-        if ok is not True:
-            raise RuntimeError(
-                f"layerwise snapshot commit for step {step_id} was refused"
+        by_request: dict[str, list[ResourceTransferSpec]] = {}
+        for spec, _future in ops.values():
+            by_request.setdefault(spec.request_id, []).append(spec)
+        for request_id in sorted(by_request):
+            request_specs = by_request[request_id]
+            # The id stays deterministic per worker and request
+            # (plan/epoch/step/owner plus the request digest): sibling
+            # TP workers commit their own op sets and sibling requests
+            # commit their own snapshots — a shared id collided on the
+            # server as "reused with different content" (t75, t94).
+            boundaries = tuple(
+                sorted(
+                    self._step_boundary_descriptors.get(step_id, {})
+                    .get(request_id, {})
+                    .values(),
+                    key=lambda item: item.resource_id,
+                )
+            )
+            commit = LayerwiseSnapshotCommit(
+                snapshot_id=self._snapshot_id_for(step_id, request_id),
+                key=request_specs[0].key,
+                registration_epoch=self.registration_epoch,
+                server_generation=self.server_generation,
+                plan_hash=self.plan_hash,
+                layout_hash=self.layout_hash,
+                operation_ids=tuple(
+                    sorted(spec.operation_id for spec in request_specs)
+                ),
+                # S1: boundary descriptors ride the commit when the
+                # engine provided real rows; empty boundaries keep the
+                # snapshot cold-only (lookups refuse to hit it, by
+                # design).
+                boundaries=boundaries,
+            )
+            ok = self.req_client.commit_layerwise_snapshot(commit).result(
+                timeout=self._mq_timeout
+            )
+            if ok is not True:
+                raise RuntimeError(
+                    f"layerwise snapshot commit for step {step_id} "
+                    f"request {request_id} was refused"
+                )
+            logger.info(
+                "[dsv41_layerwise] store snapshot committed id=%s "
+                "request=%s ops=%d boundaries=%d%s",
+                commit.snapshot_id,
+                request_id,
+                len(commit.operation_ids),
+                len(commit.boundaries),
+                ""
+                if commit.boundaries
+                else " (cold-only: lookups cannot hit S0-style snapshots)",
             )
         self._uncommitted_store_steps.discard(step_id)
         del self._step_store_ops[step_id]
-        logger.info(
-            "[dsv41_layerwise] store snapshot committed id=%s ops=%d "
-            "boundaries=%d%s",
-            commit.snapshot_id,
-            len(commit.operation_ids),
-            len(commit.boundaries),
-            ""
-            if commit.boundaries
-            else " (cold-only: lookups cannot hit S0-style snapshots)",
-        )
         self._step_boundary_descriptors.pop(step_id, None)
 
     def recorded_step_spec(
