@@ -272,6 +272,15 @@ def compute_layout_hash(
     ).hexdigest()
 
 
+# Sentinel request id for a step-level cold window (t71): when the stock
+# scheduler emits an entirely empty connector metadata (``requests=[]``,
+# the engine-warmup / first cold prefill step carries no RETRIEVE and no
+# STORE op), the step still needs one declared window per layer so the
+# fail-closed forward observes a settled step. The id can never collide
+# with engine request ids (chatcmpl-* / req-*).
+_COLD_STEP_REQUEST = "__cold_step__"
+
+
 @dataclass(frozen=True)
 class StepRequestView:
     """Per-request transfer geometry of one scheduler step.
@@ -664,7 +673,11 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         ``start``/``end``/``skip_first_n_tokens`` and the per-engine-group
         block ids (T54-03). Requests without a RETRIEVE op (cold/no-hit)
         still open an empty, immediately-admitted window so forward
-        admission and stores cover them too (T56-03). Boundary-state and
+        admission and stores cover them too (T56-03). An entirely empty
+        ``requests`` mapping — the stock scheduler's metadata for a fully
+        cold step such as the engine warmup — opens one step-level
+        trivially-admitted window per layer (t71): the step is declared
+        and settled, it simply has nothing to wait for. Boundary-state and
         recompute resources are excluded: they are not token-range
         retrievable.
 
@@ -708,6 +721,19 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                     and layer in resource.consumer_layers
                 ]
                 if not required:
+                    continue
+                if not requests:
+                    # Fully cold step (t71): the stock scheduler metadata
+                    # carried no request entry at all, so there is no
+                    # per-request geometry. The step is still declared --
+                    # one trivially-admitted window for the layer -- so
+                    # the fail-closed forward observes a settled step
+                    # instead of "never opened an admission window".
+                    # No hit is faked and nothing is transferred; store
+                    # ops arrive in later steps' metadata.
+                    self.begin_step_admission(
+                        _COLD_STEP_REQUEST, step_id, layer, [], []
+                    )
                     continue
                 for request_id, view in requests.items():
                     if not view.has_retrieve:
