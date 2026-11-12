@@ -424,6 +424,12 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         self._layer_current_step: dict[str, int] = {}
         self._producer_windows: dict[str, _ProducerWindow] = {}
         self._op_counter = itertools.count()
+        # Set at registration from the vLLM worker rank: operation ids
+        # must be unique across the DP workers of one engine (each worker
+        # owns its shard of the KV caches and stores concurrently; a
+        # shared counter collided as DUPLICATE_OPERATION on the MP
+        # server, t75).
+        self._op_owner = ""
         self.index: "LayerwiseTransferIndex | None" = None
         self.snapshots: "LayerwiseSnapshotStore | None" = None
         self.registration_epoch: int = -1
@@ -447,6 +453,14 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             int, dict[str, tuple[ResourceTransferSpec, Any]]
         ] = {}
         self._uncommitted_store_steps: set[int] = set()
+        # Steps whose store pass already ran (wait-time or sync path), so a
+        # second wait never resubmits the same range (t75 async fix).
+        self._wait_store_handled: set[int] = set()
+        # Steps whose metadata carried at least one real request entry —
+        # the wait-time pass warns once when such a step ends with no
+        # recorded store range (chunk granularity miss), while sentinel
+        # cold steps stay silent (t75).
+        self._step_real_requests: dict[int, set[str]] = {}
 
     # ------------------------------------------------------------------
     # Registration (design section 4.1 ordering; T52-12 commit-after-RPC)
@@ -574,6 +588,10 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         self._by_execution = by_execution
         self._engine_group_ids = next_engine_group_ids
         self._cache_names = tuple(kv_caches)
+        # The ack's server generation is unique per registering worker
+        # process (the server increments it for every registration), so it
+        # disambiguates even the TP workers that share one vllm_rank.
+        self._op_owner = f"g{int(ack.server_generation)}-"
         self.registration_epoch = next_epoch
         self.plan_hash = next_plan_hash
         self.layout_hash = next_layout_hash
@@ -620,7 +638,7 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
     # ------------------------------------------------------------------
     def next_operation_id(self, direction: str) -> str:
         """Fresh operation id; the direction prefix drives index dispatch."""
-        return f"{direction}:{next(self._op_counter)}"
+        return f"{direction}:{self._op_owner}{next(self._op_counter)}"
 
     def submit_retrieve(self, spec: ResourceTransferSpec) -> Any:
         """Submit one retrieve into the runtime index (idempotent per spec)."""
@@ -699,6 +717,10 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         # their records are retired up front so a long serving run does
         # not accumulate per-step state (T56-04).
         self._retire_steps_below(step_id)
+        if requests:
+            self._step_real_requests.setdefault(step_id, set()).update(
+                requests.keys()
+            )
         try:
             for request_id, view in requests.items():
                 # The store range comes from the STORE op semantics — the
@@ -923,15 +945,17 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                 ", ".join(requests_without_store_op) or "none",
             )
         elif requests_without_store_op:
-            # The t65 silent hole made loud: the engine produced KV for
-            # these requests, but the connector metadata carried no STORE
-            # op, so nothing crossed the wire. Usually chunk granularity
-            # (prompt shorter than lmcache_tokens_per_chunk); S0 stores
-            # nothing rather than inventing a range.
-            logger.warning(
-                "[dsv41_layerwise] step %d carried request(s) %s but the "
-                "connector metadata had no STORE op; no KV stored (chunk "
-                "granularity / S0 cold-only)",
+            # Debug-only on the hook path: with async scheduling the
+            # engine binds the step's connector metadata *after* the
+            # forward (0.30 start-after-forward lane), so this call
+            # legitimately observes the previous step's window before the
+            # real store range exists. The wait-time pass below is the
+            # authoritative store path and warns once, loudly, when a
+            # real step ends with no STORE op at all (t75).
+            logger.debug(
+                "[dsv41_layerwise] hook-path store for step %d saw no "
+                "STORE op for request(s) %s yet (async metadata binds "
+                "after forward; the wait-time pass owns the store)",
                 window.step_id,
                 ", ".join(requests_without_store_op),
             )
@@ -957,8 +981,108 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         """
         if self.index is None:
             raise RuntimeError("layerwise runtime is not registered yet")
+        self._wait_time_store_pass()
         for step_id in sorted(self._uncommitted_store_steps):
             self._commit_step_snapshot(step_id)
+
+    def _wait_time_store_pass(self) -> None:
+        """Submit and dispatch the steps whose stores the hook could not.
+
+        With async scheduling the engine runs the step's forward *before*
+        :meth:`schedule_step_retrieves` binds the connector metadata (the
+        0.30 start-after-forward lane), so the per-layer hook observes the
+        previous step's producer window and cannot submit yet. By the time
+        the engine calls ``wait_for_save`` the metadata is bound: every
+        recorded ``(step, request)`` store range is submitted for the full
+        plan backbone — exactly the bytes the forward just wrote into the
+        registered caches — dispatched over the MP wire, and left for the
+        commit loop as a server snapshot. Steps the hook already handled
+        (sync lane) are skipped, a step never stores twice, and a step
+        that carried real requests but recorded no STORE range warns once,
+        loudly: chunk granularity miss, not a silent hole (t65/t75).
+
+        Raises:
+            RuntimeError: No runtime registered, or dispatch/commit
+                refused (propagated from the S0 wire path).
+        """
+        assert self._plan is not None and self.index is not None
+        by_step: dict[int, list[tuple[str, int, int, tuple]]] = {}
+        for (step_id, request_id), store_range in sorted(
+            self._step_store_ranges.items()
+        ):
+            if step_id in self._wait_store_handled:
+                continue
+            if step_id in self._step_store_ops:
+                # The sync-path hook already dispatched this step's stores.
+                self._wait_store_handled.add(step_id)
+                continue
+            by_step.setdefault(step_id, []).append(
+                (request_id, *store_range)
+            )
+        for step_id in sorted(by_step):
+            specs = []
+            for request_id, start_token, end_token, blocks in by_step[
+                step_id
+            ]:
+                for resource in self._plan.resources:
+                    if resource.storage_kind != "token_range":
+                        continue
+                    if not self._store_covers_resource(resource, blocks):
+                        # The step's STORE op allocated no blocks for this
+                        # resource's engine group (scratch / zero-alloc
+                        # group, e.g. the hybrid SWA group the stock
+                        # scheduler omits): there is nothing computed for
+                        # that group in this step, so nothing to persist.
+                        # Skipping is the honest store; inventing empty
+                        # blocks would fake coverage.
+                        logger.debug(
+                            "[dsv41_layerwise] store for request %s skips "
+                            "resource %s: engine group %s has no blocks in "
+                            "this step's STORE op",
+                            request_id,
+                            resource.resource_id,
+                            resource.engine_group_id,
+                        )
+                        continue
+                    spec = self._step_spec_for(
+                        step_id=step_id,
+                        request_id=request_id,
+                        resource=resource,
+                        per_group_blocks=blocks,
+                        start_token=start_token,
+                        end_token=end_token,
+                        skip_first_n_tokens=0,
+                        direction="store",
+                    )
+                    specs.append(spec)
+                    self.index.submit_transfer(spec)
+                    logger.info(
+                        "[dsv41_layerwise] store submitted (wait-time) "
+                        "op=%s request=%s tokens=[%d, %d) blocks=%d",
+                        spec.operation_id,
+                        request_id,
+                        start_token,
+                        end_token,
+                        len(blocks or ()),
+                    )
+            self._wait_store_handled.add(step_id)
+            if specs:
+                self.enqueue_step_transports(step_id)
+        for step_id in sorted(self._step_real_requests):
+            if step_id in self._wait_store_handled:
+                continue
+            recorded = any(
+                sid == step_id for (sid, _) in self._step_store_ranges
+            )
+            if not recorded:
+                logger.warning(
+                    "[dsv41_layerwise] step %d carried real request(s) %s "
+                    "but the connector metadata had no STORE op; no KV "
+                    "stored (chunk granularity / S0 cold-only)",
+                    step_id,
+                    ", ".join(sorted(self._step_real_requests[step_id])),
+                )
+                self._wait_store_handled.add(step_id)
 
     def _dispatch_spec(self, spec: ResourceTransferSpec) -> None:
         """Send one submitted transfer over the MP request wire (S0).
@@ -967,7 +1091,16 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         caches; retrieves fetch committed bytes and write them back. The
         settled result is folded into the runtime index; a non-ok status
         is recorded first and then raised, so the engine stops on the
-        first failed transfer instead of scheduling on top of it.
+        first failed transfer instead of scheduling on top of it. The one
+        exception is a store that loses the server-side single-owner
+        election (DUPLICATE_OPERATION): the winning sibling worker already
+        stored the key, so the loser skips (returns ``False``) instead of
+        failing the step.
+
+        Returns:
+            True when this worker's transfer completed on the wire;
+            False when a store lost the single-owner election and was
+            skipped.
 
         Raises:
             RuntimeError: Wire failure, non-ok status, or the index
@@ -985,6 +1118,26 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             result, payload = settled[0], settled[1]
             if result.status == "ok" and payload:
                 self._restore_resource_payload(spec, payload)
+        if result.status != "ok" and result.error_code == "DUPLICATE_OPERATION":
+            # The MP server's index keys stores by (epoch, request, step,
+            # resource, direction): with DP+TP the sibling TP workers of
+            # one engine submit the same key for their shards, and the
+            # first store wins. Losing a store race means another worker
+            # already moved this (request, step, resource) - the S0
+            # protocol is single-owner per key. Skip loudly instead of
+            # tearing the engine down; this worker simply contributes no
+            # bytes for that key (S0 scope: one real owner per store).
+            logger.warning(
+                "[dsv41_layerwise] store op=%s lost the single-owner "
+                "election for (request=%s, step=%d, resource=%s); another "
+                "worker already stored this key - skipping",
+                spec.operation_id,
+                spec.request_id,
+                spec.step_id,
+                spec.resource_id,
+            )
+            self.index.complete_transfer(result)
+            return False
         if not self.index.complete_transfer(result):
             raise RuntimeError(
                 f"layerwise transfer {spec.operation_id} completion was "
@@ -1012,6 +1165,7 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                 len(spec.block_ids or ()),
                 len(payload),
             )
+        return True
 
     def _extract_resource_payload(self, spec: ResourceTransferSpec) -> bytes:
         """Frame the real tensor bytes one store moves (S0).
@@ -1094,10 +1248,14 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             self._uncommitted_store_steps.discard(step_id)
             return
         spec = next(iter(ops.values()))[0]
+        # The id stays deterministic per worker (plan/epoch/step plus the
+        # per-worker owner tag): sibling TP workers commit their own op
+        # sets for the same plan/step, and a shared id collided on the
+        # server as "reused with different content" (t75).
         commit = LayerwiseSnapshotCommit(
             snapshot_id=(
                 f"snap-{self.plan_hash[:8]}-{self.registration_epoch}"
-                f"-{step_id}"
+                f"-{step_id}-{self._op_owner.rstrip('-')}"
             ),
             key=spec.key,
             registration_epoch=self.registration_epoch,
@@ -1210,6 +1368,10 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             del self._step_store_ranges[key]
         for key in [k for k in self._step_specs if k[1] < step_id]:
             del self._step_specs[key]
+        for step in [s for s in self._wait_store_handled if s < step_id]:
+            self._wait_store_handled.discard(step)
+        for step in [s for s in self._step_real_requests if s < step_id]:
+            del self._step_real_requests[step]
 
     def _drop_step_records(self, step_id: int) -> None:
         """Drop every adapter record of one step (schedule rollback).
@@ -1226,6 +1388,8 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             del self._step_store_ranges[key]
         for key in [k for k in self._step_specs if k[1] == step_id]:
             del self._step_specs[key]
+        self._wait_store_handled.discard(step_id)
+        self._step_real_requests.pop(step_id, None)
         for layer_key in list(self._producer_windows):
             if self._producer_windows[layer_key].step_id == step_id:
                 del self._producer_windows[layer_key]
@@ -1272,6 +1436,35 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                 f"cover engine group {engine_group_id} at index {index}"
             )
         return per_group_blocks[index]
+
+    def _store_covers_resource(
+        self,
+        resource: "CacheTransferResource",
+        per_group_blocks: tuple[tuple[int, ...], ...],
+    ) -> bool:
+        """Whether a step's STORE op carries blocks for a resource's group.
+
+        The stock scheduler omits groups with zero allocated tokens from
+        the STORE op's per-group block list (e.g. the hybrid SWA scratch
+        group), so the recorded list can be shorter than the registered
+        engine groups. A store for such a resource has no bytes to move
+        this step; callers skip instead of raising coverage.
+
+        Args:
+            resource: Token-range resource referenced by the store.
+            per_group_blocks: Per-group block ids recorded from the step's
+                STORE op.
+
+        Returns:
+            True when the recorded groups cover the resource's engine
+            group.
+        """
+        if resource.engine_group_id is None:
+            return True
+        if resource.engine_group_id not in self._engine_group_ids:
+            return False
+        index = self._engine_group_ids.index(resource.engine_group_id)
+        return index < len(per_group_blocks)
 
     def _step_spec_for(
         self,
