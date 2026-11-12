@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 # Third Party
+from lmcache.logging import init_logger
+
 from lmcache.integration.vllm.vllm_multi_process_adapter import (
     LMCacheMPSchedulerAdapter,
     LMCacheMPWorkerAdapter,
@@ -37,6 +39,7 @@ from lmcache.v1.multiprocess.layerwise_protocol import (
     LayerwiseSnapshotCommit,
     ResourceTransferSpec,
 )
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     # Third Party
@@ -804,6 +807,11 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             and spec.operation_id not in self._dispatched_ops
         ]
         if not specs:
+            logger.debug(
+                "[dsv41_layerwise] step %s has no pending transfers to "
+                "dispatch over the wire",
+                step_id,
+            )
             return
         requests = sorted({spec.request_id for spec in specs})
         if len(requests) > 1:
@@ -871,6 +879,7 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                 "notify_layer_produced must run after its forward"
             )
         futures = []
+        requests_without_store_op = []
         for request_id in window.request_ids:
             store_range = self._step_store_ranges.get(
                 (window.step_id, request_id)
@@ -878,6 +887,7 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             if store_range is None:
                 # No STORE op for this request: nothing newly computed to
                 # persist (e.g. a fully-served replay).
+                requests_without_store_op.append(request_id)
                 continue
             start_token, end_token, blocks = store_range
             for resource in self._plan.written_by(binding.execution_layer_name):
@@ -894,6 +904,37 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                     direction="store",
                 )
                 futures.append(self.index.submit_transfer(spec))
+                logger.info(
+                    "[dsv41_layerwise] store submitted op=%s request=%s "
+                    "tokens=[%d, %d) blocks=%d",
+                    spec.operation_id,
+                    request_id,
+                    start_token,
+                    end_token,
+                    len(blocks or ()),
+                )
+        if futures:
+            logger.info(
+                "[dsv41_layerwise] layer %s produced %d store spec(s) for "
+                "step %d (requests without a STORE op: %s)",
+                layer_name,
+                len(futures),
+                window.step_id,
+                ", ".join(requests_without_store_op) or "none",
+            )
+        elif requests_without_store_op:
+            # The t65 silent hole made loud: the engine produced KV for
+            # these requests, but the connector metadata carried no STORE
+            # op, so nothing crossed the wire. Usually chunk granularity
+            # (prompt shorter than lmcache_tokens_per_chunk); S0 stores
+            # nothing rather than inventing a range.
+            logger.warning(
+                "[dsv41_layerwise] step %d carried request(s) %s but the "
+                "connector metadata had no STORE op; no KV stored (chunk "
+                "granularity / S0 cold-only)",
+                window.step_id,
+                ", ".join(requests_without_store_op),
+            )
         # Dispatch moves the submitted stores over the wire now (S0);
         # wait_for_pending_stores later commits them as a snapshot.
         self.enqueue_step_transports(window.step_id)
@@ -961,6 +1002,16 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                 spec.operation_id
             ] = (spec, future)
             self._uncommitted_store_steps.add(spec.step_id)
+            logger.info(
+                "[dsv41_layerwise] store dispatched over the wire op=%s "
+                "request=%s tokens=[%d, %d) blocks=%d bytes=%d",
+                spec.operation_id,
+                spec.request_id,
+                spec.start_token,
+                spec.end_token,
+                len(spec.block_ids or ()),
+                len(payload),
+            )
 
     def _extract_resource_payload(self, spec: ResourceTransferSpec) -> bytes:
         """Frame the real tensor bytes one store moves (S0).
@@ -1065,6 +1116,12 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             )
         self._uncommitted_store_steps.discard(step_id)
         del self._step_store_ops[step_id]
+        logger.info(
+            "[dsv41_layerwise] store snapshot committed id=%s ops=%d "
+            "boundaries=() (cold-only: lookups cannot hit S0 snapshots)",
+            commit.snapshot_id,
+            len(commit.operation_ids),
+        )
 
     def recorded_step_spec(
         self, request_id: str, step_id: int, resource_id: str, direction: str
