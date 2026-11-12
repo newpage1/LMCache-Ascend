@@ -16,11 +16,12 @@ With the flag absent or ``False`` every method defers to the stock
   any layerwise state exists, binds it to the live attention objects
   explicitly (no ``v41_attn``→``attn`` string rewriting), and only then
   lets the stock registration RPC run;
-- the forward path is real up to the single transport seam: retrieves
-  and stores are genuinely scheduled from the stock connector-metadata
-  ops and submitted into the runtime index, and only the message-queue
-  transport itself (:meth:`enqueue_step_transports`) raises
-  :class:`NotImplementedError` because the wire does not exist yet;
+- the forward path runs over the real wire (S0): retrieves and stores
+  are genuinely scheduled from the stock connector-metadata ops,
+  submitted into the runtime index and dispatched one request per step
+  to the server (:meth:`enqueue_step_transports`); stores commit as
+  cold-only snapshots (empty boundaries), so lookups miss fail-closed
+  until the C2 boundary codec exists;
 - ``shutdown`` drops the layerwise admission registry before running
   the stock shutdown (idempotent).
 """
@@ -86,8 +87,10 @@ def _per_group_blocks(op: Any, request_id: str) -> tuple[tuple[int, ...], ...]:
     raw = getattr(op, "block_ids", None)
     if raw is None:
         raise RuntimeError(
-            f"connector op for {request_id} has no block_ids; engine "
-            "integration pending"
+            f"connector op for {request_id} has no block_ids: the "
+            "vllm-ascend scheduler must attach per-engine-group block "
+            "ids to every RETRIEVE/STORE op (list[int] for one group, "
+            "list[list[int]] per group)"
         )
     if not raw:
         return ()
@@ -294,15 +297,14 @@ class DSV41LayerwiseMPConnector(LMCacheMPConnector):
         self.worker_adapter.wait_for_layer_load(layer_name)
 
     def start_load_kv(self, forward_context: Any, **kwargs: Any) -> None:
-        """Schedule the step's layerwise retrieves (real), then hit the seam.
+        """Schedule the step's layerwise retrieves, then dispatch them.
 
         The per-request transfer geometry is taken from the stock connector
         metadata ops — ``start``/``end``/``skip_first_n_tokens`` and the
         per-engine-group ``block_ids`` — never from positional alignment
         with engine objects (T54-03). Scheduling really submits the
-        retrieve specs and opens one admission window per request; the
-        explicit transport seam (:meth:`enqueue_step_transports`) raises
-        afterwards because the wire does not exist in this milestone.
+        retrieve specs and opens one admission window per request, then
+        :meth:`enqueue_step_transports` moves them over the MP wire (S0).
         """
         if not self._dsv41_layerwise:
             super().start_load_kv(forward_context, **kwargs)
@@ -324,14 +326,14 @@ class DSV41LayerwiseMPConnector(LMCacheMPConnector):
         attn_metadata: Any,
         **kwargs: Any,
     ) -> None:
-        """Submit the layer's stores (real), then hit the transport seam."""
+        """Submit the layer's stores and dispatch them over the wire."""
         if not self._dsv41_layerwise:
             super().save_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)
             return
         self.worker_adapter.submit_layer_store(layer_name)
 
     def wait_for_save(self) -> None:
-        """Fail-closed flush: pending stores can never settle unwired."""
+        """Commit dispatched stores as server snapshots (S0 flush)."""
         if not self._dsv41_layerwise:
             super().wait_for_save()
             return
@@ -378,15 +380,17 @@ class DSV41LayerwiseMPConnector(LMCacheMPConnector):
         Raises:
             RuntimeError: When the metadata or an op lacks the fields
                 this view needs, or an entry carries an unknown
-                direction — the exact engine integration points that
-                stay unwired until the transport milestone (fail-closed,
-                never guessed).
+                direction — every message names the missing field and
+                its supplier (the vllm-ascend admission path) so the gap
+                is actionable rather than a placeholder.
         """
         requests = getattr(metadata, "requests", None)
         if requests is None:
             raise RuntimeError(
                 "dsv41.layerwise start_load_kv needs connector metadata "
-                "requests; engine integration pending"
+                "with one requests entry per scheduled request "
+                "(direction/request_id/op): the vllm-ascend admission "
+                "path must attach them before scheduling a layerwise step"
             )
         # First Party (path-loaded sibling module)
         from lmcache_ascend.integration.vllm.dsv41_mp_adapter import (
@@ -401,8 +405,10 @@ class DSV41LayerwiseMPConnector(LMCacheMPConnector):
             op = getattr(meta, "op", None)
             if op is None:
                 raise RuntimeError(
-                    f"connector metadata for {request_id} has no op; "
-                    "engine integration pending"
+                    f"connector metadata entry for {request_id} has no "
+                    "op: the vllm-ascend admission path must attach the "
+                    "per-request LoadStoreOp (start/end/"
+                    "skip_first_n_tokens/block_ids)"
                 )
             if direction == "RETRIEVE":
                 views[request_id] = StepRequestView(
@@ -423,7 +429,8 @@ class DSV41LayerwiseMPConnector(LMCacheMPConnector):
             else:
                 raise RuntimeError(
                     f"connector metadata for {request_id} has unknown "
-                    f"direction {direction!r}; engine integration pending"
+                    f"direction {direction!r}: expected RETRIEVE or "
+                    "STORE from the vllm-ascend admission path"
                 )
         for request_id, (start, end, blocks) in stores.items():
             base = views.get(request_id) or StepRequestView(

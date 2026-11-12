@@ -4,10 +4,15 @@
 The worker adapter owns the layerwise wiring state of one vLLM worker: the
 transfer plan, the attention bindings, the per-resource runtime index and
 the admission registry handed to the vLLM-Ascend custom op. The scheduler
-adapter validates registration acks and builds prefix lookups. The
-message-queue transport itself is deliberately *not* wired in this
-milestone: the single seam is :meth:`DSV41LayerwiseMPWorkerAdapter.
-enqueue_step_transports`, which raises :class:`NotImplementedError`.
+adapter validates registration acks and builds prefix lookups.
+
+The S0 transport closes the loop over the real MP request wire:
+registration fetches a real server generation, stores carry per-block
+tensor bytes to the server, and dispatched stores are committed as
+cold-only snapshots (empty boundaries — lookup cannot hit without the C2
+boundary codec, and says so). One request may be in flight per step;
+overlapping multi-request scheduling is a fail-closed boundary reserved
+for the scheduler-MQ milestone.
 """
 
 # Standard
@@ -27,6 +32,9 @@ from lmcache.v1.multiprocess.layerwise_protocol import (
     LAYERWISE_PROTOCOL_VERSION,
     LayerwiseLookupRequest,
     LayerwiseLookupResult,
+    LayerwiseRegistration,
+    LayerwiseRegistrationAck,
+    LayerwiseSnapshotCommit,
     ResourceTransferSpec,
 )
 
@@ -43,8 +51,8 @@ if TYPE_CHECKING:
     )
     from vllm_ascend.models.deepseek_v41.topology import DSV41LayerBinding
 
-# Reserved wire field until the MP server handshake exists; late protocol
-# changes stay cheap because every spec already carries it (design 4.3).
+# Generation carried before the layerwise registration RPC ran; the real
+# server generation replaces it on registration (design 4.3).
 _SERVER_GENERATION_PLACEHOLDER = 0
 
 
@@ -54,6 +62,81 @@ def compute_plan_hash(plan: "LayerwiseTransferPlan") -> str:
     import msgspec
 
     return hashlib.sha256(msgspec.json.encode(plan)).hexdigest()
+
+
+def encode_resource_payload(segments: Sequence[tuple[str, Any]]) -> bytes:
+    """Frame per-cache tensor slices into self-describing wire bytes (S0).
+
+    Layout: 4-byte big-endian header length, one JSON header
+    ``{"v": 1, "segments": [{"name", "dtype", "shape"}, ...]}``, then each
+    segment's raw bytes in order. Portability over throughput: the
+    torch-only byte path (no numpy) keeps the adapter usable on hosts
+    without numpy, and S0 payloads are block-sized, not cache-sized.
+
+    Args:
+        segments: ``(name, tensor_slice)`` pairs; slices are copied to
+            host memory when they live on a device.
+
+    Returns:
+        The framed payload bytes.
+    """
+    # Third Party
+    import torch
+
+    meta: list[dict[str, Any]] = []
+    bodies: list[bytes] = []
+    for name, slice_ in segments:
+        host = slice_.detach().contiguous().cpu()
+        # view(uint8) keeps the bytes exact; flatten before tolist() so
+        # multi-dimensional slices serialize as one flat byte string.
+        raw = host.view(torch.uint8).reshape(-1)
+        meta.append(
+            {"name": name, "dtype": str(host.dtype), "shape": list(host.shape)}
+        )
+        bodies.append(bytes(raw.tolist()))
+    header = json.dumps({"v": 1, "segments": meta}, sort_keys=True).encode(
+        "utf-8"
+    )
+    return len(header).to_bytes(4, "big") + header + b"".join(bodies)
+
+
+def decode_resource_payload(
+    payload: bytes,
+) -> tuple[dict[str, Any], list[Any]]:
+    """Unframe :func:`encode_resource_payload` wire bytes.
+
+    Args:
+        payload: Framed payload bytes.
+
+    Returns:
+        ``(header, tensors)``: the parsed JSON header and one CPU tensor
+        per segment, in header order.
+    """
+    # Third Party
+    import torch
+
+    header_len = int.from_bytes(payload[:4], "big")
+    header = json.loads(payload[4 : 4 + header_len])
+    tensors: list[Any] = []
+    offset = 4 + header_len
+    for meta in header["segments"]:
+        # dtype strings are torch's repr ("torch.float32"): resolve
+        # through the attribute table; torch.dtype(str) is not callable.
+        dtype = getattr(torch, meta["dtype"].split(".")[-1])
+        numel = 1
+        for dim in meta["shape"]:
+            numel *= dim
+        nbytes = numel * torch.empty(0, dtype=dtype).element_size()
+        body = payload[offset : offset + nbytes]
+        offset += nbytes
+        if body:
+            tensor = torch.frombuffer(bytearray(body), dtype=dtype)
+        else:
+            # torch.frombuffer rejects zero-length buffers (empty row
+            # selections): materialize an empty tensor of the right shape.
+            tensor = torch.empty(tuple(meta["shape"]), dtype=dtype)
+        tensors.append(tensor.reshape(meta["shape"]) if meta["shape"] else tensor)
+    return header, tensors
 
 
 @dataclass(frozen=True)
@@ -343,6 +426,15 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         self._step_store_ranges: dict[
             tuple[int, str], tuple[int, int, tuple[tuple[int, ...], ...]]
         ] = {}
+        self._cache_names: tuple[str, ...] = ()
+        # S0 transport dispatch bookkeeping: op ids that already crossed
+        # the wire, and the dispatched store ops (spec, future) per step
+        # awaiting snapshot commit.
+        self._dispatched_ops: set[str] = set()
+        self._step_store_ops: dict[
+            int, dict[str, tuple[ResourceTransferSpec, Any]]
+        ] = {}
+        self._uncommitted_store_steps: set[int] = set()
 
     # ------------------------------------------------------------------
     # Registration (design section 4.1 ordering; T52-12 commit-after-RPC)
@@ -358,10 +450,12 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
     ) -> None:
         """Commit the layerwise plan after the stock registration succeeds.
 
-        The stock registration RPC runs first; only when it returns is the
-        local layerwise state committed and the admission registry bound.
-        A failing RPC therefore leaves this adapter unregistered and
-        retryable instead of half-committed with a live registry.
+        The stock registration RPC runs first, then the layerwise
+        registration RPC fetches the server generation; only when both
+        return is the local layerwise state committed and the admission
+        registry bound. A failing RPC therefore leaves this adapter
+        unregistered and retryable instead of half-committed with a live
+        registry.
 
         The layout digest hashes the real registered tensor geometry
         (:func:`tensor_layouts_from_kv_caches`), so two registrations that
@@ -416,14 +510,62 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             engine_group_infos=engine_group_infos,
             layout_hints=layout_hints,
         )
+        # Layerwise registration RPC: the MP server owns a real server
+        # generation for this (plan, layout) identity, replacing the
+        # pre-registration placeholder (design 4.1).
+        strategy = getattr(self, "parallel_strategy", None)
+        vllm_rank = getattr(strategy, "vllm_worker_id", None)
+        kv_worker_id = getattr(strategy, "kv_worker_id", None)
+        if vllm_rank is None or kv_worker_id is None:
+            raise RuntimeError(
+                "layerwise registration requires a ParallelStrategy with "
+                "vllm_worker_id/kv_worker_id (v1 connector); legacy int "
+                "worker ids are not supported"
+            )
+        registration = LayerwiseRegistration(
+            protocol_version=LAYERWISE_PROTOCOL_VERSION,
+            plan_hash=next_plan_hash,
+            layout_hash=next_layout_hash,
+            registration_epoch=next_epoch,
+            plan=plan,
+            cache_names=tuple(kv_caches),
+            vllm_rank=int(vllm_rank),
+            kv_worker_id=str(kv_worker_id),
+            topology_hash=hashlib.sha256(
+                json.dumps(
+                    {
+                        "engine_group_ids": list(next_engine_group_ids),
+                        "cache_names": list(kv_caches),
+                    },
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest(),
+        )
+        ack = self.req_client.register_layerwise_cache(registration).result(
+            timeout=self._mq_timeout
+        )
+        if (
+            ack.registration_epoch != next_epoch
+            or ack.plan_hash != next_plan_hash
+            or ack.layout_hash != next_layout_hash
+            or "token_range_host_storage" not in ack.capabilities
+        ):
+            raise RuntimeError(
+                "layerwise registration ack mismatch: "
+                f"epoch={ack.registration_epoch} "
+                f"plan={ack.plan_hash[:8]} layout={ack.layout_hash[:8]} "
+                f"capabilities={sorted(ack.capabilities)}"
+            )
         self._plan = plan
         self._bindings = bindings
         self._by_dispatch = by_dispatch
         self._by_execution = by_execution
         self._engine_group_ids = next_engine_group_ids
+        self._cache_names = tuple(kv_caches)
         self.registration_epoch = next_epoch
         self.plan_hash = next_plan_hash
         self.layout_hash = next_layout_hash
+        self.server_generation = ack.server_generation
         self.index = LayerwiseTransferIndex(registration_epoch=next_epoch)
         self.snapshots = LayerwiseSnapshotStore()
         admission.set_admission_registry(_DispatchAdmissionView(self))
@@ -609,18 +751,45 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             raise
 
     def enqueue_step_transports(self, step_id: int) -> None:
-        """Hand a step's submitted transfers to the transport layer.
+        """Dispatch a step's submitted transfers over the MP wire (S0).
 
-        **Not wired in this milestone.** The MP transport RPC does not
-        exist yet; this method is the single explicit seam between
-        scheduling (real, above) and the wire, so nothing silently
-        pretends to have moved KV bytes.
+        Every submitted-but-undispatched spec of ``step_id`` is sent
+        synchronously through the request client: stores carry the real
+        per-block tensor bytes, retrieves fetch committed bytes and write
+        them back into the registered caches. Each dispatched op settles
+        into the runtime index before returning, so admission gates and
+        store waits observe terminal state, not promises.
+
+        Fail-closed S0 boundary: exactly one request may be in flight per
+        step. A step carrying specs of several requests raises instead of
+        interleaving transfers the index cannot order yet; overlapping
+        multi-request scheduling arrives with the scheduler-MQ milestone.
+
+        Raises:
+            RuntimeError: No runtime registered, or the step carries more
+                than one request's transfers (S0 boundary).
         """
-        raise NotImplementedError(
-            "layerwise transport enqueue is not wired in this milestone "
-            "(design section 4.3 transport RPC); transfers are scheduled "
-            "and submitted but never moved"
-        )
+        if self.index is None:
+            raise RuntimeError("layerwise runtime is not registered yet")
+        specs = [
+            spec
+            for (_, spec_step_id, _, _), spec in self._step_specs.items()
+            if spec_step_id == step_id
+            and spec.operation_id not in self._dispatched_ops
+        ]
+        if not specs:
+            return
+        requests = sorted({spec.request_id for spec in specs})
+        if len(requests) > 1:
+            raise RuntimeError(
+                "layerwise S0 transport dispatches one request per step; "
+                f"step {step_id} carries {len(requests)}: "
+                f"{', '.join(requests)}. Overlapping multi-request "
+                "scheduling arrives with the scheduler-MQ milestone; "
+                "refusing to interleave fail-closed"
+            )
+        for spec in specs:
+            self._dispatch_spec(spec)
 
     def notify_layer_produced(self, layer_name: str) -> None:
         """Record the producing layer's whole current step window.
@@ -699,30 +868,177 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                     direction="store",
                 )
                 futures.append(self.index.submit_transfer(spec))
-        # Transport seam: the stores are really submitted above; moving
-        # them is the one unwired step of this milestone.
+        # Dispatch moves the submitted stores over the wire now (S0);
+        # wait_for_pending_stores later commits them as a snapshot.
         self.enqueue_step_transports(window.step_id)
         return tuple(futures)
 
     def wait_for_pending_stores(self) -> None:
-        """Return only when no store transfer is still pending.
+        """Commit every dispatched store step as a server snapshot (S0).
 
-        Fail-closed boundary: without the transport RPC a pending store can
-        never settle, so its presence is reported as the unwired-transport
-        seam instead of pretending success.
+        Store dispatch is synchronous (see
+        :meth:`enqueue_step_transports`), so the wires are already
+        settled when this runs; each step with dispatched stores is
+        committed to the MP server as a snapshot with empty boundaries —
+        S0's honest cold-only contract: the snapshot exists, but without
+        the C2 boundary codec a lookup can never hit it, and nothing
+        pretends otherwise.
 
         Raises:
-            RuntimeError: No runtime registered.
-            NotImplementedError: Stores are still pending and the transport
-                is not wired in this milestone.
+            RuntimeError: No runtime registered, or the server refused a
+                snapshot commit.
         """
         if self.index is None:
             raise RuntimeError("layerwise runtime is not registered yet")
-        if self.index.pending_request_ids("store"):
-            raise NotImplementedError(
-                "layerwise stores are pending and the transport is not "
-                "wired in this milestone; they can never settle"
+        for step_id in sorted(self._uncommitted_store_steps):
+            self._commit_step_snapshot(step_id)
+
+    def _dispatch_spec(self, spec: ResourceTransferSpec) -> None:
+        """Send one submitted transfer over the MP request wire (S0).
+
+        Stores extract the real per-block bytes from the registered
+        caches; retrieves fetch committed bytes and write them back. The
+        settled result is folded into the runtime index; a non-ok status
+        is recorded first and then raised, so the engine stops on the
+        first failed transfer instead of scheduling on top of it.
+
+        Raises:
+            RuntimeError: Wire failure, non-ok status, or the index
+                rejected the completion (stale epoch or duplicate).
+        """
+        assert self.index is not None
+        is_store = spec.operation_id.startswith("store:")
+        if is_store:
+            payload = self._extract_resource_payload(spec)
+            future = self.req_client.store_resource(spec, payload)
+            result = future.result(timeout=self._mq_timeout)
+        else:
+            future = self.req_client.retrieve_resource(spec)
+            settled = future.result(timeout=self._mq_timeout)
+            result, payload = settled[0], settled[1]
+            if result.status == "ok" and payload:
+                self._restore_resource_payload(spec, payload)
+        if not self.index.complete_transfer(result):
+            raise RuntimeError(
+                f"layerwise transfer {spec.operation_id} completion was "
+                "ignored (stale epoch or duplicate); refusing to continue"
             )
+        if result.status != "ok":
+            raise RuntimeError(
+                f"layerwise transfer {spec.operation_id} failed with "
+                f"status {result.status}"
+                + (f" ({result.error_code})" if result.error_code else "")
+            )
+        self._dispatched_ops.add(spec.operation_id)
+        if is_store:
+            self._step_store_ops.setdefault(spec.step_id, {})[
+                spec.operation_id
+            ] = (spec, future)
+            self._uncommitted_store_steps.add(spec.step_id)
+
+    def _extract_resource_payload(self, spec: ResourceTransferSpec) -> bytes:
+        """Frame the real tensor bytes one store moves (S0).
+
+        Multi-plane registrations (K + scale tuples) are framed as one
+        segment per plane with a ``name[plane]`` suffix so the decode
+        side can address the exact plane again.
+
+        Raises:
+            RuntimeError: Unknown resource id or tensor name.
+        """
+        assert self._plan is not None
+        resource = next(
+            (
+                candidate
+                for candidate in self._plan.resources
+                if candidate.resource_id == spec.resource_id
+            ),
+            None,
+        )
+        if resource is None:
+            raise RuntimeError(
+                f"unknown layerwise resource {spec.resource_id}"
+            )
+        rows = list(spec.block_ids)
+        segments: list[tuple[str, Any]] = []
+        for tensor_index in resource.tensor_indices:
+            name = self._cache_names[tensor_index]
+            value = self.kv_caches[name]
+            planes = value if isinstance(value, tuple) else (value,)
+            for plane_index, plane in enumerate(planes):
+                segment_name = (
+                    name
+                    if len(planes) == 1
+                    else f"{name}[{plane_index}]"
+                )
+                segments.append((segment_name, plane[rows] if rows else plane[:0]))
+        return encode_resource_payload(segments)
+
+    def _restore_resource_payload(
+        self, spec: ResourceTransferSpec, payload: bytes
+    ) -> None:
+        """Write fetched bytes back into the registered caches (S0).
+
+        Raises:
+            RuntimeError: Unknown segment name in the payload header.
+        """
+        header, tensors = decode_resource_payload(payload)
+        for meta, tensor in zip(header["segments"], tensors, strict=True):
+            name = meta["name"]
+            plane_index = 0
+            if name.endswith("]") and "[" in name:
+                base, _, tail = name.rpartition("[")
+                name = base
+                plane_index = int(tail[:-1])
+            if name not in self.kv_caches:
+                raise RuntimeError(
+                    f"layerwise payload names unknown cache {name!r}"
+                )
+            value = self.kv_caches[name]
+            planes = list(value) if isinstance(value, tuple) else [value]
+            target = planes[plane_index]
+            rows = list(spec.block_ids)
+            if rows:
+                target[rows] = tensor.to(device=target.device)
+
+    def _commit_step_snapshot(self, step_id: int) -> None:
+        """Commit one step's dispatched stores as a server snapshot (S0).
+
+        The snapshot id is derived from (plan, epoch, step) so a retried
+        commit stays idempotent server-side. Boundaries are empty on
+        purpose: without the C2 codec the snapshot is cold-only storage
+        that lookups refuse to hit (design 4.0/6).
+
+        Raises:
+            RuntimeError: If the server refuses the commit.
+        """
+        ops = self._step_store_ops.get(step_id)
+        if not ops:
+            self._uncommitted_store_steps.discard(step_id)
+            return
+        spec = next(iter(ops.values()))[0]
+        commit = LayerwiseSnapshotCommit(
+            snapshot_id=(
+                f"snap-{self.plan_hash[:8]}-{self.registration_epoch}"
+                f"-{step_id}"
+            ),
+            key=spec.key,
+            registration_epoch=self.registration_epoch,
+            server_generation=self.server_generation,
+            plan_hash=self.plan_hash,
+            layout_hash=self.layout_hash,
+            operation_ids=tuple(sorted(ops)),
+            boundaries=(),  # C2 codec unavailable: cold-only, lookup cannot hit
+        )
+        ok = self.req_client.commit_layerwise_snapshot(commit).result(
+            timeout=self._mq_timeout
+        )
+        if ok is not True:
+            raise RuntimeError(
+                f"layerwise snapshot commit for step {step_id} was refused"
+            )
+        self._uncommitted_store_steps.discard(step_id)
+        del self._step_store_ops[step_id]
 
     def recorded_step_spec(
         self, request_id: str, step_id: int, resource_id: str, direction: str
@@ -966,16 +1282,20 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         self._producer_windows.clear()
         self._step_specs.clear()
         self._step_store_ranges.clear()
+        self._dispatched_ops.clear()
+        self._step_store_ops.clear()
+        self._uncommitted_store_steps.clear()
         admission.clear_admission_registry()
 
 
 class DSV41LayerwiseMPSchedulerAdapter(LMCacheMPSchedulerAdapter):
     """Scheduler-side adapter: registration identity + prefix lookups.
 
-    The message-queue transport is not wired in this milestone; this class
-    delivers the minimal real path: recording the expected registration
-    identity, validating the worker ack, and building/applying prefix
-    lookups against that identity.
+    The S0 transport keeps stores cold-only (empty boundaries), so lookups
+    built here cannot hit yet; this class still delivers the real path it
+    owns: recording the expected registration identity, validating the
+    worker ack (now echoing a real server generation), and
+    building/applying prefix lookups against that identity.
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
