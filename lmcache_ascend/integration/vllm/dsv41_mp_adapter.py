@@ -31,6 +31,7 @@ from lmcache.integration.vllm.vllm_multi_process_adapter import (
     LMCacheMPWorkerAdapter,
 )
 from lmcache.v1.multiprocess.layerwise_protocol import (
+    BOUNDARY_STATE_SCHEMA_V2,
     LAYERWISE_PROTOCOL_VERSION,
     BoundaryStateDescriptor,
     LayerwiseLookupRequest,
@@ -39,6 +40,7 @@ from lmcache.v1.multiprocess.layerwise_protocol import (
     LayerwiseRegistrationAck,
     LayerwiseSnapshotCommit,
     ResourceTransferSpec,
+    compute_boundary_checksum,
 )
 
 from lmcache_ascend.integration.vllm.dsv41_boundary_codec import (
@@ -1487,6 +1489,56 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                 )
             ring_length = int(header["ring_length"])
             page_offset = int(header["page_offset"])
+            # Schema integrity: a v2 payload must travel with a v2
+            # descriptor. A v1 descriptor cannot prove its ring identity
+            # (no geometry fields), so pairing it with a v2 payload is a
+            # forged or misrouted frame and is refused fail-closed.
+            descriptor = spec.boundary
+            if descriptor.schema_version != BOUNDARY_STATE_SCHEMA_V2:
+                raise RuntimeError(
+                    "boundary descriptor for resource "
+                    f"{spec.resource_id} is schema "
+                    f"v{descriptor.schema_version} but its payload is v2; "
+                    "identity fields cannot be cross-checked - refusing "
+                    "to restore"
+                )
+            # Ring integrity: every identity field the descriptor
+            # checksums must agree with the payload header it traveled
+            # with; a forged cursor, phase, or page describes a ring
+            # state the capture never wrote.
+            for field_name, header_key in (
+                ("ring_length", "ring_length"),
+                ("page_offset", "page_offset"),
+                ("ring_cursor", "ring_cursor"),
+                ("compression_phase", "compression_phase"),
+            ):
+                header_value = int(header[header_key])
+                descriptor_value = int(getattr(descriptor, field_name))
+                if header_value != descriptor_value:
+                    raise RuntimeError(
+                        f"boundary payload {header_key} {header_value} "
+                        f"disagrees with descriptor "
+                        f"{descriptor_value} for resource "
+                        f"{spec.resource_id}; refusing to restore"
+                    )
+            # Checksum integrity: recompute over the descriptor's own
+            # identity so a hand-edited descriptor cannot ride a payload
+            # it was never encoded with.
+            expected_checksum = compute_boundary_checksum(
+                descriptor.snapshot_id,
+                descriptor.resource_id,
+                descriptor.boundary_token,
+                descriptor.ring_cursor,
+                descriptor.compression_phase,
+                descriptor.row_indices,
+                descriptor.schema_version,
+            )
+            if descriptor.checksum != expected_checksum:
+                raise RuntimeError(
+                    "boundary descriptor checksum for resource "
+                    f"{spec.resource_id} does not cover its identity "
+                    "fields; refusing to restore a forged descriptor"
+                )
             # Ring integrity: the descriptor's row identity must span
             # exactly the payload's captured page, and the payload's
             # boundary token must match the descriptor it traveled with.

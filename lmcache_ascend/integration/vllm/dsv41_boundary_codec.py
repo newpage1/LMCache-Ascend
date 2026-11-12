@@ -52,6 +52,7 @@ from typing import Any
 from lmcache.v1.multiprocess.layerwise_protocol import (
     BOUNDARY_COMPRESSION_PHASES,
     BOUNDARY_STATE_SCHEMA_VERSION,
+    BOUNDARY_STATE_SCHEMA_V2,
     BoundaryStateDescriptor,
     compute_boundary_checksum,
 )
@@ -181,6 +182,8 @@ def encode_boundary_rows(
         }
         page_rows: tuple[int, ...] = rows
         ring_length_out = int(block.shape[0])
+        page_start = -1
+        written_local: tuple[int, ...] = ()
     else:
         ring_length_out = int(ring_length)
         if ring_length_out <= 0:
@@ -238,7 +241,11 @@ def encode_boundary_rows(
         ring_cursor=int(ring_cursor),
         compression_phase=int(compression_phase),
         row_indices=page_rows,
-        schema_version=BOUNDARY_STATE_SCHEMA_VERSION,
+        schema_version=(
+            BOUNDARY_STATE_SCHEMA_V2
+            if ring_length is not None
+            else BOUNDARY_STATE_SCHEMA_VERSION
+        ),
         checksum=compute_boundary_checksum(
             snapshot_id,
             resource_id,
@@ -246,7 +253,20 @@ def encode_boundary_rows(
             int(ring_cursor),
             int(compression_phase),
             page_rows,
-            BOUNDARY_STATE_SCHEMA_VERSION,
+            BOUNDARY_STATE_SCHEMA_V2
+            if ring_length is not None
+            else BOUNDARY_STATE_SCHEMA_VERSION,
+        ),
+        ring_length=(
+            int(ring_length_out) if ring_length is not None else -1
+        ),
+        page_offset=(
+            int(page_start)
+            if ring_length is not None
+            else -1
+        ),
+        written_rows=(
+            tuple(written_local) if ring_length is not None else ()
         ),
     )
     return descriptor, payload
