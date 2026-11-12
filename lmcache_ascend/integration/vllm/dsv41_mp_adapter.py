@@ -488,6 +488,24 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                 Row indices must be the engine's real slot mapping: the
                 C2 codec rejects guesses.
 
+        Provider protocol v2 (t84 full-page snapshots). Optional hooks on
+        the provider object enable the page-geometry aware paths:
+
+        * ``provider.ring_rows(resource_id) -> int`` — rows per ring
+          page. Required for boundary *stores*: with it the adapter
+          frames the complete ring page (schema v2 payload, unwritten
+          rows normalized to zero); without it the snapshot stays
+          cold-only with a loud warning, exactly like a missing
+          provider.
+        * ``provider.restore_target(resource_id, boundary_token) ->
+          (target_page, ring_rows) | None`` — the new request's own ring
+          page for a *restore*. Required for boundary *restores*: the
+          captured physical page is provenance only (plan §6), so the
+          adapter refuses to write back at the captured rows and
+          rebases the full page onto the target page instead. A missing
+          hook or ``None`` fails the transfer closed rather than
+          restoring onto a guessed page.
+
         Raises:
             TypeError: If ``provider`` is not callable.
         """
@@ -1150,14 +1168,21 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         step_id: int,
         entries: list[tuple[str, int, int, tuple]],
     ) -> None:
-        """Encode and dispatch the step's boundary-state rows (S1).
+        """Encode and dispatch the step's boundary-state pages (S1).
 
         Boundary rows are the engine-side ring-buffer slots a later hit
         must restore, so they ride the same snapshot as the token-range
         bytes. Rows always come from the installed provider — the
-        engine's real slot mapping — and a missing provider or a
-        provider ``None`` leaves the resource out of the snapshot with a
-        loud warning: the adapter never invents row indices.
+        engine's real slot mapping — and a missing provider, a provider
+        ``None``, or a provider without ring geometry leaves the
+        resource out of the snapshot with a loud warning: the adapter
+        never invents row indices and never guesses pages.
+
+        Stores frame the **complete ring page** (schema v2): the
+        provider's written rows prove which slots hold real bytes, the
+        unwritten slots travel normalized to zero (plan §6.2), and the
+        descriptor's row identity spans the whole page so a restore can
+        rebase it onto a new request page without stale tail slots.
 
         Raises:
             RuntimeError: No runtime registered, or the server refused a
@@ -1186,6 +1211,17 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             )
             self._step_boundary_descriptors[step_id] = {}
             return
+        ring_rows_hook = getattr(self._boundary_provider, "ring_rows", None)
+        if not callable(ring_rows_hook):
+            logger.warning(
+                "[dsv41_layerwise] boundary provider exposes no ring "
+                "geometry (ring_rows hook); a sparse snapshot cannot be "
+                "rebased onto a new request page, so step %d stays "
+                "cold-only (no fabricated pages)",
+                step_id,
+            )
+            self._step_boundary_descriptors[step_id] = {}
+            return
         dispatched: dict[str, BoundaryStateDescriptor] = {}
         for resource in boundary_resources:
             provided = self._boundary_provider(
@@ -1201,6 +1237,7 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                 )
                 continue
             ring_cursor, compression_phase, row_indices = provided
+            ring_length = int(ring_rows_hook(resource.resource_id))
             tensor_index = resource.tensor_indices[0]
             name = self._cache_names[tensor_index]
             value = self.kv_caches[name]
@@ -1213,6 +1250,7 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                 boundary_token=boundary_token,
                 ring_cursor=ring_cursor,
                 compression_phase=compression_phase,
+                ring_length=ring_length,
             )
             spec = ResourceTransferSpec(
                 operation_id=self.next_operation_id("store"),
@@ -1271,11 +1309,14 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             dispatched[resource.resource_id] = descriptor
             logger.info(
                 "[dsv41_layerwise] boundary store dispatched over the wire "
-                "op=%s request=%s resource=%s rows=%d token=%s",
+                "op=%s request=%s resource=%s full_page_rows=%d "
+                "written_rows=%d bytes=%d token=%s",
                 spec.operation_id,
                 request_id,
                 resource.resource_id,
                 len(descriptor.row_indices),
+                len(row_indices),
+                len(payload),
                 boundary_token,
             )
         self._step_boundary_descriptors[step_id] = dispatched
@@ -1406,13 +1447,19 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
     ) -> None:
         """Write fetched bytes back into the registered caches (S0/S1).
 
-        Token-range payloads scatter into the addressed cache rows;
-        boundary payloads (S1) decode through the C2 codec and restore
-        the exact rows the descriptor carried.
+        Token-range payloads scatter into the addressed cache rows.
+        Boundary payloads (S1, schema v2) are **full ring pages**: the
+        captured physical page is provenance only (plan §6), so the
+        restore asks the provider for the *new request's own target
+        page* and copies the whole page there — never back at the
+        captured rows, never only the rows the captured step wrote. The
+        full-page copy overwrites every target slot (ring tail
+        included), so no previous request's bytes survive the rebase.
 
         Raises:
-            RuntimeError: Unknown segment name in the payload header, or
-                an unknown resource for a boundary payload.
+            RuntimeError: Unknown segment name in the payload header, an
+                unknown resource, a v1 (sparse) boundary payload, ring
+                integrity mismatches, or no resolvable target page.
         """
         if spec.boundary is not None:
             assert self._plan is not None
@@ -1429,11 +1476,90 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                     f"unknown layerwise resource {spec.resource_id}"
                 )
             decoded = decode_boundary_rows(payload)
-            name = self._cache_names[resource.tensor_indices[0]]
+            header = decoded["header"]
+            if header.get("v") != 2:
+                raise RuntimeError(
+                    "boundary payload for resource "
+                    f"{spec.resource_id} is v1 (sparse rows): it carries "
+                    "no ring geometry, so it cannot be rebased onto a new "
+                    "request page - refusing to restore; re-store the "
+                    "snapshot with the v2 full-page codec"
+                )
+            ring_length = int(header["ring_length"])
+            page_offset = int(header["page_offset"])
+            # Ring integrity: the descriptor's row identity must span
+            # exactly the payload's captured page, and the payload's
+            # boundary token must match the descriptor it traveled with.
+            descriptor_rows = tuple(spec.boundary.row_indices)
+            expected_rows = tuple(range(page_offset, page_offset + ring_length))
+            if descriptor_rows != expected_rows:
+                raise RuntimeError(
+                    f"boundary descriptor rows {descriptor_rows[:4]}... do "
+                    f"not span the payload ring page {expected_rows[:4]}... "
+                    f"for resource {spec.resource_id}; refusing to restore "
+                    "mismatched identity"
+                )
+            if str(header.get("boundary_token")) != str(
+                spec.boundary.boundary_token
+            ):
+                raise RuntimeError(
+                    f"boundary payload token {header.get('boundary_token')!r} "
+                    f"disagrees with descriptor token "
+                    f"{spec.boundary.boundary_token!r} for resource "
+                    f"{spec.resource_id}; refusing to restore"
+                )
+            target_hook = getattr(
+                self._boundary_provider, "restore_target", None
+            )
+            if not callable(target_hook):
+                raise RuntimeError(
+                    "the installed boundary provider cannot name a restore "
+                    "target page (no restore_target hook); refusing to "
+                    "restore boundary bytes onto a guessed page fail-closed"
+                )
+            target = target_hook(
+                spec.resource_id, spec.boundary.boundary_token
+            )
+            if target is None:
+                raise RuntimeError(
+                    "boundary provider returned no target page for "
+                    f"resource {spec.resource_id} (no new request page to "
+                    "rebase onto); refusing to restore fail-closed"
+                )
+            target_page, target_ring = int(target[0]), int(target[1])
+            if target_ring != ring_length:
+                raise RuntimeError(
+                    f"restore target ring has {target_ring} rows but the "
+                    f"payload page has {ring_length}; cross-topology "
+                    "rebase refused fail-closed"
+                )
+            tensor_index = resource.tensor_indices[0]
+            name = self._cache_names[tensor_index]
             value = self.kv_caches[name]
-            target = value[0] if isinstance(value, tuple) else value
-            rows = decoded["header"]["rows"]
-            target[rows] = decoded["rows"].to(device=target.device)
+            cache = value[0] if isinstance(value, tuple) else value
+            target_start = target_page * ring_length
+            target_end = target_start + ring_length
+            if target_start < 0 or target_end > int(cache.shape[0]):
+                raise RuntimeError(
+                    f"restore target page {target_page} rows "
+                    f"[{target_start}, {target_end}) exceed the registered "
+                    f"cache with {int(cache.shape[0])} rows for resource "
+                    f"{spec.resource_id}"
+                )
+            page = decoded["rows"].to(device=cache.device, dtype=cache.dtype)
+            cache[target_start:target_end] = page
+            logger.info(
+                "[dsv41_layerwise] boundary page restored op=%s "
+                "resource=%s captured_page=%d -> target_page=%d "
+                "ring_length=%d written_rows=%d token=%s",
+                spec.operation_id,
+                spec.resource_id,
+                page_offset // ring_length,
+                target_page,
+                ring_length,
+                len(header.get("written_rows", ())),
+                spec.boundary.boundary_token,
+            )
             return
         header, tensors = decode_resource_payload(payload)
         for meta, tensor in zip(header["segments"], tensors, strict=True):
