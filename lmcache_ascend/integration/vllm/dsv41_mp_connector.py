@@ -27,6 +27,7 @@ With the flag absent or ``False`` every method defers to the stock
 """
 
 # Standard
+import dataclasses
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
@@ -43,6 +44,28 @@ except ImportError:  # pragma: no cover - msgspec ships with lmcache
 from lmcache_ascend.integration.vllm.dsv41_prefix_key import (
     dsv41_prefix_key,
 )
+from lmcache.logging import init_logger
+
+logger = init_logger(__name__)
+
+
+def _annotate_entry_configs(entry: Any, configs: dict) -> Any:
+    """Rebuild a metadata entry with new request_configs.
+
+    Stock entries are plain dataclasses (``LMCacheMPRequestMetadata``),
+    so ``dataclasses.replace`` is the primary path; msgspec structs (if
+    a future stock version switches) fall back to
+    ``msgspec.structs.replace``. Returns ``None`` when neither applies —
+    the caller skips that entry (best effort, t111 run11: msgspec-only
+    replace silently failed on the dataclass and zero entries were
+    annotated).
+    """
+    if dataclasses.is_dataclass(entry) and not isinstance(entry, type):
+        return dataclasses.replace(entry, request_configs=configs)
+    try:
+        return msgspec_structs_replace(entry, request_configs=configs)
+    except Exception:  # noqa: BLE001 - annotation is best effort
+        return None
 
 DSV41_LAYERWISE_FLAG = "dsv41.layerwise"
 
@@ -398,13 +421,35 @@ class DSV41LayerwiseMPConnector(LMCacheMPConnector):
             )
             configs = dict(getattr(entry, "request_configs", None) or {})
             configs["dsv41.prefix_key"] = key
-            try:
-                requests[index] = msgspec_structs_replace(
-                    entry, request_configs=configs
-                )
-                annotated = True
-            except Exception:  # noqa: BLE001 - annotation is best effort
+            # t111 run19: when this request's layerwise lookup already
+            # HIT, forward the serving registration identity so the
+            # worker's retrieves target the exact state that holds the
+            # snapshot instead of fanning out over every published one.
+            hit = getattr(self.scheduler_adapter, "_dsv41_lookups", {}).get(
+                request_id
+            )
+            if hit and hit.get("hit") is not None:
+                result = hit["hit"]
+                configs["dsv41.hit_identity"] = {
+                    "plan_hash": result.plan_hash,
+                    "layout_hash": result.layout_hash,
+                    "registration_epoch": getattr(
+                        result, "registration_epoch", 0
+                    )
+                    or 0,
+                    "server_generation": int(result.server_generation),
+                }
+            rebuilt = _annotate_entry_configs(entry, configs)
+            if rebuilt is None:
                 continue
+            requests[index] = rebuilt
+            annotated = True
+        logger.info(
+            "[dsv41_layerwise] build_connector_meta annotated %d/%d "
+            "metadata entries with the cross-request prefix key",
+            sum(1 for e in requests if "dsv41.prefix_key" in (getattr(e, "request_configs", None) or {})),
+            len(requests),
+        )
         if annotated:
             try:
                 metadata.requests = tuple(requests)
@@ -486,6 +531,7 @@ class DSV41LayerwiseMPConnector(LMCacheMPConnector):
                     ),
                     has_retrieve=True,
                     prefix_key=prefix_key,
+                    hit_identity=configs.get("dsv41.hit_identity"),
                 )
             elif direction == "STORE":
                 stores[request_id] = (

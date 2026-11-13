@@ -25,6 +25,9 @@ that cannot be attributed stays cold alone.
 import hashlib
 import itertools
 import json
+import os
+import threading
+from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
@@ -50,9 +53,15 @@ from lmcache.v1.multiprocess.layerwise_protocol import (
     LayerwiseRegistration,
     LayerwiseRegistrationAck,
     LayerwiseSnapshotCommit,
+    ResourceTransferResult,
     ResourceTransferSpec,
     compute_boundary_checksum,
 )
+
+try:  # msgspec.structs.replace needs msgspec >= 0.18
+    from msgspec.structs import replace as _msgspec_replace
+except Exception:  # pragma: no cover - image ships msgspec 0.22
+    _msgspec_replace = None
 
 from lmcache_ascend.integration.vllm.dsv41_boundary_codec import (
     decode_boundary_rows,
@@ -347,6 +356,7 @@ class StepRequestView:
 
     committed_tokens: int
     prefix_key: str | None = None
+    hit_identity: dict | None = None
     blocks: tuple[tuple[int, ...], ...] = ()
     start_token: int = 0
     skip_first_n_tokens: int = 0
@@ -482,6 +492,14 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             int, dict[str, tuple[ResourceTransferSpec, Any]]
         ] = {}
         self._uncommitted_store_steps: set[int] = set()
+        # t111 run20: a step commits only after the engine sealed it —
+        # wait_for_pending_stores marks the step complete. Committing on
+        # ``outstanding == 0`` alone raced ahead of later layers of the
+        # same step submitting their stores, so the first partial commit
+        # published an op set missing whole layers and every later
+        # same-id commit hit "reused with different content" (9x
+        # layers.1.swa_cache NOT_COMMITTED).
+        self._sealed_steps: set[int] = set()
         # Steps whose store pass already ran (wait-time or sync path), so a
         # second wait never resubmits the same range (t75 async fix).
         self._wait_store_handled: set[int] = set()
@@ -497,6 +515,15 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         # t106 bridge: request id -> cross-request prefix key delivered
         # through the stock metadata's request_configs.
         self._request_prefix_keys: dict[str, str] = {}
+        # t111 run19: exact serving identity per request, injected by the
+        # scheduler through request_configs once its lookup HIT.
+        self._request_hit_identity: dict[str, dict] = {}
+        # t111 run13: cross-DP prefix retrieves. A published snapshot
+        # lives in the *storing* DP group's registration state, so a
+        # warm request routed to another DP must address its retrieve
+        # RPC with that publishing identity instead of its own.
+        self._worker_identity_cache: list[dict] | None = None
+        self._group_identity_adopted = False
         # S1 boundary support: the engine-side provider of real boundary
         # rows (ring cursor, compression phase, row indices) per
         # boundary-state resource. ``None`` (default) leaves snapshots
@@ -508,6 +535,36 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         self._step_boundary_descriptors: dict[
             int, dict[str, dict[str, BoundaryStateDescriptor]]
         ] = {}
+        # t111 async store drain: store RPCs are submitted in the engine
+        # thread (cheap enqueue on the client's outbound queue) but settled
+        # and committed by a background drain thread, so the engine never
+        # pays a synchronous per-store settle RTT (the t103/t106 c01 runs
+        # measured ~90s per 8192-token window at 48 in-flight requests).
+        # The queue is bounded: backpressure settles the oldest items in
+        # the caller's thread instead of dropping them.
+        self._drain_pending: "deque[tuple[ResourceTransferSpec, Any, bytes | None, int]]" = deque()
+        self._drain_lock = threading.Lock()
+        self._drain_wake = threading.Event()
+        self._drain_stop = False
+        self._drain_thread: threading.Thread | None = None
+        self._drain_failures = 0
+        # step id -> store settles still in flight (enqueued minus
+        # settled). A step commits once its outstanding count hits zero.
+        self._step_outstanding_stores: dict[int, int] = {}
+        # t111: the engine thread (opportunistic commit after
+        # wait_for_pending_stores) and the drain thread both reach
+        # _commit_settled_steps; commits are serialized and a commit
+        # failure in either thread is logged (honest miss), never
+        # raised into the engine.
+        self._commit_lock = threading.Lock()
+        self._committing_steps: set[int] = set()
+        # Steps whose stores already went over the wire in any lane
+        # (hook or wait-time). The wait-time pass never resubmits them:
+        # after a single-owner election loss the winning sibling worker
+        # already stored the key, and a fresh operation id for the same
+        # ResourceOpKey is a conflicting re-submission server-side
+        # (observed on c01 t111 run2: 45 commit refusals, wedged steps).
+        self._step_dispatched: set[int] = set()
 
     def set_boundary_provider(self, provider: Any) -> None:
         """Install the engine-side boundary-row provider (S1).
@@ -695,6 +752,58 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         self.index = LayerwiseTransferIndex(registration_epoch=next_epoch)
         self.snapshots = LayerwiseSnapshotStore()
         admission.set_admission_registry(_DispatchAdmissionView(self))
+        self._publish_registration_identity()
+
+    def _publish_registration_identity(self) -> None:
+        """Publish this registration identity for the scheduler sidecar.
+
+        The scheduler-role connector runs in a different process and
+        cannot see the worker's registration ack, so a prefix lookup
+        submitted there has no identity to carry (t111 run8: the B3
+        bridge silently never activated because ``_plan_hash`` stayed
+        empty). The worker drops a tiny JSON sidecar under
+        ``DSV41_LAYERWISE_IDENTITY_DIR`` (default
+        ``/tmp/dsv41-layerwise-identity``); the scheduler adapter lazily
+        adopts whatever identities exist. No sidecar, no layerwise
+        lookup — fail-closed, the stock path is untouched.
+        """
+        root = os.environ.get(
+            "DSV41_LAYERWISE_IDENTITY_DIR",
+            "/tmp/dsv41-layerwise-identity",
+        )
+        try:
+            os.makedirs(root, exist_ok=True)
+            payload = json.dumps(
+                {
+                    "plan_hash": self.plan_hash,
+                    "layout_hash": self.layout_hash,
+                    "registration_epoch": int(self.registration_epoch),
+                    "server_generation": int(self.server_generation),
+                }
+            )
+            name = f"{self.plan_hash[:8]}-{self.layout_hash[:8]}.json"
+            tmp = os.path.join(root, f".{name}.{os.getpid()}.tmp")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+            os.replace(tmp, os.path.join(root, name))
+            logger.info(
+                "[dsv41_layerwise] published registration identity "
+                "plan=%s layout=%s epoch=%d generation=%d to %s/%s "
+                "(scheduler-side prefix lookups can now adopt it)",
+                self.plan_hash[:8],
+                self.layout_hash[:8],
+                int(self.registration_epoch),
+                int(self.server_generation),
+                root,
+                name,
+            )
+        except OSError as exc:
+            logger.warning(
+                "[dsv41_layerwise] could not publish the registration "
+                "identity sidecar (%s); scheduler-side prefix lookups "
+                "stay off (fail-closed, stock path unaffected)",
+                exc,
+            )
 
     # ------------------------------------------------------------------
     # Binding lookup
@@ -808,6 +917,11 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         """
         if self._plan is None or self.index is None:
             raise RuntimeError("layerwise runtime is not registered yet")
+        # t111 run18: adopt the group identity before ANY spec is built.
+        # The hook lane (submit_layer_store during forward) may already
+        # have built specs by the time the async start_load_kv lane gets
+        # here, so both entry points adopt first.
+        self._ensure_group_identity()
         assert self.index is not None
         # Steps below the incoming one can no longer schedule or store:
         # their records are retired up front so a long serving run does
@@ -821,7 +935,21 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                 if view.prefix_key:
                     # t106: keep the latest cross-request key for this
                     # request; specs and snapshots commit under it.
-                    self._request_prefix_keys[request_id] = view.prefix_key
+                    if view.prefix_key:
+                        self._request_prefix_keys[request_id] = (
+                            view.prefix_key
+                        )
+                        hit_identity = getattr(view, "hit_identity", None)
+                        if hit_identity:
+                            self._request_hit_identity[request_id] = (
+                                hit_identity
+                            )
+                        logger.info(
+                            "[dsv41_layerwise] worker adopted prefix key "
+                            "%s for request %s",
+                            view.prefix_key,
+                            request_id,
+                        )
         try:
             for request_id, view in requests.items():
                 # The store range comes from the STORE op semantics — the
@@ -968,23 +1096,25 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         ordered = sorted(
             specs, key=lambda s: (s.request_id, s.resource_id, s.operation_id)
         )
-        # t106: submit every RPC first, then wait once. The t103 c01 run
-        # showed the serial per-spec ``submit -> .result()`` round trip
-        # collapse throughput at 48 in-flight requests (24 resources x a
-        # full RTT each, per step, per request); batching the waits turns
-        # that into one RTT overlap per step.
-        inflight: list[tuple[ResourceTransferSpec, Any, Any, int]] = []
+        if ordered:
+            self._step_dispatched.add(step_id)
+        # t111: retrieves settle inline - their admission window must
+        # close (and bytes land) before the engine's wait_for_layer_load
+        # unblocks, and a step carries at most a handful of them.
         for spec in ordered:
-            is_store = spec.operation_id.startswith("store:")
-            if is_store:
+            if not spec.operation_id.startswith("store:"):
+                self._dispatch_retrieve(spec)
+        # Stores only submit here; the bounded background drain settles
+        # them and commits the finished steps (t111). Submitting is a
+        # cheap enqueue on the client's outbound queue, so the engine
+        # thread stops paying a synchronous settle RTT per store spec
+        # (t103/t106 measured ~90s per 8192-token window at 48 in-flight
+        # requests on that barrier).
+        for spec in ordered:
+            if spec.operation_id.startswith("store:"):
                 payload = self._extract_resource_payload(spec)
                 future = self.req_client.store_resource(spec, payload)
-                inflight.append((spec, future, payload, len(payload)))
-            else:
-                future = self.req_client.retrieve_resource(spec)
-                inflight.append((spec, future, None, 0))
-        for spec, future, payload, payload_len in inflight:
-            self._settle_dispatched_spec(spec, future, payload, payload_len)
+                self._enqueue_store_drain(spec, future, payload, len(payload))
 
     def notify_layer_produced(self, layer_name: str) -> None:
         """Record the producing layer's whole current step window.
@@ -1032,6 +1162,14 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         """
         if self._plan is None or self.index is None:
             raise RuntimeError("layerwise runtime is not registered yet")
+        self._ensure_group_identity()
+        if not self._is_sole_group_storer():
+            logger.debug(
+                "[dsv41_layerwise] skipping hook-lane stores for %s: a "
+                "sibling TP worker is the elected sole storer",
+                layer_name,
+            )
+            return ()
         binding = self._binding_for_engine_layer(layer_name)
         window = self._producer_windows.get(binding.execution_layer_name)
         if window is None or not window.request_ids:
@@ -1152,19 +1290,27 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         the C2 boundary codec a lookup can never hit it, and nothing
         pretends otherwise.
 
+        t111 async contract: store settlement and snapshot commits run in
+        the background drain thread; this call submits everything the
+        engine knows about (wait-time store pass, boundary pass for steps
+        whose stores are already settled), opportunistically settles the
+        futures that have already completed (so a fully-synchronous wire
+        behaves exactly like the old blocking version), and returns
+        without waiting on unresolved futures. The engine thread stops
+        paying a synchronous settle RTT per store spec (t103/t106 c01:
+        ~90s per 8192-token window at 48 in-flight requests).
+
         Raises:
-            RuntimeError: No runtime registered, or the server refused a
-                snapshot commit.
+            RuntimeError: No runtime registered, or a synchronous part
+                (submit / retrieve settle) failed.
         """
         if self.index is None:
             raise RuntimeError("layerwise runtime is not registered yet")
         self._wait_time_store_pass()
-        for step_id in sorted(self._uncommitted_store_steps):
-            # S1: fold the step's boundary rows (engine-provided) into the
-            # snapshot before the commit, whichever lane dispatched the
-            # token-range stores.
-            self._store_step_boundaries_for_commit(step_id)
-            self._commit_step_snapshot(step_id)
+        self._settle_ready_drain_inline()
+        for (step_id, _rid) in self._step_store_ranges:
+            self._sealed_steps.add(step_id)
+        self._commit_settled_steps()
 
     def _store_step_boundaries_for_commit(self, step_id: int) -> None:
         """Run the boundary pass for a step about to commit (S1).
@@ -1204,14 +1350,34 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                 refused (propagated from the S0 wire path).
         """
         assert self._plan is not None and self.index is not None
+        if not self._is_sole_group_storer():
+            logger.debug(
+                "[dsv41_layerwise] skipping wait-time stores: a sibling "
+                "TP worker (lower server_generation in the same DP "
+                "group) is the elected sole storer"
+            )
+            self._wait_store_handled.update(
+                step_id
+                for (step_id, _request_id) in self._step_store_ranges
+            )
+            return
         by_step: dict[int, list[tuple[str, int, int, tuple]]] = {}
         for (step_id, request_id), store_range in sorted(
             self._step_store_ranges.items()
         ):
             if step_id in self._wait_store_handled:
                 continue
-            if step_id in self._step_store_ops:
-                # The sync-path hook already dispatched this step's stores.
+            if (
+                step_id in self._step_store_ops
+                # t111: the hook lane (or an earlier wait pass) already
+                # queued this step's stores for the background drain.
+                or self._step_outstanding_stores.get(step_id)
+                # t111: any lane already put this step's stores on the
+                # wire (including election losers - the winner stored
+                # the key; a resubmit is a conflicting re-submission).
+                or step_id in self._step_dispatched
+            ):
+                # Stores already on the wire for this step.
                 self._wait_store_handled.add(step_id)
                 continue
             by_step.setdefault(step_id, []).append(
@@ -1472,8 +1638,21 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                     compression_phase=compression_phase,
                     ring_length=ring_length,
                 )
+                # t111: the boundary spec is deterministic per (request,
+                # step, resource) — a stable operation id over stable
+                # fields — so re-entering the boundary pass (engine and
+                # drain threads, or a retried commit) re-submits the
+                # *identical* spec. Both the client-side and server-side
+                # single-owner indexes treat an identical re-submission
+                # as idempotent and hand back the original future, where
+                # a fresh counter-based operation id made every re-entry
+                # a fatal "conflicting re-submission" (t111 run3/run4:
+                # 20+20 boundary commit failures per request pair).
                 spec = ResourceTransferSpec(
-                    operation_id=self.next_operation_id("store"),
+                    operation_id=(
+                        f"store:boundary:{request_id}:{step_id}:"
+                        f"{resource.resource_id}"
+                    ),
                     request_id=request_id,
                     step_id=step_id,
                     registration_epoch=self.registration_epoch,
@@ -1519,9 +1698,20 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                         f"{getattr(result, 'status', None)} ({error_code})"
                     )
                 if not self.complete_transfer(result):
-                    raise RuntimeError(
-                        "boundary store completion was ignored (stale "
-                        "epoch or duplicate)"
+                    # t111: the boundary operation id is deterministic
+                    # per (request, step, resource), so a re-entry of the
+                    # boundary pass settles the *same* op the first pass
+                    # already completed — the client index answers False
+                    # (already terminal) for the identical completion.
+                    # That is idempotent success, not a stale epoch (the
+                    # pre-deterministic-id run5 showed 28 false failures
+                    # here); a genuinely stale epoch still fails the
+                    # identity checks above.
+                    logger.debug(
+                        "[dsv41_layerwise] boundary store completion "
+                        "already recorded for op=%s (idempotent "
+                        "re-entry); continuing",
+                        spec.operation_id,
                     )
                 self._dispatched_ops.add(spec.operation_id)
                 self._step_store_ops.setdefault(step_id, {})[
@@ -1544,6 +1734,269 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                     boundary_token,
                 )
         self._step_boundary_descriptors[step_id] = dispatched
+
+    def _published_identities(self) -> list[dict]:
+        """Own identity first, then the worker sidecars, newest epoch last.
+
+        Each entry carries the identity fields a retrieve RPC must
+        carry for the server to route it to the *publishing*
+        registration state (``_state_for`` matches plan, layout and
+        epoch). Unreadable sidecars are skipped; a missing directory
+        degrades to the own identity only.
+        """
+        own = {
+            "plan_hash": self.plan_hash,
+            "layout_hash": self.layout_hash,
+            "registration_epoch": self.registration_epoch,
+            "server_generation": int(self.server_generation),
+        }
+        if self._worker_identity_cache is not None:
+            return [own, *self._worker_identity_cache]
+        root = os.environ.get(
+            "DSV41_LAYERWISE_IDENTITY_DIR",
+            "/tmp/dsv41-layerwise-identity",
+        )
+        others: dict[tuple, dict] = {}
+        try:
+            names = sorted(os.listdir(root))
+        except OSError:
+            names = []
+        for name in names:
+            if not name.endswith(".json") or name.startswith("."):
+                continue
+            try:
+                with open(os.path.join(root, name), encoding="utf-8") as fh:
+                    payload = json.load(fh)
+                identity = {
+                    "plan_hash": str(payload["plan_hash"]),
+                    "layout_hash": str(payload["layout_hash"]),
+                    "registration_epoch": int(payload["registration_epoch"]),
+                    "server_generation": int(payload["server_generation"]),
+                }
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+            others.setdefault(
+                (
+                    identity["plan_hash"],
+                    identity["layout_hash"],
+                    identity["registration_epoch"],
+                ),
+                identity,
+            )
+        cache = sorted(
+            others.values(), key=lambda i: i["registration_epoch"]
+        )
+        self._worker_identity_cache = cache
+        return [own, *cache]
+
+    def _ensure_group_identity(self) -> None:
+        """Adopt the group's canonical registration identity once.
+
+        All sibling TP workers of a DP group register separately, but
+        the server keeps ONE registration state per (plan, layout) —
+        last registrant wins — so only specs carrying the group's final
+        (epoch, generation) pass ``matches()``. Every worker reads the
+        group sidecar (written by the last registrant) and adopts that
+        identity before building specs; combined with deterministic
+        store op ids, all siblings then emit *identical* specs, which
+        the server replays idempotently: one complete op set, one
+        commit, no election fragmentation (t111 run17 root cause).
+        """
+        if self._group_identity_adopted:
+            return
+        self._group_identity_adopted = True
+        for identity in self._published_identities():
+            if (
+                identity["plan_hash"] == self.plan_hash
+                and identity["layout_hash"] == self.layout_hash
+                and identity["registration_epoch"] != self.registration_epoch
+            ):
+                logger.info(
+                    "[dsv41_layerwise] adopting group identity: epoch "
+                    "%d -> %d, generation %s -> %s (sibling TP workers "
+                    "emit identical specs against one registration "
+                    "state)",
+                    self.registration_epoch,
+                    identity["registration_epoch"],
+                    int(self.server_generation),
+                    identity["server_generation"],
+                )
+                self.registration_epoch = identity["registration_epoch"]
+                self.server_generation = identity["server_generation"]
+                self._op_owner = f"g{int(self.server_generation)}-"
+                self.index = LayerwiseTransferIndex(
+                    registration_epoch=self.registration_epoch
+                )
+                self._dispatched_ops.clear()
+                self._step_store_ops.clear()
+                self._uncommitted_store_steps.clear()
+                self._sealed_steps.clear()
+                self._step_specs.clear()
+                break
+
+    def _is_sole_group_storer(self) -> bool:
+        """Whether this worker is the elected storer for its DP group.
+
+        Sibling TP workers of one DP group share a registration state,
+        and the server elects one owner per (key, request, step,
+        resource) op — with every sibling racing, winners scatter across
+        workers and each sibling's snapshot commit then lists only its
+        own winning ops. A retrieve resolves against *one* commit, so a
+        scattered commit reads as NOT_COMMITTED for the resources a
+        sibling lost (t111 run16: op -0 hit, op -1 missed on the same
+        step). Electing a single storer per group — the registered
+        identity of the group with the lowest ``server_generation`` —
+        keeps every step's op set in one commit. Workers parse the same
+        sidecar directory, so the election is deterministic and needs no
+        extra RPC. Losing siblings skip storing (their bytes are
+        replicated by construction; the sole storer ships the full set).
+        """
+        identities = self._published_identities()
+        own_key = (self.plan_hash, self.layout_hash)
+        peers = [
+            i["server_generation"]
+            for i in identities
+            if (i["plan_hash"], i["layout_hash"]) == own_key
+        ]
+        if not peers:
+            return True
+        return int(self.server_generation) == min(peers)
+
+    def _dispatch_retrieve(self, spec: ResourceTransferSpec) -> None:
+        """Dispatch one retrieve, settling it inline (admission contract).
+
+        Own-identity retrieves settle through the standard path. A
+        *prefix-key* retrieve (cross-request reuse) whose own-identity
+        attempt misses retries with every published identity: the
+        snapshot was committed under the storing DP group's
+        registration state, and only a spec carrying that identity
+        reaches it (t111 run13: warm requests round-robin across DP
+        ranks, so cross-identity is the norm, not the exception).
+        """
+        exact = self._request_hit_identity.get(spec.request_id)
+        if exact and _msgspec_replace is not None:
+            variant = _msgspec_replace(
+                spec,
+                plan_hash=exact["plan_hash"],
+                layout_hash=exact["layout_hash"],
+                registration_epoch=exact["registration_epoch"],
+                server_generation=exact["server_generation"],
+            )
+            settled = self.req_client.retrieve_resource(variant).result(
+                timeout=self._mq_timeout
+            )
+            result, payload = settled[0], settled[1]
+            if result.status == "ok" and payload:
+                self._restore_resource_payload(spec, payload)
+                ok = ResourceTransferResult(
+                    operation_id=spec.operation_id,
+                    resource_id=spec.resource_id,
+                    registration_epoch=self.registration_epoch,
+                    server_generation=int(self.server_generation),
+                    status="ok",
+                )
+                self.index.complete_transfer(ok)
+                self._dispatched_ops.add(spec.operation_id)
+                logger.info(
+                    "[dsv41_layerwise] exact-identity prefix retrieve "
+                    "op=%s request=%s served by the scheduler's hit "
+                    "identity %s/%s",
+                    spec.operation_id,
+                    spec.request_id,
+                    exact["plan_hash"][:8],
+                    exact["layout_hash"][:8],
+                )
+                return
+            logger.info(
+                "[dsv41_layerwise] exact-identity retrieve %s missed "
+                "(status=%s); falling back to own + published identities",
+                spec.operation_id,
+                result.status,
+            )
+        future = self.req_client.retrieve_resource(spec)
+        try:
+            self._settle_dispatched_spec(spec, future, None, 0)
+            return
+        except RuntimeError as exc:
+            if not spec.key.startswith("dsv41-"):
+                raise
+            logger.debug(
+                "[dsv41_layerwise] own-identity retrieve %s missed; "
+                "trying published identities (%s)",
+                spec.operation_id,
+                exc,
+            )
+        # Own attempt missed: the runtime index recorded the failure
+        # (complete_transfer ran before the raise), so re-submit before
+        # retrying, keeping one live index entry per operation id.
+        self.index.submit_transfer(spec)
+        for identity in self._published_identities()[1:]:
+            if (
+                identity["plan_hash"] == self.plan_hash
+                and identity["layout_hash"] == self.layout_hash
+                and identity["registration_epoch"] == self.registration_epoch
+            ):
+                continue
+            if _msgspec_replace is None:
+                break
+            variant = _msgspec_replace(
+                spec,
+                plan_hash=identity["plan_hash"],
+                layout_hash=identity["layout_hash"],
+                registration_epoch=identity["registration_epoch"],
+                server_generation=identity["server_generation"],
+            )
+            settled = self.req_client.retrieve_resource(variant).result(
+                timeout=self._mq_timeout
+            )
+            result, payload = settled[0], settled[1]
+            if result.status == "ok" and payload:
+                self._restore_resource_payload(spec, payload)
+                ok = ResourceTransferResult(
+                    operation_id=spec.operation_id,
+                    resource_id=spec.resource_id,
+                    registration_epoch=self.registration_epoch,
+                    server_generation=int(self.server_generation),
+                    status="ok",
+                )
+                if not self.index.complete_transfer(ok):
+                    logger.debug(
+                        "[dsv41_layerwise] cross-identity retrieve %s "
+                        "completion was ignored (stale or duplicate)",
+                        spec.operation_id,
+                    )
+                self._dispatched_ops.add(spec.operation_id)
+                logger.info(
+                    "[dsv41_layerwise] cross-identity prefix retrieve "
+                    "op=%s request=%s served by published identity "
+                    "%s/%s (own layout %s)",
+                    spec.operation_id,
+                    spec.request_id,
+                    identity["plan_hash"][:8],
+                    identity["layout_hash"][:8],
+                    str(self.layout_hash)[:8],
+                )
+                return
+        miss = ResourceTransferResult(
+            operation_id=spec.operation_id,
+            resource_id=spec.resource_id,
+            registration_epoch=self.registration_epoch,
+            server_generation=int(self.server_generation),
+            status="miss",
+            error_code="NOT_COMMITTED",
+        )
+        self.index.complete_transfer(miss)
+        tried = ", ".join(
+            f"{i['plan_hash'][:6]}/{i['layout_hash'][:6]}"
+            for i in self._published_identities()
+        )
+        raise RuntimeError(
+            f"layerwise transfer {spec.operation_id} (request="
+            f"{spec.request_id} step={spec.step_id} resource="
+            f"{spec.resource_id} key={spec.key[:24]}...) failed with "
+            "status miss (NOT_COMMITTED) after trying every published "
+            f"identity: {tried}"
+        )
 
     def _settle_dispatched_spec(
         self,
@@ -1647,6 +2100,204 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                 payload_len,
             )
         return True
+
+    # ------------------------------------------------------------------
+    # t111: bounded background drain for store settlement and commits.
+    # ------------------------------------------------------------------
+    _DRAIN_QUEUE_MAX = 256
+    _DRAIN_LOG_EVERY = 50
+
+    def _ensure_drain_thread(self) -> None:
+        """Start the drain thread on first use (never at import time)."""
+        if self._drain_thread is not None and self._drain_thread.is_alive():
+            return
+        self._drain_stop = False
+        self._drain_wake.clear()
+        self._drain_thread = threading.Thread(
+            target=self._drain_loop,
+            name="dsv41-layerwise-store-drain",
+            daemon=True,
+        )
+        self._drain_thread.start()
+
+    def _enqueue_store_drain(
+        self,
+        spec: ResourceTransferSpec,
+        future: Any,
+        payload: bytes | None,
+        payload_len: int,
+    ) -> None:
+        """Queue one already-submitted store for background settlement.
+
+        Bounded: when the queue is at capacity the oldest items are
+        settled in the caller's thread first (honest backpressure — the
+        engine blocks before the queue grows without limit, never by
+        silently dropping a store).
+        """
+        if getattr(future, "query", None) is not None and future.query():
+            # Already resolved: settle inline (no wait, just bookkeeping —
+            # the barrier t111 removes is the *wait*, not the folding).
+            self._settle_drain_item((spec, future, payload, payload_len))
+            return
+        self._ensure_drain_thread()
+        while True:
+            with self._drain_lock:
+                if len(self._drain_pending) < self._DRAIN_QUEUE_MAX:
+                    self._drain_pending.append(
+                        (spec, future, payload, payload_len)
+                    )
+                    self._step_outstanding_stores[spec.step_id] = (
+                        self._step_outstanding_stores.get(spec.step_id, 0) + 1
+                    )
+                    break
+                oldest = self._drain_pending.popleft()
+            self._settle_drain_item(oldest)
+        self._drain_wake.set()
+
+    def _settle_ready_drain_inline(self) -> None:
+        """Settle queued stores whose futures already resolved (fast path).
+
+        Keeps fully-synchronous wires (tests, a responsive server)
+        behaving like the pre-t111 blocking implementation: by the time
+        ``wait_for_pending_stores`` returns, every already-completed
+        store is settled.
+        """
+        while True:
+            with self._drain_lock:
+                ready = None
+                for item in self._drain_pending:
+                    if getattr(item[1], "query", None)():
+                        self._drain_pending.remove(item)
+                        ready = item
+                        break
+                if ready is None:
+                    return
+            self._settle_drain_item(ready)
+
+    def _settle_drain_item(
+        self, item: tuple[ResourceTransferSpec, Any, bytes | None, int]
+    ) -> None:
+        """Settle one queued store and mark its step one step closer to commit."""
+        spec = item[0]
+        try:
+            self._settle_dispatched_spec(spec, item[1], item[2], item[3])
+        except Exception as exc:  # noqa: BLE001 - background settle: log + drop
+            # The engine already moved on (async contract); a failed store
+            # is recorded loudly and its snapshot simply never commits —
+            # the next lookup misses honestly. Nothing is fabricated.
+            self._drain_failures += 1
+            if (
+                self._drain_failures == 1
+                or self._drain_failures % self._DRAIN_LOG_EVERY == 0
+            ):
+                logger.error(
+                    "[dsv41_layerwise] background store settle failed "
+                    "(occurrence #%d): op=%s request=%s step=%d: %s; that "
+                    "snapshot will not commit (honest miss next lookup)",
+                    self._drain_failures,
+                    spec.operation_id,
+                    spec.request_id,
+                    spec.step_id,
+                    exc,
+                )
+        finally:
+            outstanding = self._step_outstanding_stores.get(spec.step_id, 0)
+            if outstanding <= 1:
+                self._step_outstanding_stores.pop(spec.step_id, None)
+            else:
+                self._step_outstanding_stores[spec.step_id] = outstanding - 1
+
+    def _drain_loop(self) -> None:
+        """Background: settle queued stores, commit finished steps."""
+        while True:
+            with self._drain_lock:
+                item = (
+                    self._drain_pending.popleft()
+                    if self._drain_pending
+                    else None
+                )
+            if item is None:
+                if self._drain_stop:
+                    return
+                self._drain_wake.wait(timeout=0.05)
+                self._drain_wake.clear()
+                continue
+            self._settle_drain_item(item)
+            try:
+                # _commit_settled_steps is serialized and fail-soft; the
+                # drain thread keeps looping whatever a commit did.
+                self._commit_settled_steps()
+            except Exception as exc:  # noqa: BLE001 - never kill drain
+                self._drain_failures += 1
+                logger.error(
+                    "[dsv41_layerwise] background commit pass failed "
+                    "(occurrence #%d): %s",
+                    self._drain_failures,
+                    exc,
+                )
+
+    def _commit_settled_steps(self) -> None:
+        """Commit every step whose queued stores have all settled.
+
+        Serialized across the engine and drain threads; a step already
+        committing under the other thread is skipped. Commit failures
+        (server refusal, RPC timeout) are logged and dropped — that
+        snapshot simply never commits, the next lookup misses honestly,
+        and the engine never dies on a background store.
+        """
+        with self._commit_lock:
+            ready = [
+                step_id
+                for step_id in sorted(self._uncommitted_store_steps)
+                if not self._step_outstanding_stores.get(step_id)
+                and step_id in self._sealed_steps
+                and step_id not in self._committing_steps
+            ]
+            self._committing_steps.update(ready)
+        try:
+            for step_id in ready:
+                try:
+                    # S1: fold the step's boundary rows (engine-provided)
+                    # into the snapshot before the commit, whichever lane
+                    # dispatched the token-range stores. The engine thread
+                    # only spends a short bounded wait here; a slow or
+                    # refused commit lands in the except path (honest
+                    # miss) instead of wedging the engine for the full
+                    # RPC timeout (t111 run2: 300s per refused commit).
+                    wait = (
+                        self._DRAIN_COMMIT_WAIT_S
+                        if threading.current_thread()
+                        is self._drain_thread
+                        else self._ENGINE_COMMIT_WAIT_S
+                    )
+                    self._store_step_boundaries_for_commit(step_id)
+                    self._commit_step_snapshot(step_id, wait_timeout=wait)
+                except Exception as exc:  # noqa: BLE001 - never kill engine
+                    self._drain_failures += 1
+                    logger.error(
+                        "[dsv41_layerwise] background snapshot commit "
+                        "failed (occurrence #%d) for step %d: %s; that "
+                        "snapshot stays uncommitted (honest miss next "
+                        "lookup)",
+                        self._drain_failures,
+                        step_id,
+                        exc,
+                    )
+                    # One-shot commit: the server's view of a timed-out or
+                    # refused commit is unknowable, and re-submitting the
+                    # boundary store under a fresh operation id trips the
+                    # client-side single-owner index (t111 run3: retry
+                    # storm - 504 commit timeouts and 94 conflicting
+                    # re-submissions from re-entering steps). Drop the
+                    # step; the lookup misses honestly.
+                    self._uncommitted_store_steps.discard(step_id)
+                    self._sealed_steps.discard(step_id)
+                    self._step_store_ops.pop(step_id, None)
+                    self._step_boundary_descriptors.pop(step_id, None)
+        finally:
+            with self._commit_lock:
+                for step_id in ready:
+                    self._committing_steps.discard(step_id)
 
     def _extract_resource_payload(self, spec: ResourceTransferSpec) -> bytes:
         """Frame the real tensor bytes one store moves (S0).
@@ -1884,7 +2535,12 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             if rows:
                 target[rows] = tensor.to(device=target.device)
 
-    def _commit_step_snapshot(self, step_id: int) -> None:
+    _ENGINE_COMMIT_WAIT_S = 2.0
+    _DRAIN_COMMIT_WAIT_S = 30.0
+
+    def _commit_step_snapshot(
+        self, step_id: int, wait_timeout: float | None = None
+    ) -> None:
         """Commit one step's dispatched stores as server snapshots (S0).
 
         One snapshot per request (t94): a multi-request step's ops are
@@ -1939,7 +2595,7 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                 boundaries=boundaries,
             )
             ok = self.req_client.commit_layerwise_snapshot(commit).result(
-                timeout=self._mq_timeout
+                timeout=self._mq_timeout if wait_timeout is None else wait_timeout,
             )
             if ok is not True:
                 raise RuntimeError(
@@ -1958,6 +2614,7 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                 else " (cold-only: lookups cannot hit S0-style snapshots)",
             )
         self._uncommitted_store_steps.discard(step_id)
+        self._sealed_steps.discard(step_id)
         del self._step_store_ops[step_id]
         self._step_boundary_descriptors.pop(step_id, None)
 
@@ -2201,8 +2858,20 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         cached = self._step_specs.get(key)
         if cached is not None:
             return cached
+        if direction == "store":
+            # Deterministic across sibling TP workers: identical specs
+            # replay idempotently on the server instead of racing the
+            # single-owner election with drifting per-worker counters
+            # (t111 run17: per-worker numbering fragmented each step's
+            # op set across siblings, so one commit never held them
+            # all and retrieves read NOT_COMMITTED).
+            operation_id = (
+                f"store:{request_id}:{step_id}:{resource.resource_id}"
+            )
+        else:
+            operation_id = self.next_operation_id(direction)
         spec = ResourceTransferSpec(
-            operation_id=self.next_operation_id(direction),
+            operation_id=operation_id,
             request_id=request_id,
             step_id=step_id,
             registration_epoch=self.registration_epoch,
@@ -2278,7 +2947,23 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         self._step_boundary_descriptors.clear()
         self._stored_token_end.clear()
         self._request_prefix_keys.clear()
+        self._request_hit_identity.clear()
         self._boundary_provider = None
+        # t111: stop the background drain; queued stores are settled
+        # synchronously here so shutdown stays deterministic.
+        self._drain_stop = True
+        self._drain_wake.set()
+        thread = self._drain_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        while True:
+            with self._drain_lock:
+                if not self._drain_pending:
+                    break
+                item = self._drain_pending.popleft()
+            self._settle_drain_item(item)
+        self._step_outstanding_stores.clear()
+        self._step_dispatched.clear()
         admission.clear_admission_registry()
 
 
@@ -2302,6 +2987,9 @@ class DSV41LayerwiseMPSchedulerAdapter(LMCacheMPSchedulerAdapter):
         # futures, the derived prefix key, and the settled hit (whose
         # lease is released as soon as the hit is consumed).
         self._dsv41_lookups: dict[str, dict[str, Any]] = {}
+        # t111: identities adopted from the worker sidecar (plan, layout,
+        # epoch); empty until the first lookup finds at least one.
+        self._lookup_identities: list[tuple[str, str, int]] = []
 
     def expect_registration(
         self,
@@ -2369,24 +3057,92 @@ class DSV41LayerwiseMPSchedulerAdapter(LMCacheMPSchedulerAdapter):
             reserve_last_token=reserve_last_token,
             start=start,
         )
-        if request_id in self._dsv41_lookups or not self._plan_hash:
+        if request_id in self._dsv41_lookups:
+            return submitted
+        if not self._lookup_identities:
+            self._lookup_identities = self._load_lookup_identities()
+            if self._lookup_identities:
+                self._plan_hash, self._layout_hash, self._registration_epoch = (
+                    self._lookup_identities[0]
+                )
+                # Cache names are worker-private; the scheduler-side
+                # scope check stays off (no names adopted -> no check).
+                self._cache_names = ()
+                logger.info(
+                    "[dsv41_layerwise] adopted %d published layerwise "
+                    "registration identit%s for prefix lookups "
+                    "(lead plan=%s layout=%s)",
+                    len(self._lookup_identities),
+                    "y" if len(self._lookup_identities) == 1 else "ies",
+                    self._plan_hash[:8],
+                    self._layout_hash[:8],
+                )
+        if not self._lookup_identities:
             return submitted
         key = dsv41_prefix_key(
             self.model_name, cache_salt, packed_token_ids
         )
-        try:
-            lookup = self.build_layerwise_lookup(key)
-        except RuntimeError:
-            return submitted
-        futures = []
-        for client in self.req_clients.values():
-            futures.append(client.lookup_layerwise_prefix(lookup))
+        entries: list[tuple[str, str, Any]] = []
+        for plan_h, layout_h, epoch in self._lookup_identities:
+            request = LayerwiseLookupRequest(
+                protocol_version=LAYERWISE_PROTOCOL_VERSION,
+                plan_hash=plan_h,
+                layout_hash=layout_h,
+                registration_epoch=epoch,
+                key=key,
+            )
+            for client in self.req_clients.values():
+                entries.append(
+                    (plan_h, layout_h, client.lookup_layerwise_prefix(request))
+                )
+        logger.info(
+            "[dsv41_layerwise] scheduler layerwise lookup submitted "
+            "request=%s key=%s identities=%d rpcs=%d stock_submitted=%s",
+            request_id,
+            key,
+            len(self._lookup_identities),
+            len(entries),
+            submitted,
+        )
         self._dsv41_lookups[request_id] = {
             "key": key,
-            "pending": futures,
+            "pending": entries,
             "hit": None,
         }
         return submitted
+
+    def _load_lookup_identities(self) -> list[tuple[str, str, int]]:
+        """Read the worker-published registration identity sidecars.
+
+        Returns a de-duplicated, deterministic ``(plan, layout, epoch)``
+        list; any unreadable or malformed sidecar is skipped (fail-closed
+        to "no identity for that file"), and a missing directory yields
+        an empty list — the layerwise lookup simply stays off.
+        """
+        root = os.environ.get(
+            "DSV41_LAYERWISE_IDENTITY_DIR",
+            "/tmp/dsv41-layerwise-identity",
+        )
+        found: dict[tuple[str, str, int], None] = {}
+        try:
+            names = sorted(os.listdir(root))
+        except OSError:
+            return []
+        for name in names:
+            if not name.endswith(".json") or name.startswith("."):
+                continue
+            try:
+                with open(os.path.join(root, name), encoding="utf-8") as fh:
+                    payload = json.load(fh)
+                identity = (
+                    str(payload["plan_hash"]),
+                    str(payload["layout_hash"]),
+                    int(payload["registration_epoch"]),
+                )
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+            found.setdefault(identity, None)
+        return list(found)
 
     def check_lookup_result(self, request_id: str) -> int | None:
         """Stock result first; fall through to the layerwise snapshot.
@@ -2410,21 +3166,23 @@ class DSV41LayerwiseMPSchedulerAdapter(LMCacheMPSchedulerAdapter):
             self._drop_layerwise_lookup(request_id, drain=True)
             return ret
         still_pending = []
-        for future in state.get("pending", []):
+        for entry in state.get("pending", []):
+            plan_h, layout_h, future = entry
             if not future.query():
-                still_pending.append(future)
+                still_pending.append(entry)
                 continue
             result = future.result(timeout=0)
             if result is None:
                 continue
-            try:
-                self.apply_layerwise_lookup(result)
-            except ValueError as exc:
+            # Validate against the identity this RPC targeted (the
+            # scheduler's lead identity may differ when several DP-group
+            # layouts published sidecars).
+            if result.plan_hash != plan_h or result.layout_hash != layout_h:
                 logger.warning(
                     "[dsv41_layerwise] rejecting layerwise lookup result "
-                    "for request %s: %s",
+                    "for request %s: result identity does not match the "
+                    "targeted registration",
                     request_id,
-                    exc,
                 )
                 continue
             state["hit"] = result
@@ -2432,10 +3190,45 @@ class DSV41LayerwiseMPSchedulerAdapter(LMCacheMPSchedulerAdapter):
         state["pending"] = still_pending
         hit = state.get("hit")
         if hit is not None:
+            # The boundary token is the engine's real step end, which is
+            # NOT chunk aligned (t111 run12: stock asserts
+            # ``ret % lmcache_tokens_per_chunk == 0`` and died on the
+            # first genuine hit). Align the matched prefix DOWN to the
+            # chunk grid the stock scheduler expects; a sub-chunk prefix
+            # aligns to zero and is reported as an honest miss.
+            chunk = int(getattr(self, "lmcache_tokens_per_chunk", 0) or 0)
+            matched = int(hit.matched_end)
+            aligned = matched // chunk * chunk if chunk > 0 else matched
             self._release_lease_quietly(hit.lease_id)
-            return int(hit.matched_end)
+            if aligned <= 0:
+                logger.info(
+                    "[dsv41_layerwise] scheduler layerwise lookup HIT "
+                    "request=%s matched_end=%d but aligns to 0 tokens "
+                    "under chunk=%d; reporting a miss",
+                    request_id,
+                    matched,
+                    chunk,
+                )
+                return ret
+            logger.info(
+                "[dsv41_layerwise] scheduler layerwise lookup HIT "
+                "request=%s matched_end=%d aligned=%d (chunk=%d) "
+                "snapshot=%s",
+                request_id,
+                matched,
+                aligned,
+                chunk,
+                hit.snapshot_id,
+            )
+            return aligned
         if state["pending"]:
             return None
+        logger.info(
+            "[dsv41_layerwise] scheduler layerwise lookup MISS "
+            "request=%s (no boundary-complete snapshot under the "
+            "request's prefix key)",
+            request_id,
+        )
         return ret
 
     def cleanup_lookup_result(self, request_id: str) -> None:
@@ -2446,7 +3239,8 @@ class DSV41LayerwiseMPSchedulerAdapter(LMCacheMPSchedulerAdapter):
             if hit is not None:
                 self._release_lease_quietly(hit.lease_id)
             else:
-                for future in state.get("pending", []):
+                for entry in state.get("pending", []):
+                    future = entry[-1]
                     try:
                         result = future.result(timeout=self._mq_timeout)
                     except Exception:  # noqa: BLE001 - best-effort drain
@@ -2462,7 +3256,8 @@ class DSV41LayerwiseMPSchedulerAdapter(LMCacheMPSchedulerAdapter):
             return
         if not drain:
             return
-        for future in state.get("pending", []):
+        for entry in state.get("pending", []):
+            future = entry[-1]
             try:
                 result = future.result(timeout=self._mq_timeout)
             except Exception:  # noqa: BLE001 - best-effort drain
