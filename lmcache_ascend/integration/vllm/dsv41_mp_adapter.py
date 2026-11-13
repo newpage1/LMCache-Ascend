@@ -881,14 +881,17 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                         for resource in covered
                     )
                     # Submit before opening admission: the window resolves
-                    # as the submitted ops' results arrive.
+                    # as the submitted ops' results arrive. Admission only
+                    # requires the COVERED resources: skipped groups have
+                    # no transfer to wait for, so requiring them would
+                    # leave the window forever unsettled (t109).
                     for spec in specs:
                         self.index.submit_transfer(spec)
                     self.begin_step_admission(
                         request_id,
                         step_id,
                         layer,
-                        [resource.resource_id for resource in required],
+                        [resource.resource_id for resource in covered],
                         specs,
                     )
         except BaseException:
@@ -1169,12 +1172,13 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                         # Skipping is the honest store; inventing empty
                         # blocks would fake coverage.
                         logger.debug(
-                            "[dsv41_layerwise] store for request %s skips "
-                            "resource %s: engine group %s has no blocks in "
-                            "this step's STORE op",
+                            "[dsv41_layerwise] store skip: request %s "
+                            "resource %s engine group %s has no blocks in "
+                            "this step's STORE op (step %d)",
                             request_id,
                             resource.resource_id,
                             resource.engine_group_id,
+                            step_id,
                         )
                         continue
                     spec = self._step_spec_for(
@@ -2026,11 +2030,17 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
     ) -> bool:
         """Whether a step's STORE op carries blocks for a resource's group.
 
-        The stock scheduler omits groups with zero allocated tokens from
-        the STORE op's per-group block list (e.g. the hybrid SWA scratch
-        group), so the recorded list can be shorter than the registered
-        engine groups. A store for such a resource has no bytes to move
-        this step; callers skip instead of raising coverage.
+        Two distinct outcomes (t109):
+
+        - The resource's engine group IS registered but the step's STORE
+          op recorded no blocks for it (the stock scheduler omits
+          zero-allocated groups, e.g. the hybrid SWA scratch group):
+          ``False`` — the caller skips the transfer because there are no
+          bytes to move this step.
+        - The resource's engine group is NOT in the registration at all:
+          the plan and the registration disagree, which is a
+          configuration error. Failing closed beats silently dropping a
+          group nobody registered, so this raises ``RuntimeError``.
 
         Args:
             resource: Token-range resource referenced by the store.
@@ -2040,11 +2050,23 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         Returns:
             True when the recorded groups cover the resource's engine
             group.
+
+        Raises:
+            RuntimeError: When the resource's engine group is not part of
+                the registration (the caller must not silently skip it).
         """
         if resource.engine_group_id is None:
             return True
         if resource.engine_group_id not in self._engine_group_ids:
-            return False
+            raise RuntimeError(
+                "[dsv41_layerwise] resource "
+                f"{resource.resource_id} references engine group "
+                f"{resource.engine_group_id}, which is not among the "
+                "registered engine groups "
+                f"{self._engine_group_ids}; the plan and the engine "
+                "registration disagree — refusing to silently skip an "
+                "unregistered group"
+            )
         index = self._engine_group_ids.index(resource.engine_group_id)
         return index < len(per_group_blocks)
 
