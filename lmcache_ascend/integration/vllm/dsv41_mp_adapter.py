@@ -516,6 +516,11 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
           rebases the full page onto the target page instead. A missing
           hook or ``None`` fails the transfer closed rather than
           restoring onto a guessed page.
+        * ``provider.step_end_token(request_id) -> int | None`` — the
+          engine's true step end for one request (optional, F5). When
+          present the boundary rides that token instead of the store's
+          chunk-aligned end, so a boundary only ever leaves the worker
+          under the token the engine will match on a later hit.
 
         Provider protocol v3 (t92/t94 per-request attribution). The
         engine provider may accept a ``request_id`` keyword on both the
@@ -841,6 +846,28 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                             request_id, step_id, layer, [], []
                         )
                         continue
+                    # F4: a required resource whose engine group is not
+                    # covered by this step's recorded block groups has no
+                    # bytes to fetch (zero-allocated groups are omitted
+                    # by the stock scheduler) — skip it instead of
+                    # building an empty-blocks spec that would fail the
+                    # protocol validation and the whole step.
+                    covered = [
+                        resource
+                        for resource in required
+                        if self._store_covers_resource(resource, view.blocks)
+                    ]
+                    skipped = len(required) - len(covered)
+                    if skipped:
+                        logger.debug(
+                            "[dsv41_layerwise] retrieve skip: %d resource(s) "
+                            "of request %s in step %d have engine groups not "
+                            "covered by the recorded %d block group(s)",
+                            skipped,
+                            request_id,
+                            step_id,
+                            len(view.blocks or ()),
+                        )
                     specs = tuple(
                         self._step_spec_for(
                             step_id=step_id,
@@ -851,7 +878,7 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                             end_token=view.effective_end_token,
                             skip_first_n_tokens=view.skip_first_n_tokens,
                         )
-                        for resource in required
+                        for resource in covered
                     )
                     # Submit before opening admission: the window resolves
                     # as the submitted ops' results arrive.
@@ -981,6 +1008,24 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             start_token, end_token, blocks = store_range
             for resource in self._plan.written_by(binding.execution_layer_name):
                 if resource.storage_kind != "token_range":
+                    continue
+                # F4: a resource whose engine group sits outside the
+                # groups this step's STORE op recorded has no bytes to
+                # move (the stock scheduler omits zero-allocated groups,
+                # e.g. the hybrid SWA scratch group). Skip it — the same
+                # coverage rule the wait-time pass applies — instead of
+                # letting a coverage miss kill the worker.
+                if not self._store_covers_resource(resource, blocks):
+                    logger.debug(
+                        "[dsv41_layerwise] store skip: engine group %s of "
+                        "resource %s is not covered by the %d block "
+                        "group(s) recorded for request %s in step %d",
+                        resource.engine_group_id,
+                        resource.resource_id,
+                        len(blocks or ()),
+                        request_id,
+                        window.step_id,
+                    )
                     continue
                 spec = self._step_spec_for(
                     step_id=window.step_id,
@@ -1277,8 +1322,27 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             self._step_boundary_descriptors[step_id] = {}
             return
         dispatched: dict[str, dict[str, BoundaryStateDescriptor]] = {}
+        # F5 alignment hook (optional, engine-side): when the provider
+        # knows the engine's true step end for a request, the boundary
+        # rides that token instead of the store's chunk-aligned end.
+        step_end_hook = getattr(
+            self._boundary_provider, "step_end_token", None
+        )
         for request_id, start_token, end_token, _blocks in entries:
             boundary_token = str(end_token)
+            if callable(step_end_hook):
+                engine_end = step_end_hook(request_id)
+                if engine_end is not None and int(engine_end) != end_token:
+                    boundary_token = str(int(engine_end))
+                    logger.info(
+                        "[dsv41_layerwise] boundary token for request %s "
+                        "step %d aligned to the engine step end %s "
+                        "(store chunk end was %d)",
+                        request_id,
+                        step_id,
+                        boundary_token,
+                        end_token,
+                    )
             snapshot_id = self._snapshot_id_for(step_id, request_id)
             for resource in boundary_resources:
                 provided = self._call_boundary_provider(
@@ -1286,14 +1350,18 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                 )
                 if provided is None:
                     logger.warning(
-                        "[dsv41_layerwise] boundary provider returned no "
-                        "rows for resource %s of request %s in step %d; "
-                        "that request's boundary stays out of the "
-                        "snapshot (cold-only for this request, the rest "
-                        "of the batch is unaffected)",
+                        "[dsv41_layerwise] boundary stays cold for "
+                        "resource %s of request %s in step %d: the "
+                        "provider did not accept store end %s as this "
+                        "request's engine step end (a boundary only "
+                        "rides a store whose end equals the step end; "
+                        "partial-chunk tails stay cold by design — "
+                        "cold-only for this request, the rest of the "
+                        "batch is unaffected)",
                         resource.resource_id,
                         request_id,
                         step_id,
+                        boundary_token,
                     )
                     continue
                 ring_cursor, compression_phase, row_indices = provided
@@ -1918,10 +1986,16 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
     ) -> tuple[int, ...]:
         """Select the blocks of one engine group from a per-group record.
 
+        A group the record does not cover has no bytes this step (the
+        stock scheduler omits zero-allocated groups, e.g. the hybrid SWA
+        scratch group), so the miss is logged and empty blocks are
+        returned (F4): a coverage gap must never kill a serving worker.
+        Only a group outside the registration remains a hard error —
+        that is a configuration mistake, not a scheduling shape.
+
         Raises:
             RuntimeError: When the resource references an engine group
-                outside the registration, or the recorded groups do not
-                cover the resource's group index.
+                outside the registration.
         """
         if engine_group_id is None:
             return ()
@@ -1933,10 +2007,16 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             )
         index = self._engine_group_ids.index(engine_group_id)
         if index >= len(per_group_blocks):
-            raise RuntimeError(
-                f"recorded block groups ({len(per_group_blocks)}) do not "
-                f"cover engine group {engine_group_id} at index {index}"
+            logger.warning(
+                "[dsv41_layerwise] recorded block groups (%d) do not "
+                "cover engine group %s at index %d; treating that group "
+                "as empty for this transfer (zero-allocated groups are "
+                "omitted by the stock scheduler)",
+                len(per_group_blocks),
+                engine_group_id,
+                index,
             )
+            return ()
         return per_group_blocks[index]
 
     def _store_covers_resource(
