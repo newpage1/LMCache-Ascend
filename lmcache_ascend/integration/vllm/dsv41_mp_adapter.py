@@ -27,6 +27,7 @@ import itertools
 import json
 import os
 import threading
+import time
 from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -441,6 +442,24 @@ class _ProducerWindow:
     request_ids: tuple[str, ...] = ()
 
 
+class _BridgeLoadFuture:
+    """Already-settled future for a synchronous bridge load.
+
+    Mimics the stock transfer future surface ``get_finished`` polls:
+    ``query()`` is a non-blocking done check, ``result()`` returns the
+    truthy load outcome.
+    """
+
+    def __init__(self, ok: bool) -> None:
+        self._ok = ok
+
+    def query(self) -> bool:
+        return True
+
+    def result(self, timeout: float | None = None) -> bool:
+        return self._ok
+
+
 class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
     """Worker adapter carrying the DSV4.1 layerwise plan and runtime index.
 
@@ -518,6 +537,16 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         # t111 run19: exact serving identity per request, injected by the
         # scheduler through request_configs once its lookup HIT.
         self._request_hit_identity: dict[str, dict] = {}
+        # t114: (request, resource) slots already served through the
+        # paged-KV bridge or the layerwise lane - retries reuse, never
+        # re-dispatch a fresh op id per engine step (t111's 192-op storm).
+        self._bridge_served: set[tuple[str, str]] = set()
+        # t114: requests whose stock RETRIEVE the paged-KV bridge had to
+        # drop (a resource was not committed when the retrieve ran). The
+        # engine recomputes those prefixes, so the layerwise lane opens
+        # plain cold windows for that step instead of fetching again --
+        # a not-yet-committed resource must never kill a serving worker.
+        self._bridge_cold_requests: set[str] = set()
         # t111 run13: cross-DP prefix retrieves. A published snapshot
         # lives in the *storing* DP group's registration state, so a
         # warm request routed to another DP must address its retrieve
@@ -917,6 +946,12 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         """
         if self._plan is None or self.index is None:
             raise RuntimeError("layerwise runtime is not registered yet")
+        # t114: requests the paged-KV bridge dropped are recomputed by
+        # the engine; the lane must not ask the wire for their prefixes
+        # again (a resource that committed after the lookup would miss
+        # and, before this guard, kill the worker).
+        bridge_cold = set(self._bridge_cold_requests)
+        self._bridge_cold_requests.clear()
         # t111 run18: adopt the group identity before ANY spec is built.
         # The hook lane (submit_layer_store during forward) may already
         # have built specs by the time the async start_load_kv lane gets
@@ -990,7 +1025,7 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                     )
                     continue
                 for request_id, view in requests.items():
-                    if not view.has_retrieve:
+                    if not view.has_retrieve or request_id in bridge_cold:
                         # Cold/no-hit request: nothing to fetch, but the
                         # admission window must still exist so the
                         # forward wait/guard covers the whole batch and a
@@ -1862,6 +1897,313 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             return True
         return int(self.server_generation) == min(peers)
 
+    def get_finished(
+        self, finished_req_ids_from_engine: set[str]
+    ) -> tuple[set[str] | None, set[str] | None]:
+        """Layerwise workers never run stock stores, so their
+        ``finished_sending`` reports (which stock emits for *every*
+        engine-finished request that has no store) can race the request
+        lifecycle under ``WAITING_FOR_REMOTE_KVS`` resume and hit the
+        scheduler's ``assert req_id in self.requests`` (t114 run2).
+        Keep the stock bookkeeping but return an empty sending set on
+        the layerwise path; retrieves (finished_recving) are still
+        reported exactly once.
+        """
+        ret_stores, finished_retrieves = super().get_finished(
+            finished_req_ids_from_engine
+        )
+        if self._plan is None:
+            return ret_stores, finished_retrieves
+        if ret_stores:
+            logger.info(
+                "[dsv41_layerwise] suppressing finished_sending report "
+                "for %d engine-finished request(s) (%s): the layerwise "
+                "path owns its stores, so a late stock store report "
+                "would race the scheduler request lifecycle",
+                len(ret_stores),
+                ",".join(sorted(ret_stores)[:4]),
+            )
+        return set(), finished_retrieves
+
+    def submit_retrieve_request(
+        self,
+        request_id: str,
+        op: Any,
+        event: Any,
+        cache_salt: str = "",
+        request_configs: dict[str, Any] | None = None,
+    ) -> None:
+        """Bridge a stock RETRIEVE into the layerwise snapshots (t114).
+
+        The stock external-hit state machine parks a request in
+        WAITING_FOR_REMOTE_KVS until the worker reports the load finished
+        through ``retrieve_futures`` (``get_finished`` polls it every
+        scheduler step). Stock retrieves stream from the standard MP
+        storage; the layerwise bytes live in the transfer module's
+        snapshots, so this override fetches them through the layerwise
+        transport (exact hit identity first, then own, then every
+        published identity) and writes the prefix rows into the engine's
+        paged caches at the op's freshly allocated block ids.
+
+        The load completes synchronously: a truthy settled future is
+        recorded in ``retrieve_futures`` so the stock machinery unblocks
+        the request. On any miss the retrieve is dropped honestly
+        (``_dropped_retrieves`` + ``error_block_ids``) so vLLM recomputes
+        the prompt locally instead of hanging.
+        """
+        if self._plan is None or self.index is None:
+            super().submit_retrieve_request(
+                request_id,
+                op,
+                event,
+                cache_salt=cache_salt,
+                request_configs=request_configs,
+            )
+            return
+        configs = request_configs or {}
+        prefix = configs.get("dsv41.prefix_key") or f"{request_id}:layerwise"
+        expand = getattr(self, "_block_ids_per_group", None)
+        if callable(expand):
+            per_group = expand(op)
+        else:
+            # Test harnesses mount the layerwise adapter on a stubbed
+            # stock base; the op already carries one block list per
+            # engine group, so identity normalization is equivalent to
+            # ``expand_engine_block_ids`` for a 1:1 group mapping.
+            raw = list(op.block_ids)
+            if raw and isinstance(raw[0], int):
+                raw = [raw]
+            per_group = [list(group) for group in raw]
+        group_index = {
+            gid: idx for idx, gid in enumerate(self._engine_group_ids)
+        }
+        served_any = False
+        failed_any = False
+        # t114 run2: one wall clock budget for the whole request bounds
+        # the bridge; past it the remaining resources miss fast and the
+        # request drops honestly so the engine recomputes the prefix
+        # instead of parking in WAITING_FOR_REMOTE_KVS forever.
+        deadline = time.monotonic() + self._BRIDGE_REQUEST_DEADLINE_S
+        for resource in self._plan.resources:
+            if resource.storage_kind != "token_range":
+                continue
+            if resource.engine_group_id is None:
+                continue
+            slot = (request_id, resource.resource_id)
+            if slot in self._bridge_served:
+                served_any = True
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                # t114 run2: past the per-request wall clock the
+                # remaining resources miss fast; the request then drops
+                # honestly below and the engine recomputes the prefix
+                # instead of parking in WAITING_FOR_REMOTE_KVS.
+                failed_any = True
+                logger.warning(
+                    "[dsv41_layerwise] bridge: request %s exceeded its "
+                    "%.0fs load budget before resource %s; the engine "
+                    "will recompute this prefix locally",
+                    request_id,
+                    float(self._BRIDGE_REQUEST_DEADLINE_S),
+                    resource.resource_id,
+                )
+                continue
+            gidx = group_index.get(resource.engine_group_id)
+            if gidx is None or gidx >= len(per_group):
+                logger.debug(
+                    "[dsv41_layerwise] bridge: resource %s group %s not "
+                    "covered by this retrieve op; skipping",
+                    resource.resource_id,
+                    resource.engine_group_id,
+                )
+                continue
+            rows = list(per_group[gidx])
+            if not rows:
+                continue
+            spec = ResourceTransferSpec(
+                operation_id=f"retrieve-bridge:{request_id}:{resource.resource_id}",
+                request_id=request_id,
+                step_id=0,
+                registration_epoch=self.registration_epoch,
+                server_generation=int(self.server_generation),
+                plan_hash=self.plan_hash,
+                layout_hash=self.layout_hash,
+                resource_id=resource.resource_id,
+                key=prefix,
+                engine_group_id=resource.engine_group_id,
+                block_ids=tuple(rows),
+                start_token=int(getattr(op, "start", 0) or 0),
+                end_token=int(getattr(op, "end", 0) or 0),
+                skip_first_n_tokens=int(
+                    getattr(op, "skip_first_n_tokens", 0) or 0
+                ),
+                boundary=None,
+            )
+            payload = self._fetch_payload_cross_identity(
+                spec, max_wait_s=remaining
+            )
+            if payload is None:
+                failed_any = True
+                logger.warning(
+                    "[dsv41_layerwise] bridge: no layerwise snapshot for "
+                    "request %s resource %s under key %s; the engine will "
+                    "recompute this prefix locally",
+                    request_id,
+                    resource.resource_id,
+                    prefix[:24],
+                )
+                continue
+            self._restore_rows_prefix(spec, payload, len(rows))
+            self._bridge_served.add(slot)
+            served_any = True
+        if served_any and not failed_any:
+            self.retrieve_futures[request_id] = (
+                _BridgeLoadFuture(True),
+                list(op.flat_block_ids),
+            )
+            logger.info(
+                "[dsv41_layerwise] paged-KV bridge loaded request %s from "
+                "layerwise snapshots (key=%s...); load reported finished",
+                request_id,
+                prefix[:24],
+            )
+        else:
+            # Honest drop exactly once: vLLM recomputes locally instead
+            # of parking the request in WAITING_FOR_REMOTE_KVS forever.
+            self.error_block_ids.update(op.flat_block_ids)
+            self._failed_request_ids.add(request_id)
+            self._dropped_retrieves.add(request_id)
+            self._bridge_cold_requests.add(request_id)
+            logger.warning(
+                "[dsv41_layerwise] paged-KV bridge dropped retrieve for "
+                "request %s (served=%s failed=%s); engine recomputes",
+                request_id,
+                served_any,
+                failed_any,
+            )
+
+    def _fetch_payload_cross_identity(
+        self, spec: ResourceTransferSpec, max_wait_s: float | None = None
+    ) -> bytes | None:
+        """Fetch one spec's payload trying the exact, own, then all
+        published registration identities.
+
+        ``max_wait_s`` caps the retry loop (the t114 per-request load
+        budget passes its remaining time here). Returns ``None`` when
+        every state misses - an honest miss, never a fabricated hit.
+        """
+        wait_s = self._BRIDGE_COMMIT_WAIT_S
+        if max_wait_s is not None:
+            wait_s = min(wait_s, float(max_wait_s))
+        deadline = time.monotonic() + wait_s
+        waited = 0.0
+        while True:
+            payload, retryable = self._retrieve_from_identities(spec)
+            if payload is not None:
+                if waited > 0.0:
+                    logger.info(
+                        "[dsv41_layerwise] paged-KV bridge: the snapshot for "
+                        "request=%s became available after %.1fs of waiting "
+                        "for the store commit",
+                        spec.request_id,
+                        waited,
+                    )
+                return payload
+            # Only a resource the server knows about but has not committed
+            # yet can become available by waiting; an unknown key is an
+            # honest cold miss and must return immediately.
+            if not retryable or time.monotonic() >= deadline:
+                return None
+            time.sleep(self._BRIDGE_RETRY_S)
+            waited += self._BRIDGE_RETRY_S
+
+    def _retrieve_from_identities(
+        self, spec: ResourceTransferSpec
+    ) -> tuple[bytes | None, bool]:
+        """One pass over the exact, own and published identities.
+
+        Returns ``(payload, retryable)``: ``retryable`` is true when at
+        least one identity answered "known but not committed yet", which
+        a short wait can fix; a plain unknown key is not retryable.
+        """
+        retryable = False
+        candidates: list[dict] = []
+        exact = self._request_hit_identity.get(spec.request_id)
+        if exact:
+            candidates.append(exact)
+        candidates.append(
+            {
+                "plan_hash": self.plan_hash,
+                "layout_hash": self.layout_hash,
+                "registration_epoch": self.registration_epoch,
+                "server_generation": int(self.server_generation),
+            }
+        )
+        candidates.extend(self._published_identities())
+        for identity in candidates:
+            if (
+                identity["plan_hash"] == self.plan_hash
+                and identity["layout_hash"] == self.layout_hash
+                and identity["registration_epoch"] == self.registration_epoch
+            ):
+                variant = spec
+            else:
+                if _msgspec_replace is None:
+                    continue
+                variant = _msgspec_replace(
+                    spec,
+                    plan_hash=identity["plan_hash"],
+                    layout_hash=identity["layout_hash"],
+                    registration_epoch=identity["registration_epoch"],
+                    server_generation=identity["server_generation"],
+                )
+            settled = self.req_client.retrieve_resource(variant).result(
+                timeout=self._mq_timeout
+            )
+            result, payload = settled[0], settled[1]
+            if result.status == "ok" and payload:
+                return payload, False
+            if "NOT_COMMITTED" in str(getattr(result, "error_code", "")):
+                retryable = True
+        return None, retryable
+
+    def _restore_rows_prefix(
+        self, spec: ResourceTransferSpec, payload: bytes, n_rows: int
+    ) -> None:
+        """Write the first ``n_rows`` payload rows into the target rows.
+
+        The stored snapshot covers the storer's full committed range; the
+        retrieve op only needs its matched prefix, so rows pair up by
+        token position (both are block-id lists ordered from token 0).
+        """
+        header, tensors = decode_resource_payload(payload)
+        for meta, tensor in zip(header["segments"], tensors, strict=True):
+            name = meta["name"]
+            plane_index = 0
+            if name.endswith("]") and "[" in name:
+                base, _, tail = name.rpartition("[")
+                name = base
+                plane_index = int(tail[:-1])
+            if name not in self.kv_caches:
+                raise RuntimeError(
+                    f"layerwise payload names unknown cache {name!r}"
+                )
+            value = self.kv_caches[name]
+            planes = list(value) if isinstance(value, tuple) else [value]
+            target = planes[plane_index]
+            rows = list(spec.block_ids)[:n_rows]
+            if rows:
+                source = tensor[:n_rows].to(device=target.device)
+                target[rows] = source
+        logger.info(
+            "[dsv41_layerwise] paged-KV bridge restored op=%s resource=%s "
+            "rows=%d",
+            spec.operation_id,
+            spec.resource_id,
+            n_rows,
+        )
+
     def _dispatch_retrieve(self, spec: ResourceTransferSpec) -> None:
         """Dispatch one retrieve, settling it inline (admission contract).
 
@@ -1872,7 +2214,37 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         registration state, and only a spec carrying that identity
         reaches it (t111 run13: warm requests round-robin across DP
         ranks, so cross-identity is the norm, not the exception).
+
+        Slots already served through the t114 paged-KV bridge (or an
+        earlier dispatch of the same request+resource) are skipped: a
+        parked request re-enters ``start_load_kv`` every engine step,
+        and without this guard each entry mints a fresh op id - the
+        192-retrieves-per-step storm t111 ended with.
         """
+        if (spec.request_id, spec.resource_id) in self._bridge_served:
+            # The bridge already moved the bytes; settle the admission
+            # window immediately so the engine's per-layer gate unblocks
+            # instead of waiting on a dispatch that will never run.
+            try:
+                self.submit_retrieve(spec)
+            except (RuntimeError, ValueError):
+                pass
+            ok = ResourceTransferResult(
+                operation_id=spec.operation_id,
+                resource_id=spec.resource_id,
+                registration_epoch=self.registration_epoch,
+                server_generation=int(self.server_generation),
+                status="ok",
+            )
+            self.index.complete_transfer(ok)
+            self._dispatched_ops.add(spec.operation_id)
+            logger.debug(
+                "[dsv41_layerwise] retrieve skip: request %s resource %s "
+                "already served; settled the admission window locally",
+                spec.request_id,
+                spec.resource_id,
+            )
+            return
         exact = self._request_hit_identity.get(spec.request_id)
         if exact and _msgspec_replace is not None:
             variant = _msgspec_replace(
@@ -2105,6 +2477,16 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
     # t111: bounded background drain for store settlement and commits.
     # ------------------------------------------------------------------
     _DRAIN_QUEUE_MAX = 256
+    # t114: a warm request's RETRIEVE can arrive before the cold
+    # request's background store drain committed the snapshot. Waiting
+    # a bounded time for the commit is honest (the bytes exist), while
+    # an immediate drop would park the request until the engine
+    # recomputes. Never unbounded: the engine thread blocks here.
+    _BRIDGE_COMMIT_WAIT_S = 20.0
+    # t114 run2: one wall clock budget for a whole bridge load; past it
+    # the remaining resources miss fast and the request drops honestly.
+    _BRIDGE_REQUEST_DEADLINE_S = 15.0
+    _BRIDGE_RETRY_S = 0.2
     _DRAIN_LOG_EVERY = 50
 
     def _ensure_drain_thread(self) -> None:
@@ -2948,6 +3330,8 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         self._stored_token_end.clear()
         self._request_prefix_keys.clear()
         self._request_hit_identity.clear()
+        self._bridge_served.clear()
+        self._bridge_cold_requests.clear()
         self._boundary_provider = None
         # t111: stop the background drain; queued stores are settled
         # synchronously here so shutdown stays deterministic.
@@ -2979,6 +3363,20 @@ class DSV41LayerwiseMPSchedulerAdapter(LMCacheMPSchedulerAdapter):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        # t114: explicit degradation gate. The paged-KV bridge cannot yet
+        # serve every resource (F4-skipped scratch groups never store),
+        # and this vLLM build cannot recompute after an external-hit
+        # drop (both drop paths 500 at resume). Until serving is
+        # complete, an honest miss keeps requests on the stock path:
+        # warm requests recompute locally instead of parking in
+        # WAITING_FOR_REMOTE_KVS or failing. Flip to serve with
+        # kv_connector_extra_config["dsv41.bridge_serve"]=true.
+        # ``extra_config`` is the connector's kv_transfer extra dict;
+        # keep any stock ``lmcache.mp.*`` keys intact for the base class.
+        extra_cfg = kwargs.get("extra_config") or {}
+        self._bridge_serve_enabled = bool(
+            extra_cfg.get("dsv41.bridge_serve", False)
+        )
         self._plan_hash: str = ""
         self._layout_hash: str = ""
         self._cache_names: tuple[str, ...] = ()
@@ -3210,10 +3608,27 @@ class DSV41LayerwiseMPSchedulerAdapter(LMCacheMPSchedulerAdapter):
                     chunk,
                 )
                 return ret
+            if not getattr(self, "_bridge_serve_enabled", False):
+                logger.info(
+                    "[dsv41_layerwise] scheduler layerwise lookup HIT "
+                    "request=%s matched_end=%d aligned=%d (chunk=%d) "
+                    "snapshot=%s but the paged-KV bridge cannot serve "
+                    "every resource yet (scratch-group stores are "
+                    "skipped and this vLLM build cannot recompute "
+                    "after an external-hit drop); reporting an honest "
+                    "miss so the engine recomputes locally - enable "
+                    "dsv41.bridge_serve to test serving",
+                    request_id,
+                    matched,
+                    aligned,
+                    chunk,
+                    hit.snapshot_id,
+                )
+                return ret
             logger.info(
                 "[dsv41_layerwise] scheduler layerwise lookup HIT "
                 "request=%s matched_end=%d aligned=%d (chunk=%d) "
-                "snapshot=%s",
+                "snapshot=%s bridge_serve=true",
                 request_id,
                 matched,
                 aligned,

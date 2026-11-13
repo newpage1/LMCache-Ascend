@@ -342,6 +342,13 @@ class DSV41LayerwiseMPConnector(LMCacheMPConnector):
         if not self._dsv41_layerwise:
             super().start_load_kv(forward_context, **kwargs)
             return
+        # t114: run the stock batched retrieve path first. Its
+        # RETRIEVE entries route into the worker's bridged
+        # ``submit_retrieve_request`` (paged-KV load + finished report);
+        # without this call a layerwise hit never satisfies the stock
+        # external-hit state machine and the request parks in
+        # WAITING_FOR_REMOTE_KVS forever (t111 Blocker 3).
+        super().start_load_kv(forward_context, **kwargs)
         worker = self.worker_adapter
         metadata = self._get_connector_metadata()
         requests = self._layerwise_step_view(metadata)
