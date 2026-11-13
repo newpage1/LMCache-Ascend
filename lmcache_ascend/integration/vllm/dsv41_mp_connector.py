@@ -34,6 +34,16 @@ from typing import Any
 # Third Party
 from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector
 
+try:  # Third Party
+    from msgspec.structs import replace as msgspec_structs_replace
+except ImportError:  # pragma: no cover - msgspec ships with lmcache
+    msgspec_structs_replace = None
+
+# First Party (path-loaded sibling module)
+from lmcache_ascend.integration.vllm.dsv41_prefix_key import (
+    dsv41_prefix_key,
+)
+
 DSV41_LAYERWISE_FLAG = "dsv41.layerwise"
 
 
@@ -353,6 +363,60 @@ class DSV41LayerwiseMPConnector(LMCacheMPConnector):
                 worker.shutdown_layerwise()
         super().shutdown()
 
+    def build_connector_meta(self, scheduler_output: Any) -> Any:
+        """Stock metadata plus the t106 cross-request prefix key.
+
+        The stock entries are built unchanged (``super()``), then every
+        RETRIEVE/STORE entry whose request tracker holds prompt tokens
+        is rebuilt with ``request_configs["dsv41.prefix_key"]`` — a
+        stable digest over (model, cache salt, packed prompt token ids).
+        The worker adapter commits snapshots under that key and the
+        scheduler-side layerwise lookup uses the same digest, so a
+        second request with the same prefix hits the first one's
+        snapshot (t106). Entries without a tracker keep the stock form.
+        """
+        metadata = super().build_connector_meta(scheduler_output)
+        try:
+            requests = list(getattr(metadata, "requests", None) or ())
+        except TypeError:
+            return metadata
+        if not requests:
+            return metadata
+        annotated = False
+        for index, entry in enumerate(requests):
+            request_id = getattr(entry, "request_id", None)
+            if request_id is None:
+                continue
+            tracker = self._get_request_tracker(request_id)
+            packed = tracker.packed_token_ids()
+            if not packed:
+                continue
+            key = dsv41_prefix_key(
+                self.scheduler_adapter.model_name,
+                tracker.cache_salt,
+                packed,
+            )
+            configs = dict(getattr(entry, "request_configs", None) or {})
+            configs["dsv41.prefix_key"] = key
+            try:
+                requests[index] = msgspec_structs_replace(
+                    entry, request_configs=configs
+                )
+                annotated = True
+            except Exception:  # noqa: BLE001 - annotation is best effort
+                continue
+        if annotated:
+            try:
+                metadata.requests = tuple(requests)
+            except AttributeError:
+                try:
+                    metadata = msgspec_structs_replace(
+                        metadata, requests=tuple(requests)
+                    )
+                except Exception:  # noqa: BLE001 - best effort
+                    return metadata
+        return metadata
+
     def _layerwise_step_view(self, metadata: Any) -> dict[str, Any]:
         """Extract the per-request transfer geometry from the stock ops.
 
@@ -410,6 +474,8 @@ class DSV41LayerwiseMPConnector(LMCacheMPConnector):
                     "per-request LoadStoreOp (start/end/"
                     "skip_first_n_tokens/block_ids)"
                 )
+            configs = getattr(meta, "request_configs", None) or {}
+            prefix_key = configs.get("dsv41.prefix_key")
             if direction == "RETRIEVE":
                 views[request_id] = StepRequestView(
                     committed_tokens=int(getattr(op, "end", 0)),
@@ -419,12 +485,14 @@ class DSV41LayerwiseMPConnector(LMCacheMPConnector):
                         getattr(op, "skip_first_n_tokens", 0)
                     ),
                     has_retrieve=True,
+                    prefix_key=prefix_key,
                 )
             elif direction == "STORE":
                 stores[request_id] = (
                     int(getattr(op, "start", 0)),
                     int(getattr(op, "end", 0)),
                     _per_group_blocks(op, request_id),
+                    prefix_key,
                 )
             else:
                 raise RuntimeError(
@@ -432,7 +500,7 @@ class DSV41LayerwiseMPConnector(LMCacheMPConnector):
                     f"direction {direction!r}: expected RETRIEVE or "
                     "STORE from the vllm-ascend admission path"
                 )
-        for request_id, (start, end, blocks) in stores.items():
+        for request_id, (start, end, blocks, prefix_key) in stores.items():
             base = views.get(request_id) or StepRequestView(
                 committed_tokens=0
             )
@@ -442,5 +510,6 @@ class DSV41LayerwiseMPConnector(LMCacheMPConnector):
                 store_start_token=start,
                 store_end_token=end,
                 store_blocks=blocks,
+                prefix_key=base.prefix_key or prefix_key,
             )
         return views

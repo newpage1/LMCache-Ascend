@@ -32,6 +32,11 @@ from typing import TYPE_CHECKING, Any, Mapping, Sequence
 # Third Party
 from lmcache.logging import init_logger
 
+# First Party (path-loaded sibling module)
+from lmcache_ascend.integration.vllm.dsv41_prefix_key import (
+    dsv41_prefix_key,
+)
+
 from lmcache.integration.vllm.vllm_multi_process_adapter import (
     LMCacheMPSchedulerAdapter,
     LMCacheMPWorkerAdapter,
@@ -330,9 +335,18 @@ class StepRequestView:
         store_blocks: Block ids of the store range, per engine group.
         has_store: The step metadata carried a STORE op for this
             request; a request without one persists nothing.
+        prefix_key: Cross-request prefix key injected into the stock
+            entry's ``request_configs`` by the wrapper connector
+            (``dsv41.prefix_key``; t106). Present when the scheduler
+            side derived a stable token-hash key for this request's
+            prompt; transfer specs then commit under that key so a
+            later request with the same prefix can hit the snapshot.
+            ``None`` keeps the request-scoped ``<request>:layerwise``
+            key (no cross-request reuse).
     """
 
     committed_tokens: int
+    prefix_key: str | None = None
     blocks: tuple[tuple[int, ...], ...] = ()
     start_token: int = 0
     skip_first_n_tokens: int = 0
@@ -476,6 +490,13 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         # recorded store range (chunk granularity miss), while sentinel
         # cold steps stay silent (t75).
         self._step_real_requests: dict[int, set[str]] = {}
+        # t106 throughput guards: per-(request, resource) stored token
+        # watermark for overlap dedup, and the lost-election log counter.
+        self._stored_token_end: dict[tuple[str, str], int] = {}
+        self._lost_election_count: int = 0
+        # t106 bridge: request id -> cross-request prefix key delivered
+        # through the stock metadata's request_configs.
+        self._request_prefix_keys: dict[str, str] = {}
         # S1 boundary support: the engine-side provider of real boundary
         # rows (ring cursor, compression phase, row indices) per
         # boundary-state resource. ``None`` (default) leaves snapshots
@@ -796,6 +817,11 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             self._step_real_requests.setdefault(step_id, set()).update(
                 requests.keys()
             )
+            for request_id, view in requests.items():
+                if view.prefix_key:
+                    # t106: keep the latest cross-request key for this
+                    # request; specs and snapshots commit under it.
+                    self._request_prefix_keys[request_id] = view.prefix_key
         try:
             for request_id, view in requests.items():
                 # The store range comes from the STORE op semantics — the
@@ -939,10 +965,26 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                 step_id,
             )
             return
-        for spec in sorted(
+        ordered = sorted(
             specs, key=lambda s: (s.request_id, s.resource_id, s.operation_id)
-        ):
-            self._dispatch_spec(spec)
+        )
+        # t106: submit every RPC first, then wait once. The t103 c01 run
+        # showed the serial per-spec ``submit -> .result()`` round trip
+        # collapse throughput at 48 in-flight requests (24 resources x a
+        # full RTT each, per step, per request); batching the waits turns
+        # that into one RTT overlap per step.
+        inflight: list[tuple[ResourceTransferSpec, Any, Any, int]] = []
+        for spec in ordered:
+            is_store = spec.operation_id.startswith("store:")
+            if is_store:
+                payload = self._extract_resource_payload(spec)
+                future = self.req_client.store_resource(spec, payload)
+                inflight.append((spec, future, payload, len(payload)))
+            else:
+                future = self.req_client.retrieve_resource(spec)
+                inflight.append((spec, future, None, 0))
+        for spec, future, payload, payload_len in inflight:
+            self._settle_dispatched_spec(spec, future, payload, payload_len)
 
     def notify_layer_produced(self, layer_name: str) -> None:
         """Record the producing layer's whole current step window.
@@ -1012,6 +1054,23 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             for resource in self._plan.written_by(binding.execution_layer_name):
                 if resource.storage_kind != "token_range":
                     continue
+                # t106 overlap dedup, keyed per (request, resource) — see
+                # the wait-time pass for the rationale.
+                watermark = self._stored_token_end.get(
+                    (request_id, resource.resource_id), 0
+                )
+                if end_token <= watermark:
+                    logger.debug(
+                        "[dsv41_layerwise] store skip: request %s layer %s "
+                        "resource %s range end %d is already stored "
+                        "(watermark %d); overlapping range not re-sent",
+                        request_id,
+                        layer_name,
+                        resource.resource_id,
+                        end_token,
+                        watermark,
+                    )
+                    continue
                 # F4: a resource whose engine group sits outside the
                 # groups this step's STORE op recorded has no bytes to
                 # move (the stock scheduler omits zero-allocated groups,
@@ -1041,6 +1100,9 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                     direction="store",
                 )
                 futures.append(self.index.submit_transfer(spec))
+                self._stored_token_end[
+                    (request_id, resource.resource_id)
+                ] = end_token
                 logger.info(
                     "[dsv41_layerwise] store submitted op=%s request=%s "
                     "tokens=[%d, %d) blocks=%d",
@@ -1163,6 +1225,29 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                 for resource in self._plan.resources:
                     if resource.storage_kind != "token_range":
                         continue
+                    # t106 overlap dedup, keyed per (request, resource):
+                    # the same token range re-presented on later steps
+                    # (decode steps re-present the stored prompt range)
+                    # must not re-send bytes the server already holds —
+                    # the t103 c01 run re-sent 27 unique ranges as ~527
+                    # ops. A DIFFERENT resource of the same range is not
+                    # covered: each resource moves its own bytes.
+                    watermark = self._stored_token_end.get(
+                        (request_id, resource.resource_id), 0
+                    )
+                    if end_token <= watermark:
+                        logger.debug(
+                            "[dsv41_layerwise] store skip: request %s "
+                            "step %d resource %s range end %d is already "
+                            "stored (watermark %d); overlapping range "
+                            "not re-sent",
+                            request_id,
+                            step_id,
+                            resource.resource_id,
+                            end_token,
+                            watermark,
+                        )
+                        continue
                     if not self._store_covers_resource(resource, blocks):
                         # The step's STORE op allocated no blocks for this
                         # resource's engine group (scratch / zero-alloc
@@ -1193,6 +1278,9 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                     )
                     specs.append(spec)
                     self.index.submit_transfer(spec)
+                    self._stored_token_end[
+                        (request_id, resource.resource_id)
+                    ] = end_token
                     logger.info(
                         "[dsv41_layerwise] store submitted (wait-time) "
                         "op=%s request=%s tokens=[%d, %d) blocks=%d",
@@ -1393,7 +1481,8 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                     plan_hash=self.plan_hash,
                     layout_hash=self.layout_hash,
                     resource_id=resource.resource_id,
-                    key=f"{request_id}:layerwise",
+                    key=self._request_prefix_keys.get(request_id)
+            or f"{request_id}:layerwise",
                     engine_group_id=None,
                     block_ids=(),
                     start_token=start_token,
@@ -1456,18 +1545,24 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                 )
         self._step_boundary_descriptors[step_id] = dispatched
 
-    def _dispatch_spec(self, spec: ResourceTransferSpec) -> None:
-        """Send one submitted transfer over the MP request wire (S0).
+    def _settle_dispatched_spec(
+        self,
+        spec: ResourceTransferSpec,
+        future: Any,
+        payload: bytes | None,
+        payload_len: int,
+    ) -> bool:
+        """Wait one already-submitted transfer and fold in its result.
 
-        Stores extract the real per-block bytes from the registered
-        caches; retrieves fetch committed bytes and write them back. The
-        settled result is folded into the runtime index; a non-ok status
-        is recorded first and then raised, so the engine stops on the
-        first failed transfer instead of scheduling on top of it. The one
-        exception is a store that loses the server-side single-owner
-        election (DUPLICATE_OPERATION): the winning sibling worker already
-        stored the key, so the loser skips (returns ``False``) instead of
-        failing the step.
+        The RPC itself went out in :meth:`enqueue_step_transports`'s
+        batched submit loop (t106); this settles the future, restores
+        retrieved bytes, and records the outcome in the runtime index. A
+        non-ok status is recorded first and then raised, so the engine
+        stops on the first failed transfer instead of scheduling on top
+        of it. The one exception is a store that loses the server-side
+        single-owner election (DUPLICATE_OPERATION): the winning sibling
+        worker already stored the key, so the loser skips (returns
+        ``False``) instead of failing the step.
 
         Returns:
             True when this worker's transfer completed on the wire;
@@ -1481,11 +1576,8 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         assert self.index is not None
         is_store = spec.operation_id.startswith("store:")
         if is_store:
-            payload = self._extract_resource_payload(spec)
-            future = self.req_client.store_resource(spec, payload)
             result = future.result(timeout=self._mq_timeout)
         else:
-            future = self.req_client.retrieve_resource(spec)
             settled = future.result(timeout=self._mq_timeout)
             result, payload = settled[0], settled[1]
             if result.status == "ok" and payload:
@@ -1499,15 +1591,32 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             # protocol is single-owner per key. Skip loudly instead of
             # tearing the engine down; this worker simply contributes no
             # bytes for that key (S0 scope: one real owner per store).
-            logger.warning(
-                "[dsv41_layerwise] store op=%s lost the single-owner "
-                "election for (request=%s, step=%d, resource=%s); another "
-                "worker already stored this key - skipping",
-                spec.operation_id,
-                spec.request_id,
-                spec.step_id,
-                spec.resource_id,
-            )
+            # t106: the t103 c01 run logged 217k of these - one per
+            # losing sibling op - which is a log storm, not signal. The
+            # first occurrence and every Nth thereafter stay WARNING so
+            # operators still see the election working; the rest drop to
+            # debug. The running counter is in the message either way.
+            self._lost_election_count += 1
+            count = self._lost_election_count
+            if count == 1 or count % 200 == 0:
+                logger.warning(
+                    "[dsv41_layerwise] store op=%s lost the single-owner "
+                    "election for (request=%s, step=%d, resource=%s); "
+                    "another worker already stored this key - skipping "
+                    "(occurrence #%d)",
+                    spec.operation_id,
+                    spec.request_id,
+                    spec.step_id,
+                    spec.resource_id,
+                    count,
+                )
+            else:
+                logger.debug(
+                    "[dsv41_layerwise] store op=%s lost the single-owner "
+                    "election (occurrence #%d); skipping",
+                    spec.operation_id,
+                    count,
+                )
             self.index.complete_transfer(result)
             return False
         if not self.index.complete_transfer(result):
@@ -1535,7 +1644,7 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                 spec.start_token,
                 spec.end_token,
                 len(spec.block_ids or ()),
-                len(payload),
+                payload_len,
             )
         return True
 
@@ -2101,7 +2210,8 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             plan_hash=self.plan_hash,
             layout_hash=self.layout_hash,
             resource_id=resource.resource_id,
-            key=f"{request_id}:layerwise",
+            key=self._request_prefix_keys.get(request_id)
+            or f"{request_id}:layerwise",
             engine_group_id=resource.engine_group_id,
             block_ids=self._blocks_for_engine_group(
                 per_group_blocks, resource.engine_group_id
@@ -2166,6 +2276,8 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         self._step_store_ops.clear()
         self._uncommitted_store_steps.clear()
         self._step_boundary_descriptors.clear()
+        self._stored_token_end.clear()
+        self._request_prefix_keys.clear()
         self._boundary_provider = None
         admission.clear_admission_registry()
 
@@ -2186,6 +2298,10 @@ class DSV41LayerwiseMPSchedulerAdapter(LMCacheMPSchedulerAdapter):
         self._layout_hash: str = ""
         self._cache_names: tuple[str, ...] = ()
         self._registration_epoch: int = -1
+        # t106 bridge: in-flight layerwise lookups keyed by request id —
+        # futures, the derived prefix key, and the settled hit (whose
+        # lease is released as soon as the hit is consumed).
+        self._dsv41_lookups: dict[str, dict[str, Any]] = {}
 
     def expect_registration(
         self,
@@ -2225,6 +2341,148 @@ class DSV41LayerwiseMPSchedulerAdapter(LMCacheMPSchedulerAdapter):
                 f"worker ack layout hash {ack.layout_hash} != expected "
                 f"{self._layout_hash}"
             )
+
+    def maybe_submit_lookup_request(
+        self,
+        request_id: str,
+        packed_token_ids: bytes,
+        cache_salt: str = "",
+        request_configs: dict[str, Any] | None = None,
+        reserve_last_token: bool = False,
+        start: int = 0,
+    ) -> bool:
+        """Stock lookup first, plus a layerwise lookup on the same prompt.
+
+        The stock path is untouched: ``super()`` submits the standard
+        lookup exactly as before (t106 item ①) and its return value is
+        what this returns. Additionally, when a layerwise registration
+        identity is expected, a ``lookup_layerwise_prefix`` RPC fan-out
+        goes out under the stable ``dsv41_prefix_key`` digest — the same
+        key the wrapper connector injects into the stock metadata and
+        the worker commits snapshots under — without waiting here.
+        """
+        submitted = super().maybe_submit_lookup_request(
+            request_id,
+            packed_token_ids=packed_token_ids,
+            cache_salt=cache_salt,
+            request_configs=request_configs,
+            reserve_last_token=reserve_last_token,
+            start=start,
+        )
+        if request_id in self._dsv41_lookups or not self._plan_hash:
+            return submitted
+        key = dsv41_prefix_key(
+            self.model_name, cache_salt, packed_token_ids
+        )
+        try:
+            lookup = self.build_layerwise_lookup(key)
+        except RuntimeError:
+            return submitted
+        futures = []
+        for client in self.req_clients.values():
+            futures.append(client.lookup_layerwise_prefix(lookup))
+        self._dsv41_lookups[request_id] = {
+            "key": key,
+            "pending": futures,
+            "hit": None,
+        }
+        return submitted
+
+    def check_lookup_result(self, request_id: str) -> int | None:
+        """Stock result first; fall through to the layerwise snapshot.
+
+        A stock hit wins outright and the layerwise lookup is dropped.
+        While the stock lookup is still pending (``None``) the layerwise
+        futures are polled non-blockingly. A layerwise hit is validated
+        through :meth:`apply_layerwise_lookup`, reported as the matched
+        token count (stock then schedules the RETRIEVE the worker serves
+        through the layerwise transport), and its lease is released
+        immediately — retrieves never consume the lease. All-layerwise
+        miss defers to the stock answer (0 stays 0, None stays None).
+        """
+        ret = super().check_lookup_result(request_id)
+        state = self._dsv41_lookups.get(request_id)
+        if state is None:
+            return ret
+        if ret is not None and ret > 0:
+            # The standard storage already answered: drop the layerwise
+            # lookup without consuming it.
+            self._drop_layerwise_lookup(request_id, drain=True)
+            return ret
+        still_pending = []
+        for future in state.get("pending", []):
+            if not future.query():
+                still_pending.append(future)
+                continue
+            result = future.result(timeout=0)
+            if result is None:
+                continue
+            try:
+                self.apply_layerwise_lookup(result)
+            except ValueError as exc:
+                logger.warning(
+                    "[dsv41_layerwise] rejecting layerwise lookup result "
+                    "for request %s: %s",
+                    request_id,
+                    exc,
+                )
+                continue
+            state["hit"] = result
+            break
+        state["pending"] = still_pending
+        hit = state.get("hit")
+        if hit is not None:
+            self._release_lease_quietly(hit.lease_id)
+            return int(hit.matched_end)
+        if state["pending"]:
+            return None
+        return ret
+
+    def cleanup_lookup_result(self, request_id: str) -> None:
+        """Stock cleanup plus layerwise lookup drain and lease release."""
+        state = self._dsv41_lookups.pop(request_id, None)
+        if state is not None:
+            hit = state.get("hit")
+            if hit is not None:
+                self._release_lease_quietly(hit.lease_id)
+            else:
+                for future in state.get("pending", []):
+                    try:
+                        result = future.result(timeout=self._mq_timeout)
+                    except Exception:  # noqa: BLE001 - best-effort drain
+                        continue
+                    if result is not None:
+                        self._release_lease_quietly(result.lease_id)
+        super().cleanup_lookup_result(request_id)
+
+    def _drop_layerwise_lookup(self, request_id: str, drain: bool) -> None:
+        """Discard a request's layerwise lookup without using its result."""
+        state = self._dsv41_lookups.pop(request_id, None)
+        if state is None:
+            return
+        if not drain:
+            return
+        for future in state.get("pending", []):
+            try:
+                result = future.result(timeout=self._mq_timeout)
+            except Exception:  # noqa: BLE001 - best-effort drain
+                continue
+            if result is not None:
+                self._release_lease_quietly(result.lease_id)
+
+    def _release_lease_quietly(self, lease_id: str | None) -> None:
+        """Fan out a lease release; failures are logged, never raised."""
+        if not lease_id:
+            return
+        for client in self.req_clients.values():
+            try:
+                client.release_layerwise_lease(lease_id)
+            except Exception as exc:  # noqa: BLE001 - release is best effort
+                logger.debug(
+                    "[dsv41_layerwise] lease release failed for %s: %s",
+                    lease_id,
+                    exc,
+                )
 
     def build_layerwise_lookup(self, key: str) -> LayerwiseLookupRequest:
         """Build the prefix-lookup request for ``key`` (selected RPC).
