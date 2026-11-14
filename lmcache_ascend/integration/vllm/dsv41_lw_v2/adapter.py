@@ -984,7 +984,9 @@ class DSV41LwV2GroupAdapter:
             self._counters["requests_finished_sending"] += len(
                 finished_sending
             )
-            return finished_receiving, finished_sending
+            # Contract order is (finished_sending, finished_receiving); the
+            # stock connector concatenates the two positionally.
+            return finished_sending, finished_receiving
 
     def take_failed_receiving(self) -> set[str]:
         """Return requests whose load failed and must be recomputed."""

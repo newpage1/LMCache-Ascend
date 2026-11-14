@@ -36,6 +36,15 @@ PACKAGE = "lmcache_ascend.integration.vllm.dsv41_lw_v2"
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class _StubTransferResults:
+    """Mutable stand-in for vLLM's ``KVConnectorTransferResults``."""
+
+    finished_sending: set[str]
+    finished_recving: set[str]
+    failed_recving: set[str]
+
+
 class StubLMCacheMPConnector:
     """Minimal stand-in for lmcache.integration.vllm.lmcache_mp_connector."""
 
@@ -47,12 +56,30 @@ class StubLMCacheMPConnector:
         self.kv_cache_config = kv_cache_config
         self._connector_metadata = None
         self.kv_caches = {}
+        # Stock-side terminal sets, merged with the v2 adapter in get_finished.
+        self.stock_finished_sending: set[str] = set()
+        self.stock_finished_receiving: set[str] = set()
+        self.stock_failed_recving: set[str] = set()
 
     def register_kv_caches(self, kv_caches) -> None:
         # The stock base registers layouts with the LMCache server; the
         # CPU stub only records the caches the v2 factory reads back.
         self.kv_caches = dict(kv_caches)
         StubLMCacheMPConnector.instances.append(self)
+
+    def get_finished(self, finished_req_ids):
+        return (
+            set(self.stock_finished_sending),
+            set(self.stock_finished_receiving),
+        )
+
+    def get_transfer_results(self, finished_req_ids):
+        sending, receiving = self.get_finished(finished_req_ids)
+        return _StubTransferResults(
+            finished_sending=sending,
+            finished_recving=receiving,
+            failed_recving=set(self.stock_failed_recving),
+        )
 
 
 def _install_stock_stub() -> None:
@@ -298,6 +325,9 @@ class RecordingAdapter:
         self.dropped: list[tuple[str, str]] = []
         self.drain_count = 0
         self.calls: list[tuple] = []
+        self.finished_sending: set[str] = set()
+        self.finished_receiving: set[str] = set()
+        self.failed_receiving: set[str] = set()
 
     def schedule_group_retrieves(self, group_id, request_ids, step):
         self.scheduled.setdefault(group_id, []).append(tuple(request_ids))
@@ -318,10 +348,16 @@ class RecordingAdapter:
         self.drain_count += 1
 
     def take_finished(self):
-        return set(), set()
+        sending = set(self.finished_sending)
+        receiving = set(self.finished_receiving)
+        self.finished_sending.clear()
+        self.finished_receiving.clear()
+        return sending, receiving
 
     def take_failed_receiving(self):
-        return set()
+        failed = set(self.failed_receiving)
+        self.failed_receiving.clear()
+        return failed
 
 
 class RecordingBoundaryHook:
@@ -976,3 +1012,40 @@ def test_metrics_surface_contains_contract_counters():
         "stale_ops_cleared",
     ):
         assert key in metrics
+
+
+# ---------------------------------------------------------------------------
+# Terminal reporting: stock + adapter merged (t5 F2)
+# ---------------------------------------------------------------------------
+
+
+def test_get_finished_merges_stock_and_adapter_terminal_sets():
+    connector, adapter, _ = _bound()
+    connector.stock_finished_sending.update({"stock-send"})
+    connector.stock_finished_receiving.update({"stock-recv"})
+    adapter.finished_sending.update({"v2-send"})
+    adapter.finished_receiving.update({"v2-recv"})
+
+    sending, receiving = connector.get_finished({"ignored"})
+
+    assert sending == {"stock-send", "v2-send"}
+    assert receiving == {"stock-recv", "v2-recv"}
+    # ``take_finished`` drains the adapter half; the stock sets stay visible.
+    assert adapter.finished_sending == set()
+    assert adapter.finished_receiving == set()
+
+
+def test_get_transfer_results_reports_failed_recving_for_bypass():
+    connector, adapter, _ = _bound()
+    connector.stock_finished_sending.update({"stock-send"})
+    connector.stock_failed_recving.update({"stock-fail"})
+    adapter.failed_receiving.add("r1")
+
+    results = connector.get_transfer_results({"r1"})
+
+    assert results.finished_sending == {"stock-send"}
+    assert results.failed_recving == {"stock-fail", "r1"}
+    # A failed receive is never also reported as a completed receive; vLLM
+    # then takes the BYPASS_LMCACHE recompute path for r1.
+    assert "r1" not in results.finished_recving
+    assert adapter.failed_receiving == set()

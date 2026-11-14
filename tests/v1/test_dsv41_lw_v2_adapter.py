@@ -605,7 +605,7 @@ def test_group_load_ready_writes_all_resources():
             caches[resource_id][:rows], torch.full((rows, 2, 3), 7.0)
         )
     assert adapter.metrics["group_load_ready"] == 1
-    ready, _ = adapter.take_finished()
+    _, ready = adapter.take_finished()
     assert ready == {"r1"}
 
 
@@ -668,7 +668,7 @@ def test_drop_request_after_schedule_never_becomes_ready():
         adapter.wait_group("g2", ("r1",), step, stream=None)
     assert adapter.metrics["group_load_dropped"] == 1
     # A late callback must not resurrect the request as ready.
-    assert adapter.take_finished()[0] == set()
+    assert adapter.take_finished()[1] == set()
 
 
 def test_stale_generation_drops_old_load():
@@ -705,7 +705,7 @@ def test_store_then_new_request_hits_same_prefix():
     adapter.drain_stores()
     assert adapter.metrics["group_store_committed"] == 1
     assert server.store_calls
-    assert adapter.take_finished()[1] == {"r1"}
+    assert adapter.take_finished()[0] == {"r1"}
 
     # A new request with the same prefix but a different suffix and id hits.
     fresh = _make_caches(fill=0.0)
@@ -736,7 +736,7 @@ def test_store_failure_is_dropped_not_committed():
     adapter.drain_stores()
     assert adapter.metrics["group_store_committed"] == 0
     assert adapter.metrics["group_store_failed"] >= 1
-    assert adapter.take_finished()[1] == {"r1"}
+    assert adapter.take_finished()[0] == {"r1"}
 
 
 # ---------------------------------------------------------------------------

@@ -132,6 +132,22 @@ def _non_empty_str(value: object, field_name: str) -> str:
     return value
 
 
+def _merge_id_sets(
+    base: object, extra: object
+) -> set[str] | None:
+    """Union a stock terminal set with the v2 adapter's set.
+
+    ``None`` from the stock connector means "nothing new this step"; keep it
+    untouched when the adapter has nothing to add so the stock scheduler sees
+    exactly the same value as before.
+    """
+    extra_ids = set(extra) if extra else set()
+    if not extra_ids:
+        return base  # type: ignore[return-value]
+    base_ids = set(base) if base else set()
+    return base_ids | extra_ids
+
+
 @dataclass(frozen=True)
 class TransferRequest:
     """One request's transfer-relevant state for one scheduler step.
@@ -964,6 +980,45 @@ class DSV41LwV2Connector(LMCacheMPConnector):
         router.wait_for_save()
         self._lw_v2_step_noted = False
         self._lw_v2_current_step = None
+
+    def get_finished(
+        self, finished_req_ids: set[str]
+    ) -> tuple[set[str] | None, set[str] | None]:
+        """Merge v2 terminal request ids into the stock connector report.
+
+        The v2 adapter settles each direction asynchronously (retrieves are
+        waited per group head, stores are drained in ``wait_for_save``), so
+        the stock connector alone never learns about them.  Returning the
+        merged ``(finished_sending, finished_receiving)`` pair keeps the stock
+        scheduler's request lifecycle intact.
+        """
+        sending, receiving = super().get_finished(finished_req_ids)
+        adapter = self.adapter
+        if adapter is None:
+            return sending, receiving
+        v2_sending, v2_receiving = adapter.take_finished()
+        return (
+            _merge_id_sets(sending, v2_sending),
+            _merge_id_sets(receiving, v2_receiving),
+        )
+
+    def get_transfer_results(self, finished_req_ids: set[str]) -> Any:
+        """Report v2 load failures as ``failed_recving`` so vLLM recomputes.
+
+        A group load that failed after the scheduler had already skipped the
+        prefix must not be treated as a completed receive: the request has to
+        take the ``BYPASS_LMCACHE`` recompute path with clean pages.
+        """
+        results = super().get_transfer_results(finished_req_ids)
+        adapter = self.adapter
+        if adapter is None:
+            return results
+        failed = adapter.take_failed_receiving()
+        if failed:
+            results.failed_recving = _merge_id_sets(
+                results.failed_recving, failed
+            )
+        return results
 
     # ------------------------------------------------------------------
     # Explicit group facades (T3 calls these directly; idempotent with hooks)
