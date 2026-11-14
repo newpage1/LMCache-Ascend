@@ -165,6 +165,10 @@ class TransferRequest:
     store_prefix_end: int = 0
     block_ids_by_engine_group: tuple[tuple[int, ...], ...] = ()
     skip_first_n_tokens: int = 0
+    # First token of this step's STORE window. The scheduler passes only the
+    # blocks that are new for this step, so staging must address them relative
+    # to this start instead of the request's absolute (cumulative) store end.
+    store_start: int = 0
 
     def __post_init__(self) -> None:
         _non_empty_str(self.request_id, "request_id")
@@ -177,10 +181,23 @@ class TransferRequest:
         _non_negative_int(self.load_prefix_end, "load_prefix_end")
         _non_negative_int(self.store_prefix_end, "store_prefix_end")
         _non_negative_int(self.skip_first_n_tokens, "skip_first_n_tokens")
+        _non_negative_int(self.store_start, "store_start")
         if not self.load_prefix_end and not self.store_prefix_end:
             raise ValueError(
                 f"request {self.request_id} has neither a load nor a store "
                 "prefix endpoint"
+            )
+        if self.store_prefix_end == 0:
+            if self.store_start:
+                raise ValueError(
+                    f"request {self.request_id} has a store_start "
+                    f"{self.store_start} without a store prefix"
+                )
+        elif self.store_start > self.store_prefix_end:
+            raise ValueError(
+                f"request {self.request_id} store_start "
+                f"{self.store_start} exceeds store_prefix_end "
+                f"{self.store_prefix_end}"
             )
         # Accept the stock flattened single-engine-group form and normalize it
         # to one tuple per engine group.
@@ -1179,6 +1196,7 @@ class DSV41LwV2Connector(LMCacheMPConnector):
                     "skip_first_n_tokens": skip_first,
                     "load_prefix_end": 0,
                     "store_prefix_end": 0,
+                    "store_start": None,
                 },
             )
             if state["token_bytes"] != token_bytes:
@@ -1199,6 +1217,13 @@ class DSV41LwV2Connector(LMCacheMPConnector):
                 state["store_prefix_end"] = max(
                     state["store_prefix_end"], end
                 )
+                # The scheduler emits one STORE entry per new window. Keep the
+                # earliest window start so the adapter can map this step's
+                # block list to absolute token positions.
+                if state["store_start"] is None:
+                    state["store_start"] = start
+                else:
+                    state["store_start"] = min(state["store_start"], start)
 
         step_id = self._lw_v2_step_serial
         requests: list[TransferRequest] = []
@@ -1208,6 +1233,12 @@ class DSV41LwV2Connector(LMCacheMPConnector):
             if not load_end and not store_end:
                 # No external hit and nothing to store this step.
                 continue
+            store_start = state["store_start"] or 0
+            if store_end and store_start > store_end:
+                raise ValueError(
+                    f"request {request_id} store_start {store_start} "
+                    f"exceeds store_prefix_end {store_end} in one step"
+                )
             stock_key = self._stock_key(
                 request_id=request_id,
                 token_bytes=state["token_bytes"],
@@ -1225,6 +1256,7 @@ class DSV41LwV2Connector(LMCacheMPConnector):
                         state["block_ids"]
                     ),
                     skip_first_n_tokens=state["skip_first_n_tokens"],
+                    store_start=store_start,
                 )
             )
         if not requests and not synthetic:

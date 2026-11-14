@@ -304,6 +304,7 @@ def _request(
     step_id=0,
     load_prefix_end=TOKENS,
     store_prefix_end=0,
+    store_start=0,
     blocks=((0, 1, 2, 3),),
     tokens=None,
 ):
@@ -314,6 +315,7 @@ def _request(
         stock_key=_stock_key(request_id, tokens, max(load_prefix_end, store_prefix_end)),
         load_prefix_end=load_prefix_end,
         store_prefix_end=store_prefix_end,
+        store_start=store_start,
         block_ids_by_engine_group=blocks,
     )
 
@@ -338,6 +340,7 @@ class _FakeServer:
     capabilities: tuple[str, ...] = adapter_mod.REQUIRED_CAPABILITIES
     delay: float = 0.0
     store_calls: list = field(default_factory=list)
+    store_specs: list = field(default_factory=list)
     retrieve_calls: list = field(default_factory=list)
     blocks: dict = field(default_factory=dict)
     boundaries: dict = field(default_factory=dict)
@@ -348,6 +351,7 @@ class _FakeServer:
     def store(self, spec, payload):
         with self.lock:
             self.store_calls.append((spec.resource_id, spec.start_token, spec.end_token))
+            self.store_specs.append(spec)
             if spec.resource_id in _BOUNDARY_IDS:
                 if not payload.startswith(adapter_mod.BOUNDARY_PAYLOAD_MAGIC):
                     return self._result(spec, "failed", "PAYLOAD_CORRUPT")
@@ -521,13 +525,13 @@ def _resource_ids():
     return list(PLAN_RESOURCES)
 
 
-def _make_caches(fill: float = 1.0):
+def _make_caches(fill: float = 1.0, rows: int = 32):
     caches = {}
     for resource_id, resource in PLAN_RESOURCES.items():
         if resource.storage_kind == "boundary_state":
             continue
         caches[resource_id] = (
-            torch.full((32, 2, 3), fill, dtype=torch.float32).contiguous()
+            torch.full((rows, 2, 3), fill, dtype=torch.float32).contiguous()
         )
     return caches
 
@@ -540,6 +544,8 @@ def _make_adapter(
     store_timeout=1.0,
     worker_id=0,
     world_size=WORLD,
+    chunk_size=CHUNK_SIZE,
+    block_size=BLOCK_SIZE,
 ):
     return adapter_mod.DSV41LwV2GroupAdapter(
         PLAN,
@@ -550,8 +556,8 @@ def _make_adapter(
         worker_id=worker_id,
         plan_hash=PLAN_HASH,
         layout_hash=LAYOUT_HASH,
-        chunk_size=CHUNK_SIZE,
-        block_size=BLOCK_SIZE,
+        chunk_size=chunk_size,
+        block_size=block_size,
         kv_caches=_make_caches() if caches is None else caches,
         cache_names=_cache_names(),
         load_timeout=load_timeout,
@@ -1205,3 +1211,138 @@ def test_wire_dtos_are_shared_server_types_and_round_trip():
     assert type(decoded) is wire.ResourceBlockSpec
     assert isinstance(decoded, adapter_mod.ResourceBlockSpec)
     assert decoded == spec
+
+
+# ---------------------------------------------------------------------------
+# Per-step store staging (t21 root cause 1)
+# ---------------------------------------------------------------------------
+
+STREAMING_CHUNK = 256
+STREAMING_BLOCK = 128
+STREAMING_WINDOWS = (
+    (0, 4096, tuple(range(0, 32))),
+    (4096, 8192, tuple(range(32, 64))),
+    (8192, 9472, tuple(range(64, 74))),
+)
+
+
+def _streaming_adapter(monkeypatch):
+    server = _FakeServer()
+    adapter = _make_adapter(
+        FakeTransport(server),
+        caches=_make_caches(rows=80),
+        chunk_size=STREAMING_CHUNK,
+        block_size=STREAMING_BLOCK,
+    )
+    adapter.register()
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        adapter_mod,
+        "logger_warning",
+        lambda message, *args: warnings.append(message % args if args else message),
+    )
+    return adapter, server, warnings
+
+
+def _submit_store_window(adapter, *, step_id, start, end, blocks):
+    request = _request(
+        "r1",
+        step_id=step_id,
+        load_prefix_end=0,
+        store_prefix_end=end,
+        store_start=start,
+        blocks=(blocks,),
+        tokens=_token_bytes(9690),
+    )
+    adapter.submit_group_store("g2", ("r1",), _step(request))
+    adapter.drain_stores()
+
+
+def test_store_staging_uses_each_steps_relative_block_list(monkeypatch):
+    """The scheduler sends only this step's blocks (32/32/10 for 9690 tokens).
+
+    Staging must map those blocks relative to ``store_start``; using the
+    cumulative ``store_prefix_end`` raised "too few blocks" on windows 2/3 and
+    silently dropped the whole group.
+    """
+    adapter, server, warnings = _streaming_adapter(monkeypatch)
+    for step_id, (start, end, blocks) in enumerate(STREAMING_WINDOWS):
+        _submit_store_window(
+            adapter, step_id=step_id, start=start, end=end, blocks=blocks
+        )
+
+    long_kv_id = next(
+        resource.resource_id
+        for resource in PLAN.group_by_id("g2").token_range_resources
+        if resource.resource_id.endswith(".long_kv_cache")
+    )
+    windows = sorted(
+        (start, end)
+        for resource_id, start, end in server.store_calls
+        if resource_id == long_kv_id
+    )
+    expected = [
+        (start, min(start + STREAMING_CHUNK, end))
+        for start, end in ((0, 4096), (4096, 8192), (8192, 9472))
+        for start in range(start, end, STREAMING_CHUNK)
+    ]
+    assert windows == expected
+    # The unaligned tail (9472..9690) is never submitted.
+    assert max(end for _, end in windows) == 9472
+
+    first_blocks = {
+        spec.start_token: spec.block_ids
+        for spec in server.store_specs
+        if spec.resource_id == long_kv_id
+    }
+    assert first_blocks[0] == (0, 1)
+    assert first_blocks[4096] == (32, 33)
+    assert first_blocks[8192] == (64, 65)
+
+    assert adapter.metrics["group_store_dropped"] == 0
+    assert adapter.metrics["group_store_committed"] == 3
+    assert warnings == []
+
+
+def test_store_staging_is_a_noop_when_the_step_adds_no_blocks(monkeypatch):
+    adapter, server, warnings = _streaming_adapter(monkeypatch)
+    _submit_store_window(
+        adapter, step_id=0, start=9472, end=9472, blocks=()
+    )
+
+    assert server.store_calls == []
+    assert adapter.metrics["group_store_dropped"] == 0
+    assert adapter.metrics["group_store_committed"] == 0
+    assert warnings == []
+
+
+def test_store_staging_reports_short_block_windows(monkeypatch):
+    adapter, server, warnings = _streaming_adapter(monkeypatch)
+    _submit_store_window(
+        adapter, step_id=0, start=0, end=4096, blocks=tuple(range(31))
+    )
+
+    assert server.store_calls == []
+    assert adapter.metrics["group_store_dropped"] == 1
+    assert len(warnings) == 1
+    assert "too few blocks" in warnings[0]
+
+
+def test_store_staging_keeps_load_and_store_endpoints_independent(monkeypatch):
+    server = _FakeServer()
+    adapter = _make_adapter(FakeTransport(server))
+    adapter.register()
+    request = _request(
+        load_prefix_end=TOKENS, store_prefix_end=TOKENS, store_start=0
+    )
+    _seed_token_blocks(server, request)
+    step = _step(request)
+
+    adapter.schedule_group_retrieves("g2", ("r1",), step)
+    adapter.wait_group("g2", ("r1",), step)
+    assert adapter.metrics["group_load_ready"] == 1
+
+    adapter.submit_group_store("g2", ("r1",), step)
+    adapter.drain_stores()
+    assert adapter.metrics["group_store_dropped"] == 0
+    assert adapter.metrics["group_store_committed"] == 1

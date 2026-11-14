@@ -1414,34 +1414,60 @@ class DSV41LwV2GroupAdapter:
     def _stage_store(
         self, group: TransferGroup, request: TransferRequest
     ) -> list[_StagedStore]:
+        """Stage this step's new rows for a group.
+
+        The scheduler only sends the blocks that were added in the current
+        step, not the request's whole block table. ``store_start`` is the
+        absolute token where that per-step block list begins, so rows are
+        addressed relative to it while ``_staged_ends`` keeps the absolute end
+        to avoid storing a window twice.
+        """
         if request.store_prefix_end % self._chunk_size:
             raise ValueError(
                 f"store prefix {request.store_prefix_end} is not chunk aligned"
             )
+        if request.store_start > request.store_prefix_end:
+            raise ValueError(
+                f"store start {request.store_start} exceeds store prefix "
+                f"{request.store_prefix_end}"
+            )
+        if request.store_start % self._block_size:
+            raise ValueError(
+                f"store start {request.store_start} is not block aligned"
+            )
+        if request.store_start >= request.store_prefix_end:
+            # Nothing new to store in this step; this is a normal no-op, not a
+            # reason to drop the group.
+            return []
         staged: list[_StagedStore] = []
         groups = request.block_ids_by_engine_group
+        needed_blocks = (
+            request.store_prefix_end - request.store_start
+        ) // self._block_size
         for resource in group.token_range_resources:
             resource_blocks = self._blocks_for(
                 request, resource.engine_group_id, groups=groups
             )
-            if not resource_blocks:
+            if len(resource_blocks) < needed_blocks:
                 raise ValueError(
-                    f"request {request.request_id} has no block ids for "
-                    f"resource {resource.resource_id}"
+                    f"resource {resource.resource_id} has too few blocks for "
+                    f"tokens [{request.store_start}, "
+                    f"{request.store_prefix_end}): needs {needed_blocks}, "
+                    f"got {len(resource_blocks)}"
                 )
             stored_end = self._staged_ends.get(
                 (request.request_id, resource.resource_id), 0
             )
-            start = max(stored_end, 0)
+            start = max(stored_end, request.store_start)
             while start < request.store_prefix_end:
                 chunk_end = min(start + self._chunk_size, request.store_prefix_end)
                 if chunk_end - start != self._chunk_size:
                     raise ValueError(
                         "store prefix is not chunk aligned at the tail"
                     )
-                blocks = resource_blocks[
-                    start // self._block_size : chunk_end // self._block_size
-                ]
+                lo = (start - request.store_start) // self._block_size
+                hi = (chunk_end - request.store_start) // self._block_size
+                blocks = resource_blocks[lo:hi]
                 if len(blocks) != self._chunk_size // self._block_size:
                     raise ValueError(
                         f"resource {resource.resource_id} has too few blocks "
@@ -1470,7 +1496,7 @@ class DSV41LwV2GroupAdapter:
                     )
                 )
                 start = chunk_end
-        if group.has_boundary:
+        if group.has_boundary and staged:
             assert group.boundary_resource is not None
             resource = group.boundary_resource
             with self._lock:

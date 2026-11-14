@@ -1123,3 +1123,73 @@ def test_get_transfer_results_reports_failed_recving_for_bypass():
     # then takes the BYPASS_LMCACHE recompute path for r1.
     assert "r1" not in results.finished_recving
     assert adapter.failed_receiving == set()
+
+
+# ---------------------------------------------------------------------------
+# Per-step store window start (t21 root cause 1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"store_start": 8},
+        {"store_prefix_end": 4, "store_start": 8},
+    ],
+)
+def test_transfer_request_rejects_invalid_store_start(kwargs):
+    base = dict(
+        request_id="r1",
+        step_id=0,
+        stock_key=object(),
+        load_prefix_end=8,
+    )
+    base.update(kwargs)
+    with pytest.raises(ValueError):
+        connector_mod.TransferRequest(**base)
+
+
+def test_step_view_uses_the_earliest_store_start_of_the_step():
+    connector, _adapter, _hook = _bound()
+    connector._connector_metadata = _metadata(
+        _store(end=8192, start=4096, block_ids=((32, 33),)),
+        _store(end=4096, start=0, block_ids=((0, 1),)),
+    )
+    connector.start_load_kv(None)
+
+    request = connector.current_step.requests[0]
+    assert request.store_prefix_end == 8192
+    assert request.store_start == 0
+
+
+def test_step_view_keeps_a_single_store_window_start():
+    connector, _adapter, _hook = _bound()
+    connector._connector_metadata = _metadata(
+        _store(end=8192, start=4096, block_ids=((32, 33),))
+    )
+    connector.start_load_kv(None)
+
+    request = connector.current_step.requests[0]
+    assert request.store_prefix_end == 8192
+    assert request.store_start == 4096
+
+
+def test_retrieve_only_step_has_no_store_window():
+    connector, _adapter, _hook = _bound()
+    connector._connector_metadata = _metadata(_retrieve(end=2048))
+    connector.start_load_kv(None)
+
+    request = connector.current_step.requests[0]
+    assert request.load_prefix_end == 2048
+    assert request.store_prefix_end == 0
+    assert request.store_start == 0
+
+
+def test_group_store_submission_is_idempotent_per_step():
+    connector, adapter, _hook = _bound()
+    connector._connector_metadata = _metadata(_store(end=2048))
+    connector.start_load_kv(None)
+
+    connector.submit_group_store("g2")
+    connector.submit_group_store("g2")
+    assert adapter.stores.count(("g2", ("r1",))) == 1
