@@ -400,6 +400,17 @@ class _FakeServer:
         )
 
 
+class _PlanMismatchServer(_FakeServer):
+    """A server whose registration plan does not match the worker's plan."""
+
+    def retrieve(self, spec):
+        with self.lock:
+            self.retrieve_calls.append(
+                (spec.resource_id, spec.start_token, spec.end_token)
+            )
+        return self._result(spec, "failed", adapter_mod.PLAN_MISMATCH), b""
+
+
 class FakeTransport:
     def __init__(self, server: _FakeServer) -> None:
         self.server = server
@@ -626,6 +637,22 @@ def test_missing_group_resource_fails_and_reports_receiving():
         adapter.wait_group("g2", ("r1",), step, stream=None)
     assert info.value.group_id == "g2"
     assert info.value.error_code == adapter_mod.RESOURCE_MISSING
+    assert adapter.take_failed_receiving() == {"r1"}
+
+
+def test_plan_mismatch_propagates_to_failed_recving():
+    """F5: a server plan mismatch is not rewritten into a generic failure."""
+    server = _PlanMismatchServer()
+    adapter = _make_adapter(FakeTransport(server), load_timeout=1.0)
+    adapter.register()
+    request = _request()
+    step = _step(request)
+
+    adapter.schedule_group_retrieves("g2", ("r1",), step)
+    with pytest.raises(connector_mod.DSV41GroupLoadError) as info:
+        adapter.wait_group("g2", ("r1",), step, stream=None)
+
+    assert info.value.error_code == adapter_mod.PLAN_MISMATCH
     assert adapter.take_failed_receiving() == {"r1"}
 
 
