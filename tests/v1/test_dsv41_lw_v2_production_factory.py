@@ -158,7 +158,57 @@ class _EngineGroupInfo:
 
 
 def _engine_groups():
+    """Simplified CPU double: one group covering every tensor index.
+
+    This is *not* the live B01 registration order (the real topology has token
+    caches under group 0 and SWA caches under groups 2..11). It stays as a
+    minimal positive case for the plan-derivation tests; the real registration
+    order is covered by ``_real_engine_groups`` below.
+    """
     return [_EngineGroupInfo(0, range(LAYERS))]
+
+
+def _real_registration_caches() -> dict[str, torch.Tensor]:
+    """Registration order observed on B01 (t6): 8 token, 3 boundary, 40 SWA.
+
+    Tensor indices are the kv_caches insertion order: group 0 therefore owns
+    0..7 (long-KV/index-K of the four sources), compressors occupy 8..10 and
+    belong to no engine group, and the 40 SWA caches occupy 11..50.
+    """
+    caches: dict[str, torch.Tensor] = {}
+    tensor = torch.zeros((8, 2, 4), dtype=torch.float32)
+    for source in SOURCES:
+        caches[_cache_name(source, "long_kv_cache")] = tensor
+        caches[_cache_name(source, "indexer.k_cache")] = tensor
+    for source in BOUNDARIES:
+        caches[_cache_name(source, "compressor.state_cache")] = tensor
+    for layer in range(LAYERS):
+        caches[_cache_name(layer, "swa_cache")] = tensor
+    return caches
+
+
+def _real_engine_groups():
+    """The 24 EngineGroupInfo records reported on B01.
+
+    Group 0 is split in two physical-transfer infos over indices 0..7; groups
+    2..11 hold the SWA caches (11..50); compressor indices 8..10 are absent.
+    """
+    groups = [
+        _EngineGroupInfo(0, (0, 1, 2, 3)),
+        _EngineGroupInfo(0, (4, 5, 6, 7)),
+        _EngineGroupInfo(2, (11,)),
+        _EngineGroupInfo(2, (12,)),
+        _EngineGroupInfo(2, (13,)),
+        _EngineGroupInfo(2, (14,)),
+    ]
+    next_index = 15
+    for engine_group_id in range(3, 12):
+        groups.append(_EngineGroupInfo(engine_group_id, (next_index, next_index + 1)))
+        groups.append(
+            _EngineGroupInfo(engine_group_id, (next_index + 2, next_index + 3))
+        )
+        next_index += 4
+    return groups
 
 
 class FakeTypedRequestClient:
@@ -399,13 +449,57 @@ def test_plan_hash_rejects_shuffled_registration_order():
     assert "tensor-index order" in str(info.value)
 
 
-def test_plan_derivation_requires_source_engine_group():
-    groups = [_EngineGroupInfo(0, range(0, 20))]
+def test_real_registration_order_maps_sources_to_token_group():
+    """Regression for t6: layer_indices are tensor indices, not layer ids."""
+    plan = production_mod.build_grouped_plan_from_registration(
+        _real_registration_caches(), _real_engine_groups()
+    )
+    assert [group.group_id for group in plan.groups] == [
+        "g2",
+        "g8",
+        "g14",
+        "g20",
+    ]
+    token_groups = {
+        resource.engine_group_id
+        for group in plan.groups
+        for resource in group.token_range_resources
+    }
+    assert token_groups == {0}
+    # The first source's long-KV/index-K caches are the first two registered.
+    assert plan.group_by_id("g2").token_range_resources[0].tensor_indices == (0,)
+    assert plan.group_by_id("g2").token_range_resources[1].tensor_indices == (1,)
+    # Boundary payloads are not block addressed and stay outside all groups.
+    boundary_groups = {
+        group.boundary_resource.engine_group_id
+        for group in plan.groups
+        if group.has_boundary
+    }
+    assert boundary_groups == {None}
+    assert len([g for g in _real_engine_groups()]) == 24
+
+
+def test_source_token_caches_must_share_engine_group():
+    """A long-KV in group 0 and its index-K in group 1 must fail closed."""
+    groups = [
+        _EngineGroupInfo(0, range(0, 7)),
+        _EngineGroupInfo(1, (7,)),
+    ]
     with pytest.raises(production_mod.DSV41LwV2ProductionUnavailable) as info:
         production_mod.build_grouped_plan_from_registration(
-            _registration_caches(), groups
+            _real_registration_caches(), groups
         )
-    assert "layer 20" in str(info.value)
+    assert "split across engine groups" in str(info.value)
+
+
+def test_plan_derivation_requires_source_engine_group():
+    # Index 7 (source 20's indexer.K) is missing from every engine group.
+    groups = [_EngineGroupInfo(0, range(0, 7))]
+    with pytest.raises(production_mod.DSV41LwV2ProductionUnavailable) as info:
+        production_mod.build_grouped_plan_from_registration(
+            _real_registration_caches(), groups
+        )
+    assert "tensor index 7" in str(info.value)
 
 
 # ---------------------------------------------------------------------------

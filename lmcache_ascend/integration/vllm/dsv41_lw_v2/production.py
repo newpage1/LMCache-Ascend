@@ -209,28 +209,63 @@ def _parse_cache_names(
 
 
 def _engine_group_for_source(
-    engine_group_infos: Sequence[Any], source: int
+    parsed: Mapping[int, Mapping[str, int]],
+    engine_group_infos: Sequence[Any],
+    source: int,
 ) -> int:
-    """Return the stock engine group whose layers include ``source``."""
-    matches: set[int] = set()
+    """Return the stock engine group owning a source's token KV caches.
+
+    ``EngineGroupInfo.layer_indices`` are *registered KV tensor indices* (the
+    ``kv_caches`` insertion order), not model layer numbers. The live B01
+    topology proves this: group 0 owns tensor indices 0..7 (the four sources'
+    long-KV plus index-K caches) while the per-layer SWA caches live in
+    groups 2..11. Matching ``source`` (2/8/14/20) against ``layer_indices``
+    would therefore miss the token group entirely, or (with a diagnostic
+    layer-number shim) match both the token group and the source's own SWA
+    group.
+
+    So match by tensor index instead: the source's ``long_kv_cache`` and
+    ``indexer.k_cache`` indices must both exist and resolve to the same
+    engine group. Anything else fails closed before a plan is built.
+    """
+    kinds = parsed[source]
+    token_indices = (kinds["long_kv_cache"], kinds["indexer.k_cache"])
+    groups_by_index: dict[int, set[int]] = {}
     for info in engine_group_infos:
         layer_indices = getattr(info, "layer_indices", None)
         if layer_indices is None:
             continue
-        if source in tuple(int(index) for index in layer_indices):
-            matches.add(int(info.engine_group_id))
-    if not matches:
+        engine_group_id = int(info.engine_group_id)
+        for index in layer_indices:
+            groups_by_index.setdefault(int(index), set()).add(engine_group_id)
+
+    resolved: list[int] = []
+    for index in token_indices:
+        matches = groups_by_index.get(index, set())
+        if not matches:
+            raise DSV41LwV2ProductionUnavailable(
+                "worker_adapter.engine_group_infos",
+                f"no KV engine group covers tensor index {index} of KV "
+                f"source layer {source}",
+            )
+        if len(matches) > 1:
+            raise DSV41LwV2ProductionUnavailable(
+                "worker_adapter.engine_group_infos",
+                f"tensor index {index} of KV source layer {source} belongs "
+                f"to several engine groups {sorted(matches)!r}",
+            )
+        resolved.append(next(iter(matches)))
+
+    long_group, index_group = resolved
+    if long_group != index_group:
         raise DSV41LwV2ProductionUnavailable(
             "worker_adapter.engine_group_infos",
-            f"no KV engine group covers KV source layer {source}",
+            f"KV source layer {source} token caches are split across engine "
+            f"groups: long_kv_cache tensor index {token_indices[0]} -> group "
+            f"{long_group}, indexer.k_cache tensor index {token_indices[1]} "
+            f"-> group {index_group}",
         )
-    if len(matches) > 1:
-        raise DSV41LwV2ProductionUnavailable(
-            "worker_adapter.engine_group_infos",
-            f"KV source layer {source} belongs to several engine groups "
-            f"{sorted(matches)!r}",
-        )
-    return matches.pop()
+    return long_group
 
 
 def build_grouped_plan_from_registration(
@@ -243,7 +278,10 @@ def build_grouped_plan_from_registration(
         kv_caches: Caches registered by the stock worker adapter, keyed by
             their engine cache name.
         engine_group_infos: Stock engine-group descriptors from the same
-            registration (used for the token resources' ``engine_group_id``).
+            registration. Their ``layer_indices`` are registered KV tensor
+            indices (the ``kv_caches`` order), not model layer numbers; the
+            token resources' ``engine_group_id`` is resolved by matching each
+            source's long-KV/index-K tensor indices against them.
 
     Returns:
         The grouped transfer plan matching the registered caches.
@@ -259,7 +297,7 @@ def build_grouped_plan_from_registration(
     cache_names = tuple(kv_caches)
     prefix, parsed = _parse_cache_names(cache_names)
     source_groups = {
-        source: _engine_group_for_source(engine_group_infos, source)
+        source: _engine_group_for_source(parsed, engine_group_infos, source)
         for source in DSV41_LW_V2_SOURCE_LAYERS
     }
 
@@ -304,6 +342,9 @@ def build_grouped_plan_from_registration(
             )
         )
         if source in DSV41_LW_V2_BOUNDARY_LAYERS:
+            # Boundary payloads are full ring pages addressed by request and
+            # logical prefix, not by paged KV block ids, so a compressor
+            # state cache intentionally belongs to no engine group.
             resources.append(
                 CacheTransferResource(
                     resource_id=(
