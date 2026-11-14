@@ -352,6 +352,10 @@ class GroupTransferRouter:
     def current_step(self) -> StepView | None:
         return self._step
 
+    @property
+    def adapter(self) -> "DSV41LwV2Adapter | None":
+        return self._adapter
+
     def bind_adapter(self, adapter: DSV41LwV2Adapter) -> None:
         if not isinstance(adapter, DSV41LwV2Adapter):
             raise ValueError("adapter does not implement DSV41LwV2Adapter")
@@ -702,6 +706,8 @@ class DSV41LwV2Connector(LMCacheMPConnector):
         self._lw_v2_server_generation = 0
         self._lw_v2_current_step: StepView | None = None
         self._lw_v2_step_noted = False
+        self._lw_v2_boundary_codec: Any = None
+        self._lw_v2_adapter_factory: Any = None
 
     # ------------------------------------------------------------------
     # Wiring seams (T4 builds the adapter on registration, T3 the boundary)
@@ -745,6 +751,97 @@ class DSV41LwV2Connector(LMCacheMPConnector):
     @property
     def grouped_plan(self) -> GroupedTransferPlan | None:
         return self._lw_v2_plan
+
+    @property
+    def current_step(self) -> StepView | None:
+        """The step most recently queued by ``start_load_kv`` (read-only).
+
+        The engine-side boundary hook uses this to obtain the real hit/store
+        sets instead of guessing from a prefix. It is cleared after
+        ``wait_for_save``.
+        """
+        return self._lw_v2_current_step
+
+    @property
+    def boundary_codec(self) -> Any:
+        """The installed schema-2 boundary codec, or ``None`` when unbound."""
+        return self._lw_v2_boundary_codec
+
+    def set_boundary_codec(self, codec: Any) -> None:
+        """Install the single production boundary codec.
+
+        Called by ``install_dsv41_lw_v2_boundary_codec`` during initialization,
+        before the first real forward. Installing a second, different codec
+        instance is a configuration error: the engine binds exactly one.
+        """
+        if codec is None:
+            raise DSV41LwV2ConfigError("boundary codec must not be None")
+        capture = getattr(codec, "capture_layer_boundary", None)
+        restore = getattr(codec, "restore_layer_boundary", None)
+        if not callable(capture) or not callable(restore):
+            raise DSV41LwV2ConfigError(
+                "boundary codec must implement capture_layer_boundary and "
+                "restore_layer_boundary"
+            )
+        existing = self._lw_v2_boundary_codec
+        if existing is not None and existing is not codec:
+            raise DSV41LwV2ConfigError(
+                "a different boundary codec is already installed; the v2 "
+                "engine binds exactly one codec instance"
+            )
+        self._lw_v2_boundary_codec = codec
+
+    def bind_adapter_factory(self, factory: Any) -> None:
+        """Bind the factory that builds the group adapter on registration.
+
+        Signature: ``factory(plan, connector) -> DSV41LwV2Adapter``. It is
+        optional so tests and the engine seam can bind a prebuilt adapter.
+        """
+        if factory is not None and not callable(factory):
+            raise DSV41LwV2ConfigError("adapter factory must be callable")
+        self._lw_v2_adapter_factory = factory
+
+    @property
+    def adapter(self) -> Any:
+        """The currently bound group adapter, or ``None``."""
+        router = self._lw_v2_router
+        return None if router is None else router.adapter
+
+    def register_kv_caches(self, kv_caches: dict[str, Any]) -> None:
+        """Run stock cache registration, then build the v2 group runtime.
+
+        The stock registration derives the edited cache views and registers
+        the layer layout with the LMCache server. Once that has happened the
+        optional adapter factory builds the group adapter over the edited
+        caches and the connector installs the schema-2 boundary codec, so both
+        are available before ``initialize_kv_cache`` installs the engine seam
+        (the engine reads ``current_step``/``boundary_codec`` from here).
+
+        Without a factory the connector stays explicit ``NotReady`` on a real
+        hit instead of silently falling back to the stock full-tensor path.
+        """
+        super().register_kv_caches(kv_caches)
+        factory = self._lw_v2_adapter_factory
+        if factory is None or self.adapter is not None:
+            return
+        plan = self._lw_v2_plan
+        if plan is None:
+            raise DSV41LwV2ConfigError(
+                "an adapter factory requires a grouped plan bound before "
+                "register_kv_caches"
+            )
+        adapter = factory(plan, self)
+        self.bind_adapter(adapter)
+        if self._lw_v2_boundary_codec is not None:
+            return
+        if not callable(getattr(adapter, "stage_boundary_capture", None)):
+            return
+        # First Party
+        from lmcache_ascend.integration.vllm.dsv41_lw_v2.boundary import (
+            install_dsv41_lw_v2_boundary_codec,
+        )
+
+        install_dsv41_lw_v2_boundary_codec(self, adapter=adapter)
 
     @property
     def metrics(self) -> dict[str, int]:
@@ -972,6 +1069,13 @@ class DSV41LwV2Connector(LMCacheMPConnector):
         self._lw_v2_server_generation = _non_negative_int(
             server_generation, "server_generation"
         )
+        adapter = self.adapter
+        setter = getattr(adapter, "set_generations", None)
+        if callable(setter):
+            setter(
+                registration_epoch=self._lw_v2_registration_epoch,
+                server_generation=self._lw_v2_server_generation,
+            )
 
     def _stock_key(
         self,
