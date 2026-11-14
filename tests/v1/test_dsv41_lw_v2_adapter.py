@@ -940,13 +940,15 @@ def test_boundary_capture_store_retrieve_restore_with_page_relocation():
         capture_view,
         _TensorView(capture_ring, (0, 1), 4, 2),
     )
-    assert adapter.metrics["boundary_captured"] == 1
+    assert adapter.metrics["boundary_staged"] == 1
+    assert adapter.metrics["boundary_captured"] == 0
 
     # Store the captured boundary (the source page is on ring page 0).
     store_request = _request("r1", load_prefix_end=0, store_prefix_end=TOKENS)
     adapter.submit_group_store("g2", ("r1",), _step(store_request))
     adapter.drain_stores()
     assert adapter.metrics["group_store_committed"] == 1
+    assert adapter.metrics["boundary_captured"] == 1
     assert server.boundaries
 
     # A second request retrieves the same prefix and lives on page 1.
@@ -1030,12 +1032,14 @@ def test_real_engine_view_absolute_rows_cross_page_roundtrip():
         ring_head_size=2,
     )
     codec.capture_layer_boundary(capture_view, capture_tensor)
-    assert adapter.metrics["boundary_captured"] == 1
+    assert adapter.metrics["boundary_staged"] == 1
+    assert adapter.metrics["boundary_captured"] == 0
 
     store_request = _request("r1", load_prefix_end=0, store_prefix_end=TOKENS)
     adapter.submit_group_store("g2", ("r1",), _step(store_request))
     adapter.drain_stores()
     assert adapter.metrics["group_store_committed"] == 1
+    assert adapter.metrics["boundary_captured"] == 1
 
     # A second request hits the same prefix, but its live page is page 7.
     adapter.bind_kv_caches(_make_caches(fill=0.0))
@@ -1169,6 +1173,132 @@ def test_boundary_wrong_prefix_on_restore_is_rejected():
             restore_view, _TensorView(_ring(), (0, 1), 4, 2)
         )
     assert adapter.metrics["boundary_restore_failed"] == 1
+
+
+def test_unaligned_boundary_capture_is_discarded_and_never_leaks(monkeypatch):
+    """T25-1: a step whose store endpoint is chunk-clamped must degrade safely.
+
+    The final B01 step captures the boundary at 9690 but only stores tokens up
+    to the chunk-aligned endpoint 9472.  Attaching the 9690 page to 9472 would
+    mislabel its compressor state, so the capture is discarded explicitly and
+    the previous 8192 endpoint remains the warm-hit boundary.
+    """
+    adapter, server, warnings = _streaming_adapter(monkeypatch)
+    resource_id = PLAN.group_by_id("g2").boundary_resource.resource_id
+    codec = _codec(adapter)
+
+    # Step 0 ends exactly on 8192: this aligned capture is attached.
+    aligned = _boundary_view("r1", prefix_end=8191)
+    aligned.ring_page = 8191 // 4
+    aligned.next_slot = 8191 % 4
+    aligned.written_rows = (8191,)
+    codec.capture_layer_boundary(
+        aligned,
+        _TensorView(_ring(pages=2049), (aligned.ring_page,), 4, 2),
+    )
+    _submit_store_window(
+        adapter, step_id=0, start=0, end=8192, blocks=tuple(range(64))
+    )
+    assert adapter.metrics["boundary_captured"] == 1
+    boundary_keys = list(server.boundaries)
+    assert len(boundary_keys) == 1
+    assert boundary_keys[0][:4] == (PLAN_HASH, LAYOUT_HASH, resource_id, 8192)
+
+    # The final step's live prefix is 9690 while only 9472 is chunk aligned.
+    unaligned = _boundary_view("r1", prefix_end=9689)
+    unaligned.ring_page = 9689 // 4
+    unaligned.next_slot = 9689 % 4
+    unaligned.written_rows = (9689,)
+    codec.capture_layer_boundary(
+        unaligned,
+        _TensorView(_ring(pages=2423), (unaligned.ring_page,), 4, 2),
+    )
+    capture = adapter._boundary_stage[("r1", resource_id)]  # noqa: SLF001
+    assert capture.page is not None
+    assert adapter.metrics["boundary_staged"] == 2
+
+    _submit_store_window(
+        adapter, step_id=1, start=8192, end=9472, blocks=tuple(range(64, 74))
+    )
+
+    # The unaligned page is dropped with an explicit reason and freed.
+    assert adapter.metrics["boundary_capture_discarded"] == 1
+    assert adapter.metrics["boundary_attached"] == 1
+    assert adapter.metrics["boundary_captured"] == 1
+    assert adapter._boundary_stage == {}  # noqa: SLF001
+    assert capture.page is None
+    assert warnings and "unaligned_endpoint" in warnings[-1]
+    # The server still exposes only the last complete, attached endpoint.
+    boundary_keys = list(server.boundaries)
+    assert len(boundary_keys) == 1
+    assert boundary_keys[0][:4] == (PLAN_HASH, LAYOUT_HASH, resource_id, 8192)
+
+
+def test_drop_request_releases_staged_boundary_capture():
+    server = _FakeServer()
+    adapter = _make_adapter(FakeTransport(server))
+    adapter.register()
+    resource_id = PLAN.group_by_id("g2").boundary_resource.resource_id
+    codec = _codec(adapter)
+    codec.capture_layer_boundary(
+        _boundary_view("r1", prefix_end=TOKENS - 1),
+        _TensorView(_ring(fill=1.0), (0, 1), 4, 2),
+    )
+    capture = adapter._boundary_stage[("r1", resource_id)]  # noqa: SLF001
+    assert capture.page is not None
+
+    adapter.drop_request("r1", reason="dropped")
+
+    assert adapter._boundary_stage == {}  # noqa: SLF001
+    assert capture.page is None
+    assert adapter.metrics["boundary_stage_released"] == 1
+
+
+def test_replacing_a_boundary_capture_releases_the_previous_page():
+    server = _FakeServer()
+    adapter = _make_adapter(FakeTransport(server))
+    adapter.register()
+    resource_id = PLAN.group_by_id("g2").boundary_resource.resource_id
+    codec = _codec(adapter)
+    codec.capture_layer_boundary(
+        _boundary_view("r1", prefix_end=TOKENS - 1),
+        _TensorView(_ring(fill=1.0), (0, 1), 4, 2),
+    )
+    first = adapter._boundary_stage[("r1", resource_id)]  # noqa: SLF001
+
+    second = _boundary_view("r1", prefix_end=TOKENS + 3)
+    second.ring_page = 2
+    second.written_rows = (11,)
+    codec.capture_layer_boundary(
+        second,
+        _TensorView(_ring(pages=3, fill=2.0), (2,), 4, 2),
+    )
+
+    assert first.page is None
+    assert adapter.metrics["boundary_stage_released"] == 1
+    assert len(adapter._boundary_stage) == 1  # noqa: SLF001
+
+
+def test_finished_requests_release_any_staged_boundary_capture():
+    server = _FakeServer()
+    adapter = _make_adapter(FakeTransport(server))
+    adapter.register()
+    resource_id = PLAN.group_by_id("g2").boundary_resource.resource_id
+    codec = _codec(adapter)
+    codec.capture_layer_boundary(
+        _boundary_view("r1", prefix_end=TOKENS - 1),
+        _TensorView(_ring(fill=1.0), (0, 1), 4, 2),
+    )
+    capture = adapter._boundary_stage[("r1", resource_id)]  # noqa: SLF001
+    adapter._sending_ready.add("r1")  # noqa: SLF001
+
+    finished_sending, finished_receiving = adapter.take_finished()
+
+    assert finished_sending == {"r1"}
+    assert finished_receiving == set()
+    assert capture.page is None
+    assert adapter._boundary_stage == {}  # noqa: SLF001
+    assert adapter.metrics["boundary_stage_released"] == 1
 
 
 def test_wire_dtos_are_shared_server_types_and_round_trip():

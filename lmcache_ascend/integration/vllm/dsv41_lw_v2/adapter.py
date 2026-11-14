@@ -375,12 +375,28 @@ class _StoreBatch:
 
 @dataclass
 class _BoundaryCapture:
-    page: torch.Tensor
+    page: torch.Tensor | None
     event: Any
     encoder: Callable[[torch.Tensor], bytes]
+    boundary_end: int
     encode_lock: threading.Lock = field(default_factory=threading.Lock)
     done: threading.Event = field(default_factory=threading.Event)
     encoded: bytes | None = None
+    released: bool = False
+
+    def release(self) -> None:
+        """Drop the private device copy and any encoded bytes.
+
+        Idempotent.  The lock serialises with the worker's device-to-host
+        copy, so a capture already being encoded finishes first and is
+        released right after; a capture that is only queued is skipped by
+        the worker once ``released`` is set.
+        """
+        self.released = True
+        with self.encode_lock:
+            self.page = None
+            self.encoded = None
+        self.done.set()
 
 
 # ---------------------------------------------------------------------------
@@ -488,7 +504,12 @@ class DSV41LwV2GroupAdapter:
         self._store_batches: list[_StoreBatch] = []
         self._terminal_ops: set[tuple[str, str, str, int, str, int]] = set()
         self._staged_ends: dict[tuple[str, str], int] = {}
-        self._boundary_stage: dict[tuple[str, str, int], bytes] = {}
+        self._boundary_group_by_resource: dict[str, str] = {
+            group.boundary_resource.resource_id: group.group_id
+            for group in plan.groups
+            if group.boundary_resource is not None
+        }
+        self._boundary_stage: dict[tuple[str, str], _BoundaryCapture] = {}
         self._boundary_payloads: dict[tuple[str, str, int], bytes] = {}
         self._failed_receiving: set[str] = set()
         self._failed_receiving_reported: set[str] = set()
@@ -513,7 +534,11 @@ class DSV41LwV2GroupAdapter:
             "group_store_committed": 0,
             "group_store_dropped": 0,
             "group_store_failed": 0,
+            "boundary_staged": 0,
+            "boundary_attached": 0,
             "boundary_captured": 0,
+            "boundary_capture_discarded": 0,
+            "boundary_stage_released": 0,
             "boundary_restored": 0,
             "boundary_restore_failed": 0,
             "host_wait_fallback": 0,
@@ -890,9 +915,15 @@ class DSV41LwV2GroupAdapter:
             self._counters["requests_finished_sending"] += len(
                 finished_sending
             )
+            released = self._release_boundary_state_locked(
+                finished_sending | finished_receiving
+            )
             # Contract order is (finished_sending, finished_receiving); the
             # stock connector concatenates the two positionally.
-            return finished_sending, finished_receiving
+            result = (finished_sending, finished_receiving)
+        for capture in released:
+            capture.release()
+        return result
 
     def take_failed_receiving(self) -> set[str]:
         """Return requests whose load failed and must be recomputed."""
@@ -911,7 +942,7 @@ class DSV41LwV2GroupAdapter:
         self,
         request_id: str,
         resource_id: str,
-        prefix_end: int,
+        boundary_end: int,
         page: torch.Tensor,
         event: Any | None,
         encoder: Callable[[torch.Tensor], bytes],
@@ -923,26 +954,42 @@ class DSV41LwV2GroupAdapter:
         ``page`` must already be a private device copy (the codec clones the
         live ring page before calling). The device-to-host copy and the
         schema-2 encoding happen on the adapter worker.
+
+        Captures are keyed by ``(request_id, resource_id)``; the logical
+        ``boundary_end`` is kept on the capture so the store path can decide
+        explicitly whether this capture belongs to the step's chunk-aligned
+        store endpoint.  A second capture for the same request/resource (for
+        example when a step's stores were dropped) releases the older page
+        instead of leaking it.
         """
         self._require_boundary_resource(resource_id)
         capture = _BoundaryCapture(
-            page=page, event=event, encoder=encoder
+            page=page,
+            event=event,
+            encoder=encoder,
+            boundary_end=int(boundary_end),
         )
+        key = (request_id, resource_id)
+        replaced: _BoundaryCapture | None = None
         with self._lock:
-            self._boundary_stage[
-                (request_id, resource_id, int(prefix_end))
-            ] = capture  # type: ignore[assignment]
+            replaced = self._boundary_stage.pop(key, None)
+            self._boundary_stage[key] = capture
+            if replaced is not None:
+                self._counters["boundary_stage_released"] += 1
+        if replaced is not None:
+            replaced.release()
         if not self._enqueue(("capture", capture)):
             with self._lock:
                 self._counters["group_store_dropped"] += 1
-                self._boundary_stage.pop(
-                    (request_id, resource_id, int(prefix_end)), None
-                )
+                if self._boundary_stage.get(key) is capture:
+                    self._boundary_stage.pop(key, None)
+                self._counters["boundary_stage_released"] += 1
+            capture.release()
 
-    def record_boundary_captured(self) -> None:
-        """Count one boundary page successfully staged for transport."""
+    def record_boundary_staged(self) -> None:
+        """Count one boundary page successfully staged by the codec."""
         with self._lock:
-            self._counters["boundary_captured"] += 1
+            self._counters["boundary_staged"] += 1
 
     def record_boundary_restored(self) -> None:
         """Count one boundary page actually written into a live ring."""
@@ -1345,6 +1392,10 @@ class DSV41LwV2GroupAdapter:
             return
         self._terminal_ops.add(terminal)
         with self._lock:
+            if staged.is_boundary:
+                # The server has committed this boundary page; only now may
+                # gate-1 observe it as captured/transmitted.
+                self._counters["boundary_captured"] += 1
             current = self._staged_ends.get((event.request_id, resource_id), 0)
             self._staged_ends[(event.request_id, resource_id)] = max(
                 current, staged.chunk_end
@@ -1354,6 +1405,8 @@ class DSV41LwV2GroupAdapter:
     def _run_capture(self, capture: _BoundaryCapture) -> None:
         try:
             with capture.encode_lock:
+                if capture.released or capture.page is None:
+                    return
                 if capture.encoded is not None:
                     return
                 event = capture.event
@@ -1363,7 +1416,11 @@ class DSV41LwV2GroupAdapter:
                     event = None
                 if event is not None:
                     event.synchronize()
-                cpu_page = capture.page.detach().to("cpu", copy=True)
+                page = capture.page
+                cpu_page = page.detach().to("cpu", copy=True)
+                # The device clone is no longer needed once the host copy
+                # exists; releasing it here keeps long-lived captures bounded.
+                capture.page = None
                 capture.encoded = capture.encoder(cpu_page)
         finally:
             capture.done.set()
@@ -1499,15 +1556,11 @@ class DSV41LwV2GroupAdapter:
         if group.has_boundary and staged:
             assert group.boundary_resource is not None
             resource = group.boundary_resource
-            with self._lock:
-                capture = self._boundary_stage.pop(
-                    (
-                        request.request_id,
-                        resource.resource_id,
-                        int(request.store_prefix_end),
-                    ),
-                    None,
-                )
+            capture = self._take_boundary_capture(
+                request_id=request.request_id,
+                resource_id=resource.resource_id,
+                store_end=int(request.store_prefix_end),
+            )
             if capture is not None:
                 staged.append(
                     _StagedStore(
@@ -1523,7 +1576,48 @@ class DSV41LwV2GroupAdapter:
                         capture=capture,
                     )
                 )
+                with self._lock:
+                    # Counted separately from ``boundary_captured``: a page
+                    # attached to a store operation is not yet visible on the
+                    # server, so gate-1 must use the committed counter.
+                    self._counters["boundary_attached"] += 1
         return staged
+
+    def _take_boundary_capture(
+        self, *, request_id: str, resource_id: str, store_end: int
+    ) -> _BoundaryCapture | None:
+        """Pop the request/resource capture and match it to ``store_end``.
+
+        A boundary page represents the compressor state at its own
+        ``boundary_end``.  Attaching it to a different (chunk-aligned) store
+        endpoint would mislabel that state, so an unaligned capture is
+        discarded explicitly and counted instead of being left unread in the
+        staging dict (which used to leak the device page clone).
+        """
+        key = (request_id, resource_id)
+        with self._lock:
+            capture = self._boundary_stage.pop(key, None)
+        if capture is None:
+            return None
+        if capture.boundary_end == store_end:
+            return capture
+        if capture.boundary_end > store_end:
+            reason = "unaligned_endpoint"
+        else:
+            reason = "stale_capture"
+        logger_warning(
+            "dsv41 lw v2 boundary capture discarded for request %s "
+            "resource %s: capture boundary_end=%s store_end=%s (%s)",
+            request_id,
+            resource_id,
+            capture.boundary_end,
+            store_end,
+            reason,
+        )
+        capture.release()
+        with self._lock:
+            self._counters["boundary_capture_discarded"] += 1
+        return None
 
     def _await_capture(self, capture: Any) -> bytes:
         if isinstance(capture, bytes):
@@ -1855,8 +1949,56 @@ class DSV41LwV2GroupAdapter:
                 batch.event.drop(reason=reason)
                 dropped += 1
                 self._counters["group_store_dropped"] += 1
+            # Boundary staging keys do not carry a step id; map the resource
+            # back to its group so group/request scoped drops behave the same.
+            released: list[_BoundaryCapture] = []
+            for (request_id, resource_id), capture in list(
+                self._boundary_stage.items()
+            ):
+                group_id = self._boundary_group_by_resource.get(
+                    resource_id, ""
+                )
+                if not predicate((group_id, request_id, -1)):
+                    continue
+                self._boundary_stage.pop((request_id, resource_id), None)
+                released.append(capture)
+            for key in list(self._boundary_payloads):
+                request_id, resource_id, _ = key
+                group_id = self._boundary_group_by_resource.get(
+                    resource_id, ""
+                )
+                if predicate((group_id, request_id, -1)):
+                    self._boundary_payloads.pop(key, None)
+            if released:
+                self._counters["boundary_stage_released"] += len(released)
             if counter is not None:
                 self._counters[counter] += dropped
+        for capture in released:
+            capture.release()
+
+    def _release_boundary_state_locked(
+        self, request_ids: set[str]
+    ) -> list[_BoundaryCapture]:
+        """Drop staged pages/payloads for finished requests.
+
+        The caller releases the returned captures outside the adapter lock,
+        so a capture that is still being encoded cannot block other
+        bookkeeping.
+        """
+        released: list[_BoundaryCapture] = []
+        for (request_id, resource_id), capture in list(
+            self._boundary_stage.items()
+        ):
+            if request_id not in request_ids:
+                continue
+            self._boundary_stage.pop((request_id, resource_id), None)
+            released.append(capture)
+        for key in list(self._boundary_payloads):
+            if key[0] in request_ids:
+                self._boundary_payloads.pop(key, None)
+        if released:
+            self._counters["boundary_stage_released"] += len(released)
+        return released
 
     def _release_store_buffers(self) -> None:
         with self._lock:

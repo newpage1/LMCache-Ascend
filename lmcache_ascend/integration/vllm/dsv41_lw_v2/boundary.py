@@ -428,7 +428,7 @@ class DSV41LwV2BoundaryCodec:
                 f"boundary capture could not be staged: {exc}",
                 error_code=BOUNDARY_PAYLOAD_CORRUPT,
             ) from None
-        adapter.record_boundary_captured()
+        adapter.record_boundary_staged()
 
     def restore_layer_boundary(
         self,
