@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Sequence
 from lmcache.logging import init_logger
 
 # First Party (path-loaded sibling module)
+from lmcache_ascend.integration.vllm import dsv41_sampling
 from lmcache_ascend.integration.vllm.dsv41_prefix_key import (
     dsv41_prefix_key,
 )
@@ -781,6 +782,47 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
         self.index = LayerwiseTransferIndex(registration_epoch=next_epoch)
         self.snapshots = LayerwiseSnapshotStore()
         admission.set_admission_registry(_DispatchAdmissionView(self))
+        if dsv41_sampling.enabled():
+            # t120 registration manifest: the real name -> engine group
+            # identity map derived from the registered tensors and the
+            # engine group view (t119 §4.1 row 1).
+            group_of_name: dict[str, list[int]] = {}
+            for group in engine_group_infos:
+                for tensor_index in group.layer_indices:
+                    if tensor_index < len(self._cache_names):
+                        group_of_name.setdefault(
+                            self._cache_names[tensor_index], []
+                        ).append(int(group.engine_group_id))
+            resources = []
+            for resource in plan.resources:
+                resources.append(
+                    {
+                        "resource_id": resource.resource_id,
+                        "storage_kind": resource.storage_kind,
+                        "engine_group_id": (
+                            None
+                            if resource.engine_group_id is None
+                            else int(resource.engine_group_id)
+                        ),
+                        "tensor_indices": list(resource.tensor_indices),
+                        "producer": resource.producer_layer,
+                        "consumers": list(resource.consumer_layers),
+                    }
+                )
+            dsv41_sampling.emit(
+                "adapter",
+                "registration",
+                vllm_rank=int(vllm_rank),
+                kv_worker_id=str(kv_worker_id),
+                plan_hash=self.plan_hash,
+                layout_hash=self.layout_hash,
+                epoch=self.registration_epoch,
+                generation=int(self.server_generation),
+                cache_names=list(self._cache_names),
+                group_of_name={k: v for k, v in group_of_name.items()},
+                resources=resources,
+                layer_order=list(plan.layer_order),
+            )
         self._publish_registration_identity()
 
     def _publish_registration_identity(self) -> None:
@@ -986,7 +1028,38 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                             request_id,
                         )
         try:
+            if not requests:
+                # t120: the fully-cold step (warmup) is recorded once so
+                # the sampling timeline can place the sentinel windows.
+                dsv41_sampling.emit("adapter", "step_schedule", cold_step=True, step_id=step_id)
             for request_id, view in requests.items():
+                if dsv41_sampling.enabled():
+                    dsv41_sampling.emit(
+                        "adapter",
+                        "step_schedule",
+                        step_id=step_id,
+                        request_id=request_id,
+                        has_retrieve=bool(view.has_retrieve),
+                        bridge_cold=request_id in bridge_cold,
+                        blocks=[list(group) for group in (view.blocks or ())],
+                        start_token=int(view.start_token),
+                        end_token=(
+                            None
+                            if view.effective_end_token is None
+                            else int(view.effective_end_token)
+                        ),
+                        skip_first_n_tokens=int(view.skip_first_n_tokens),
+                        store=(
+                            None
+                            if not view.has_store
+                            else [
+                                int(view.store_start_token),
+                                int(view.store_end_token),
+                            ]
+                        ),
+                        prefix_key=view.prefix_key,
+                        hit_identity=getattr(view, "hit_identity", None),
+                    )
                 # The store range comes from the STORE op semantics — the
                 # step's actual committed token range — never from the
                 # RETRIEVE hit bound (T56-02).
@@ -1048,6 +1121,21 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                     ]
                     skipped = len(required) - len(covered)
                     if skipped:
+                        dsv41_sampling.emit(
+                            "adapter",
+                            "f4_skip",
+                            step_id=step_id,
+                            request_id=request_id,
+                            layer=layer,
+                            skipped=skipped,
+                            required=[
+                                resource.resource_id for resource in required
+                            ],
+                            covered=[
+                                resource.resource_id for resource in covered
+                            ],
+                            block_groups=len(view.blocks or ()),
+                        )
                         logger.debug(
                             "[dsv41_layerwise] retrieve skip: %d resource(s) "
                             "of request %s in step %d have engine groups not "
@@ -1642,6 +1730,15 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                     resource.resource_id, snapshot_id, boundary_token, request_id
                 )
                 if provided is None:
+                    dsv41_sampling.emit(
+                        "adapter",
+                        "boundary_cold",
+                        step_id=step_id,
+                        request_id=request_id,
+                        resource_id=resource.resource_id,
+                        boundary_token=boundary_token,
+                        reason="provider_rejected_store_end",
+                    )
                     logger.warning(
                         "[dsv41_layerwise] boundary stays cold for "
                         "resource %s of request %s in step %d: the "
@@ -1672,6 +1769,22 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                     ring_cursor=ring_cursor,
                     compression_phase=compression_phase,
                     ring_length=ring_length,
+                )
+                dsv41_sampling.emit(
+                    "adapter",
+                    "boundary_store",
+                    step_id=step_id,
+                    request_id=request_id,
+                    resource_id=resource.resource_id,
+                    boundary_token=boundary_token,
+                    ring_length=ring_length,
+                    ring_cursor=ring_cursor,
+                    compression_phase=compression_phase,
+                    written_rows=len(row_indices),
+                    full_page_rows=len(descriptor.row_indices),
+                    wire_bytes=len(payload),
+                    digest=hashlib.sha256(payload).hexdigest(),
+                    source_tensor=dsv41_sampling.summarize_tensor(tensor),
                 )
                 # t111: the boundary spec is deterministic per (request,
                 # step, resource) — a stable operation id over stable
@@ -1992,6 +2105,13 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             slot = (request_id, resource.resource_id)
             if slot in self._bridge_served:
                 served_any = True
+                dsv41_sampling.emit(
+                    "adapter",
+                    "bridge_resource",
+                    request_id=request_id,
+                    resource_id=resource.resource_id,
+                    outcome="already_served",
+                )
                 continue
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
@@ -2000,6 +2120,13 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                 # honestly below and the engine recomputes the prefix
                 # instead of parking in WAITING_FOR_REMOTE_KVS.
                 failed_any = True
+                dsv41_sampling.emit(
+                    "adapter",
+                    "bridge_resource",
+                    request_id=request_id,
+                    resource_id=resource.resource_id,
+                    outcome="budget_exhausted",
+                )
                 logger.warning(
                     "[dsv41_layerwise] bridge: request %s exceeded its "
                     "%.0fs load budget before resource %s; the engine "
@@ -2011,6 +2138,19 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                 continue
             gidx = group_index.get(resource.engine_group_id)
             if gidx is None or gidx >= len(per_group):
+                dsv41_sampling.emit(
+                    "adapter",
+                    "bridge_resource",
+                    request_id=request_id,
+                    resource_id=resource.resource_id,
+                    outcome="group_not_covered",
+                    engine_group_id=(
+                        None
+                        if resource.engine_group_id is None
+                        else int(resource.engine_group_id)
+                    ),
+                    op_block_groups=len(per_group),
+                )
                 logger.debug(
                     "[dsv41_layerwise] bridge: resource %s group %s not "
                     "covered by this retrieve op; skipping",
@@ -2045,6 +2185,14 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             )
             if payload is None:
                 failed_any = True
+                dsv41_sampling.emit(
+                    "adapter",
+                    "bridge_resource",
+                    request_id=request_id,
+                    resource_id=resource.resource_id,
+                    outcome="miss",
+                    rows=len(rows),
+                )
                 logger.warning(
                     "[dsv41_layerwise] bridge: no layerwise snapshot for "
                     "request %s resource %s under key %s; the engine will "
@@ -2057,6 +2205,23 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             self._restore_rows_prefix(spec, payload, len(rows))
             self._bridge_served.add(slot)
             served_any = True
+            dsv41_sampling.emit(
+                "adapter",
+                "bridge_resource",
+                request_id=request_id,
+                resource_id=resource.resource_id,
+                outcome="loaded",
+                rows=len(rows),
+                wire_bytes=len(payload),
+            )
+        dsv41_sampling.emit(
+            "adapter",
+            "bridge_outcome",
+            request_id=request_id,
+            prefix=prefix,
+            served=served_any,
+            failed=failed_any,
+        )
         if served_any and not failed_any:
             self.retrieve_futures[request_id] = (
                 _BridgeLoadFuture(True),
@@ -2202,6 +2367,16 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             spec.operation_id,
             spec.resource_id,
             n_rows,
+        )
+        dsv41_sampling.emit(
+            "adapter",
+            "restore_rows",
+            operation_id=spec.operation_id,
+            request_id=spec.request_id,
+            resource_id=spec.resource_id,
+            key=spec.key,
+            rows=list(spec.block_ids)[:n_rows],
+            wire_bytes=len(payload),
         )
 
     def _dispatch_retrieve(self, spec: ResourceTransferSpec) -> None:
@@ -2717,7 +2892,25 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                     else f"{name}[{plane_index}]"
                 )
                 segments.append((segment_name, plane[rows] if rows else plane[:0]))
-        return encode_resource_payload(segments)
+        payload = encode_resource_payload(segments)
+        if dsv41_sampling.enabled():
+            # t120: pure tensor bytes leaving the worker; wire bytes are
+            # the server-side store view of the same payload.
+            dsv41_sampling.emit(
+                "adapter",
+                "store_payload",
+                operation_id=spec.operation_id,
+                request_id=spec.request_id,
+                step_id=spec.step_id,
+                resource_id=spec.resource_id,
+                key=spec.key,
+                rows=list(spec.block_ids),
+                tensor_bytes=len(payload),
+                wire_bytes=len(payload),
+                digest=hashlib.sha256(payload).hexdigest(),
+                segments=[name for name, _ in segments],
+            )
+        return payload
 
     def _restore_resource_payload(
         self, spec: ResourceTransferSpec, payload: bytes
@@ -2897,6 +3090,19 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                 len(header.get("written_rows", ())),
                 spec.boundary.boundary_token,
             )
+            dsv41_sampling.emit(
+                "adapter",
+                "restore_boundary",
+                operation_id=spec.operation_id,
+                request_id=spec.request_id,
+                resource_id=spec.resource_id,
+                captured_page=page_offset // ring_length,
+                target_page=target_page,
+                ring_length=ring_length,
+                written_rows=len(header.get("written_rows", ())),
+                boundary_token=spec.boundary.boundary_token,
+                wire_bytes=len(payload),
+            )
             return
         header, tensors = decode_resource_payload(payload)
         for meta, tensor in zip(header["segments"], tensors, strict=True):
@@ -2916,6 +3122,16 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
             rows = list(spec.block_ids)
             if rows:
                 target[rows] = tensor.to(device=target.device)
+        dsv41_sampling.emit(
+            "adapter",
+            "restore_token_range",
+            operation_id=spec.operation_id,
+            request_id=spec.request_id,
+            resource_id=spec.resource_id,
+            key=spec.key,
+            rows=list(spec.block_ids),
+            wire_bytes=len(payload),
+        )
 
     _ENGINE_COMMIT_WAIT_S = 2.0
     _DRAIN_COMMIT_WAIT_S = 30.0
@@ -2994,6 +3210,20 @@ class DSV41LayerwiseMPWorkerAdapter(LMCacheMPWorkerAdapter):
                 ""
                 if commit.boundaries
                 else " (cold-only: lookups cannot hit S0-style snapshots)",
+            )
+            dsv41_sampling.emit(
+                "adapter",
+                "commit",
+                step_id=step_id,
+                request_id=request_id,
+                snapshot_id=commit.snapshot_id,
+                key=commit.key,
+                operation_count=len(commit.operation_ids),
+                operation_ids=list(commit.operation_ids),
+                boundary_count=len(commit.boundaries),
+                boundary_tokens=[
+                    str(item.boundary_token) for item in commit.boundaries
+                ],
             )
         self._uncommitted_store_steps.discard(step_id)
         self._sealed_steps.discard(step_id)
@@ -3502,6 +3732,16 @@ class DSV41LayerwiseMPSchedulerAdapter(LMCacheMPSchedulerAdapter):
             len(entries),
             submitted,
         )
+        dsv41_sampling.emit(
+            "adapter",
+            "lookup_submit",
+            role="scheduler",
+            request_id=request_id,
+            key=key,
+            identities=len(self._lookup_identities),
+            rpcs=len(entries),
+            stock_submitted=bool(submitted),
+        )
         self._dsv41_lookups[request_id] = {
             "key": key,
             "pending": entries,
@@ -3597,6 +3837,19 @@ class DSV41LayerwiseMPSchedulerAdapter(LMCacheMPSchedulerAdapter):
             chunk = int(getattr(self, "lmcache_tokens_per_chunk", 0) or 0)
             matched = int(hit.matched_end)
             aligned = matched // chunk * chunk if chunk > 0 else matched
+            dsv41_sampling.emit(
+                "adapter",
+                "lookup_hit",
+                role="scheduler",
+                request_id=request_id,
+                matched_end=matched,
+                aligned=aligned,
+                chunk=chunk,
+                snapshot_id=hit.snapshot_id,
+                lease_id=hit.lease_id,
+                resources=list(hit.resource_ids),
+                bridge_serve=bool(getattr(self, "_bridge_serve_enabled", False)),
+            )
             self._release_lease_quietly(hit.lease_id)
             if aligned <= 0:
                 logger.info(
@@ -3643,6 +3896,12 @@ class DSV41LayerwiseMPSchedulerAdapter(LMCacheMPSchedulerAdapter):
             "request=%s (no boundary-complete snapshot under the "
             "request's prefix key)",
             request_id,
+        )
+        dsv41_sampling.emit(
+            "adapter",
+            "lookup_miss",
+            role="scheduler",
+            request_id=request_id,
         )
         return ret
 
