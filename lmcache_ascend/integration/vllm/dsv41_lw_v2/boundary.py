@@ -543,6 +543,16 @@ class DSV41LwV2BoundaryCodec:
                 f"{view.prefix_end} modulo ring length {ring_length}",
                 error_code=BOUNDARY_GEOMETRY_MISMATCH,
             )
+        page = int(view.ring_page)
+        if page < 0:
+            raise DSV41BoundaryStateError(
+                f"ring page {page} must be non-negative",
+                error_code=BOUNDARY_GEOMETRY_MISMATCH,
+            )
+        # The engine DTO is the wire source of truth for ``written_rows``:
+        # rows are *absolute* in the physical ring, i.e. the live-page window
+        # is [ring_page * ring_length, (ring_page + 1) * ring_length).  Page
+        # 0 therefore looks relative, but page N must not be rejected.
         written = tuple(int(row) for row in view.written_rows)
         expected_rows = min(int(view.step_tokens), ring_length)
         if len(written) != expected_rows:
@@ -556,10 +566,13 @@ class DSV41LwV2BoundaryCodec:
                 "written rows repeat",
                 error_code=BOUNDARY_GEOMETRY_MISMATCH,
             )
+        page_start = page * ring_length
+        page_end = page_start + ring_length
         for row in written:
-            if not 0 <= row < ring_length:
+            if not page_start <= row < page_end:
                 raise DSV41BoundaryStateError(
-                    f"written row {row} is outside the ring",
+                    f"written row {row} is outside the live page "
+                    f"[{page_start}, {page_end}) for ring page {page}",
                     error_code=BOUNDARY_GEOMETRY_MISMATCH,
                 )
         control = tuple(view.position_control)
@@ -635,14 +648,7 @@ class DSV41LwV2BoundaryCodec:
                     f"the restore view {expected!r}",
                     error_code=code,
                 )
-        view_rows = [int(row) for row in view.written_rows]
-        header_rows = header.get("written_rows")
-        if view_rows and header_rows != view_rows:
-            raise DSV41BoundaryStateError(
-                f"boundary payload written rows {header_rows!r} do not match "
-                f"the restore view {view_rows!r}",
-                error_code=BOUNDARY_GEOMETRY_MISMATCH,
-            )
+        self._validate_header_rows(header)
         ring_rows, head_size = int(tensor_view.ring_rows), int(
             tensor_view.ring_head_size
         )
@@ -665,6 +671,63 @@ class DSV41LwV2BoundaryCodec:
                 f"{envelope.kv.dtype}",
                 error_code=BOUNDARY_GEOMETRY_MISMATCH,
             )
+
+    def _validate_header_rows(self, header: dict[str, Any]) -> None:
+        """Validate the captured absolute rows against the captured page.
+
+        The rows are provenance of the capture (which absolute ring rows that
+        step wrote); a restore happens in a *different* request's live page and
+        has its own ``written_rows``.  Comparing the two would reject every
+        cross-page stock hit, so the header is validated against its own page
+        window instead.
+        """
+        ring_length = header.get("ring_length")
+        ring_page = header.get("ring_page")
+        step_tokens = header.get("step_tokens")
+        if not all(
+            type(value) is int
+            for value in (ring_length, ring_page, step_tokens)
+        ):
+            raise DSV41BoundaryStateError(
+                "boundary payload is missing its ring geometry",
+                error_code=BOUNDARY_GEOMETRY_MISMATCH,
+            )
+        if ring_length <= 0 or ring_page < 0 or step_tokens < 0:
+            raise DSV41BoundaryStateError(
+                f"boundary payload has invalid ring geometry "
+                f"(page={ring_page}, length={ring_length}, "
+                f"step_tokens={step_tokens})",
+                error_code=BOUNDARY_GEOMETRY_MISMATCH,
+            )
+        rows = header.get("written_rows")
+        if not isinstance(rows, list) or any(
+            type(row) is not int for row in rows
+        ):
+            raise DSV41BoundaryStateError(
+                "boundary payload written rows are not a list of ints",
+                error_code=BOUNDARY_GEOMETRY_MISMATCH,
+            )
+        expected = min(step_tokens, ring_length)
+        if len(rows) != expected:
+            raise DSV41BoundaryStateError(
+                f"boundary payload has {len(rows)} written rows, expected "
+                f"min(step_tokens, ring_length)={expected}",
+                error_code=BOUNDARY_GEOMETRY_MISMATCH,
+            )
+        if len(set(rows)) != len(rows):
+            raise DSV41BoundaryStateError(
+                "boundary payload written rows repeat",
+                error_code=BOUNDARY_GEOMETRY_MISMATCH,
+            )
+        page_start = ring_page * ring_length
+        page_end = page_start + ring_length
+        for row in rows:
+            if not page_start <= row < page_end:
+                raise DSV41BoundaryStateError(
+                    f"boundary payload written row {row} is outside its "
+                    f"capture page [{page_start}, {page_end})",
+                    error_code=BOUNDARY_GEOMETRY_MISMATCH,
+                )
 
     @staticmethod
     def _geometry(tensor_view: Any) -> tuple[int, int]:

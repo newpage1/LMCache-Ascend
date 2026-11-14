@@ -112,6 +112,46 @@ def _import_v2():
 
 plan_mod, connector_mod, adapter_mod, boundary_mod = _import_v2()
 
+# The cross-repo F1 test loads the *real* vllm-ascend boundary DTO module. It
+# only needs its package skeleton (the module itself imports torch only), not
+# the vLLM runtime.
+VLLM_ASCEND = ROOT.parent / "vllm-ascend"
+
+
+def _load_engine_boundary() -> types.ModuleType:
+    """Load vllm-ascend's ``BoundaryRequestView``/``BoundaryTensorView``."""
+    packages = (
+        ("vllm_ascend", VLLM_ASCEND / "vllm_ascend"),
+        ("vllm_ascend.attention", VLLM_ASCEND / "vllm_ascend/attention"),
+        ("vllm_ascend.models", VLLM_ASCEND / "vllm_ascend/models"),
+        (
+            "vllm_ascend.models.deepseek_v41",
+            VLLM_ASCEND / "vllm_ascend/models/deepseek_v41",
+        ),
+    )
+    for name, path in packages:
+        if name not in sys.modules:
+            package = types.ModuleType(name)
+            package.__path__ = [str(path)]
+            package.__package__ = name
+            sys.modules[name] = package
+    topology = "vllm_ascend.models.deepseek_v41.topology"
+    if topology not in sys.modules:
+        _load_module(
+            topology,
+            VLLM_ASCEND / "vllm_ascend/models/deepseek_v41/topology.py",
+        )
+    group_module = "vllm_ascend.attention.dsv41_lw_v2"
+    if group_module not in sys.modules:
+        _load_module(
+            group_module,
+            VLLM_ASCEND / "vllm_ascend/attention/dsv41_lw_v2.py",
+        )
+    name = "vllm_ascend.attention.dsv41_lw_v2_boundary"
+    return sys.modules.get(name) or _load_module(
+        name, VLLM_ASCEND / "vllm_ascend/attention/dsv41_lw_v2_boundary.py"
+    )
+
 
 # ---------------------------------------------------------------------------
 # Real four-group plan (fixed DSV4.1 topology)
@@ -794,6 +834,134 @@ def test_boundary_capture_store_retrieve_restore_with_page_relocation():
     assert torch.allclose(restore_ring[1, :, 2:], capture_ring[0, :, 2:])
     # The capture page itself was not touched.
     assert torch.allclose(restore_ring[0], torch.full((4, 4), -1.0))
+
+
+@pytest.mark.skipif(
+    not VLLM_ASCEND.is_dir(), reason="vllm-ascend checkout is not present"
+)
+def test_real_engine_view_absolute_rows_cross_page_roundtrip():
+    """F1: a real engine view on page >0 must survive the codec chain.
+
+    The engine DTO emits *absolute* ring rows; the codec used to demand
+    page-relative rows and therefore rejected every real capture/restore on a
+    page other than zero.  This test uses the real vllm-ascend DTOs and its
+    ``_written_rows`` kernel formula, then exercises the real v2 codec through
+    capture -> store -> retrieve -> restore with different live pages.
+    """
+    engine = _load_engine_boundary()
+    layer = "model.layers.2.self_attn.attn"
+    resource_id = PLAN.group_by_id("g2").boundary_resource.resource_id
+    capture_page, restore_page = 3, 7
+
+    server = _FakeServer()
+    adapter = _make_adapter(FakeTransport(server), caches=_make_caches(fill=4.0))
+    adapter.register()
+    codec = _codec(adapter)
+
+    capture_ring = _ring(pages=8, fill=1.0)
+    capture_ring[capture_page, :, :2] = torch.arange(8).reshape(4, 2)
+    capture_ring[capture_page, :, 2:] = 100.0
+    rows = engine._written_rows(  # noqa: SLF001 - real engine row formula
+        ring_rows=4,
+        prefix_end=TOKENS - 1,
+        step_tokens=1,
+        ring_page=capture_page,
+    )
+    assert rows == (15,)
+    capture_view = engine.BoundaryRequestView(
+        request_id="r1",
+        request_index=0,
+        step_id=0,
+        registration_epoch=0,
+        server_generation=0,
+        resource_id=resource_id,
+        dispatch_layer=layer,
+        execution_layer=layer,
+        prefix_end=TOKENS - 1,
+        step_tokens=1,
+        ring_length=4,
+        ring_page=capture_page,
+        next_slot=(TOKENS - 1) % 4,
+        compression_ratio=2,
+        compression_phase=(TOKENS - 1) % 2,
+        position_control=(TOKENS - 1, 1, 0, 0, capture_page),
+        written_rows=rows,
+    )
+    capture_tensor = engine.BoundaryTensorView(
+        resource_id=resource_id,
+        dispatch_layer=layer,
+        execution_layer=layer,
+        ring=capture_ring,
+        page_ids=torch.tensor([capture_page], dtype=torch.int64),
+        ring_rows=4,
+        ring_head_size=2,
+    )
+    codec.capture_layer_boundary(capture_view, capture_tensor)
+    assert adapter.metrics["boundary_captured"] == 1
+
+    store_request = _request("r1", load_prefix_end=0, store_prefix_end=TOKENS)
+    adapter.submit_group_store("g2", ("r1",), _step(store_request))
+    adapter.drain_stores()
+    assert adapter.metrics["group_store_committed"] == 1
+
+    # A second request hits the same prefix, but its live page is page 7.
+    adapter.bind_kv_caches(_make_caches(fill=0.0))
+    load_request = _request("r2", load_prefix_end=TOKENS)
+    adapter.schedule_group_retrieves("g2", ("r2",), _step(load_request))
+    adapter.wait_group("g2", ("r2",), _step(load_request), stream=None)
+
+    restore_ring = _ring(pages=8, fill=-1.0)
+    restore_rows = engine._written_rows(  # noqa: SLF001
+        ring_rows=4,
+        prefix_end=TOKENS,
+        step_tokens=1,
+        ring_page=restore_page,
+    )
+    assert restore_rows == (28,)
+    restore_view = engine.BoundaryRequestView(
+        request_id="r2",
+        request_index=0,
+        step_id=0,
+        registration_epoch=0,
+        server_generation=0,
+        resource_id=resource_id,
+        dispatch_layer=layer,
+        execution_layer=layer,
+        prefix_end=TOKENS,
+        step_tokens=1,
+        ring_length=4,
+        ring_page=restore_page,
+        next_slot=TOKENS % 4,
+        compression_ratio=2,
+        compression_phase=TOKENS % 2,
+        position_control=(TOKENS, 1, 0, 0, restore_page),
+        written_rows=restore_rows,
+    )
+    codec.restore_layer_boundary(
+        restore_view,
+        engine.BoundaryTensorView(
+            resource_id=resource_id,
+            dispatch_layer=layer,
+            execution_layer=layer,
+            ring=restore_ring,
+            page_ids=torch.tensor([restore_page], dtype=torch.int64),
+            ring_rows=4,
+            ring_head_size=2,
+        ),
+    )
+    assert adapter.metrics["boundary_restored"] == 1
+    assert adapter.metrics["boundary_restore_failed"] == 0
+    assert torch.allclose(
+        restore_ring[restore_page, :, :2],
+        capture_ring[capture_page, :, :2],
+    )
+    assert torch.allclose(
+        restore_ring[restore_page, :, 2:],
+        capture_ring[capture_page, :, 2:],
+    )
+    assert torch.allclose(
+        restore_ring[restore_page - 1], torch.full((4, 4), -1.0)
+    )
 
 
 def test_boundary_restore_missing_payload_is_explicit_failure():
