@@ -470,6 +470,31 @@ class FakeTransport:
         )
 
 
+class _KeyRecordingTransport:
+    """Forward to a fake transport and record every spec's stock key.
+
+    The adapter must pin each resource operation to the worker identity, so
+    the test observes the keys the transport actually receives rather than
+    the adapter's private bookkeeping.
+    """
+
+    def __init__(self, inner: FakeTransport) -> None:
+        self.inner = inner
+        self.store_keys: list = []
+        self.retrieve_keys: list = []
+
+    def __getattr__(self, name: str):
+        return getattr(self.inner, name)
+
+    def store_resource_block(self, spec, payload):
+        self.store_keys.append(spec.stock_key)
+        return self.inner.store_resource_block(spec, payload)
+
+    def retrieve_resource_block(self, spec):
+        self.retrieve_keys.append(spec.stock_key)
+        return self.inner.retrieve_resource_block(spec)
+
+
 _BOUNDARY_IDS = {
     group.boundary_resource.resource_id
     for group in PLAN.groups
@@ -507,14 +532,22 @@ def _make_caches(fill: float = 1.0):
     return caches
 
 
-def _make_adapter(transport, *, caches=None, load_timeout=1.0, store_timeout=1.0):
+def _make_adapter(
+    transport,
+    *,
+    caches=None,
+    load_timeout=1.0,
+    store_timeout=1.0,
+    worker_id=0,
+    world_size=WORLD,
+):
     return adapter_mod.DSV41LwV2GroupAdapter(
         PLAN,
         transport=transport,
         instance_id="instance-1",
         model_name=MODEL,
-        world_size=WORLD,
-        worker_id=0,
+        world_size=world_size,
+        worker_id=worker_id,
         plan_hash=PLAN_HASH,
         layout_hash=LAYOUT_HASH,
         chunk_size=CHUNK_SIZE,
@@ -763,6 +796,56 @@ def test_store_then_new_request_hits_same_prefix():
         fresh["model.layers.20.self_attn.long_kv_cache"][:rows],
         torch.full((rows, 2, 3), 3.0),
     )
+
+
+def test_group_specs_pin_the_worker_identity():
+    """TP>1: every store/retrieve spec addresses only this worker's rank."""
+    server = _FakeServer()
+    transport = _KeyRecordingTransport(FakeTransport(server))
+    adapter = _make_adapter(transport, worker_id=3, world_size=8)
+    try:
+        tokens = _token_bytes(TOKENS)
+        store_request = _request(
+            "r1", load_prefix_end=0, store_prefix_end=TOKENS, tokens=tokens
+        )
+        store_step = _step(store_request)
+        adapter.submit_group_store("g20", ("r1",), store_step)
+        adapter.drain_stores()
+        assert transport.store_keys
+        for key in transport.store_keys:
+            assert (key.worker_id, key.world_size) == (3, 8)
+
+        load_request = _request("r2", load_prefix_end=TOKENS, tokens=tokens)
+        load_step = _step(load_request)
+        adapter.schedule_group_retrieves("g20", ("r2",), load_step)
+        adapter.wait_group("g20", ("r2",), load_step, stream=None)
+        assert transport.retrieve_keys
+        for key in transport.retrieve_keys:
+            assert (key.worker_id, key.world_size) == (3, 8)
+    finally:
+        adapter.close()
+
+
+def test_default_adapter_keeps_the_tp1_worker_key():
+    """TP=1 regression: the worker key is already single rank and unchanged."""
+    server = _FakeServer()
+    transport = _KeyRecordingTransport(FakeTransport(server))
+    adapter = _make_adapter(transport)
+    try:
+        store_request = _request(
+            "r1",
+            load_prefix_end=0,
+            store_prefix_end=TOKENS,
+            tokens=_token_bytes(TOKENS),
+        )
+        step = _step(store_request)
+        adapter.submit_group_store("g20", ("r1",), step)
+        adapter.drain_stores()
+        assert transport.store_keys
+        for key in transport.store_keys:
+            assert (key.worker_id, key.world_size) == (0, WORLD)
+    finally:
+        adapter.close()
 
 
 def test_store_failure_is_dropped_not_committed():

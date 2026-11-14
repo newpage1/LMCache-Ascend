@@ -18,9 +18,14 @@ This module owns the data plane of the v2 design:
   ``take_failed_receiving`` reports the stock connector consumes.
 
 The adapter never invents cache identity: every resource spec carries the
-request's ``IPCCacheServerKey`` and the resource id from the registered plan.
-``resource_blocks_v1`` is engine neutral; the concrete schema-2 boundary
-envelope lives in :mod:`lmcache_ascend.integration.vllm.dsv41_lw_v2.boundary`.
+request's ``IPCCacheServerKey`` pinned to this worker's ``(world_size,
+worker_id)`` and the resource id from the registered plan.  The pin matters:
+the stock server writes one object key per rank of the key, but records
+completeness per rank and only lets a single-rank key retrieve; a worker-less
+lookup key passed straight through would fan a store out under a key no
+retrieve can address.  ``resource_blocks_v1`` is engine neutral; the concrete
+schema-2 boundary envelope lives in
+:mod:`lmcache_ascend.integration.vllm.dsv41_lw_v2.boundary`.
 
 Completion semantics (``docs/v2-api-contract.md`` section 4):
 
@@ -39,7 +44,7 @@ from __future__ import annotations
 # Standard
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, runtime_checkable
 import json
 import queue
@@ -1523,6 +1528,37 @@ class DSV41LwV2GroupAdapter:
             planes=staged.planes,
         )
 
+    def _spec_stock_key(self, stock_key: IPCCacheServerKey) -> IPCCacheServerKey:
+        """Return the single-rank view of a step's stock key.
+
+        A step may carry a lookup-shaped key (``worker_id=None``).  The
+        resource-block transport addresses exactly one KV rank: the store
+        writes that rank's object key and the retrieve reads it back, which
+        the server rejects for a fanout key.  Pin the key to this adapter's
+        own identity so a store is written and accounted for by this worker
+        and can later be retrieved under a stock read lock.
+
+        Args:
+            stock_key: The key built by the connector for this request.
+
+        Returns:
+            The same key when the adapter has no worker id or the key already
+            carries this worker's identity, otherwise a copy pinned to
+            ``(self._world_size, self._worker_id)``.
+        """
+        if self._worker_id is None:
+            return stock_key
+        if (
+            stock_key.worker_id == self._worker_id
+            and int(stock_key.world_size) == self._world_size
+        ):
+            return stock_key
+        return replace(
+            stock_key,
+            world_size=self._world_size,
+            worker_id=self._worker_id,
+        )
+
     def _spec(
         self,
         *,
@@ -1558,7 +1594,7 @@ class DSV41LwV2GroupAdapter:
             server_generation=self._server_generation,
             plan_hash=self._plan_hash,
             layout_hash=self._layout_hash,
-            stock_key=request.stock_key,
+            stock_key=self._spec_stock_key(request.stock_key),
             resource_id=resource_id,
             engine_group_id=engine_group_id,
             block_ids=blocks,
