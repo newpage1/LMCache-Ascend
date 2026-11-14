@@ -52,6 +52,12 @@ class _StubConnector:
         self.role = role
         self.kv_cache_config = kv_cache_config
         self._connector_metadata = None
+        self.kv_caches = {}
+
+    def register_kv_caches(self, kv_caches) -> None:
+        # The stock base registers layouts with the LMCache server; the
+        # CPU stub only records the caches the v2 factory reads back.
+        self.kv_caches = dict(kv_caches)
         _StubConnector.instances.append(self)
 
 

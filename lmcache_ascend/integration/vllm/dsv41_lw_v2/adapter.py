@@ -239,18 +239,52 @@ class ResourceBlockTransport(Protocol):
     ) -> Future: ...
 
 
+_RESOURCE_BLOCK_CLIENT_METHODS = (
+    "register_resource_blocks",
+    "store_resource_block",
+    "retrieve_resource_block",
+    "lookup_resource_blocks",
+)
+
+
 class MPResourceBlockTransport:
     """``ResourceBlockTransport`` over the stock multiprocess request client.
 
+    The stock worker owns a typed ``RequestClient``
+    (``ZmqMultiprocessClient``): the resource-block methods are generated from
+    the ``@rpc_method`` declarations, so the generated client has no
+    ``submit_request``. Older/generic clients only expose
+    ``submit_request(operation, payloads)``. Both are accepted; the typed
+    methods are preferred when all four are present.
+
     Args:
-        client: Object exposing ``submit_request(operation, payloads)``.
+        client: Stock multiprocess request client.
         timeout: Blocking timeout for the registration acknowledgement.
     """
 
     def __init__(self, client: Any, *, timeout: float = 30.0) -> None:
-        if not hasattr(client, "submit_request"):
-            raise TypeError("client must expose submit_request()")
+        typed = [
+            method
+            for method in _RESOURCE_BLOCK_CLIENT_METHODS
+            if callable(getattr(client, method, None))
+        ]
+        has_submit = callable(getattr(client, "submit_request", None))
+        if typed and len(typed) != len(_RESOURCE_BLOCK_CLIENT_METHODS):
+            missing = sorted(
+                set(_RESOURCE_BLOCK_CLIENT_METHODS) - set(typed)
+            )
+            raise TypeError(
+                "request client has a partial resource-block interface; "
+                f"missing {missing!r}"
+            )
+        if not typed and not has_submit:
+            raise TypeError(
+                "client must expose the typed resource-block RPCs "
+                f"{list(_RESOURCE_BLOCK_CLIENT_METHODS)!r} "
+                "(stock RequestClient) or submit_request(operation, payloads)"
+            )
         self._client = client
+        self._typed = bool(typed)
         self._timeout = float(timeout)
 
     def _submit(self, operation: str, *payloads: Any) -> Future:
@@ -259,23 +293,31 @@ class MPResourceBlockTransport:
     def register_resource_blocks(
         self, registration: ResourceBlockRegistration
     ) -> Future:
+        if self._typed:
+            return self._client.register_resource_blocks(registration)
         return self._submit("register_resource_blocks", registration)
 
     def store_resource_block(
         self, spec: ResourceBlockSpec, payload: bytes
     ) -> Future:
+        if self._typed:
+            return self._client.store_resource_block(spec, payload)
         return self._submit("store_resource_block", spec, payload)
 
     def retrieve_resource_block(self, spec: ResourceBlockSpec) -> Future:
+        if self._typed:
+            return self._client.retrieve_resource_block(spec)
         return self._submit("retrieve_resource_block", spec)
 
     def lookup_resource_blocks(
         self, registration_epoch: int, stock_key: IPCCacheServerKey, limit: int
     ) -> Future:
-        return self._submit(
-            "lookup_resource_blocks",
-            resource_block_lookup_request(registration_epoch, stock_key, limit),
+        request = resource_block_lookup_request(
+            registration_epoch, stock_key, limit
         )
+        if self._typed:
+            return self._client.lookup_resource_blocks(request)
+        return self._submit("lookup_resource_blocks", request)
 
 
 class _ResourceBlockLookupRequest(msgspec.Struct, frozen=True):

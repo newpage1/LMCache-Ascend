@@ -72,6 +72,12 @@ DSV41_LW_V2_INCOMPATIBLE_FLAGS = (
     "lmcache.mp.transfer_intermediate_tensors",
 )
 
+#: Sentinel meaning "use the production adapter factory from
+#: :mod:`lmcache_ascend.integration.vllm.dsv41_lw_v2.production`. It is
+#: resolved lazily so importing the connector does not import torch/msgspec
+#: data-plane modules on the scheduler.
+_USE_DEFAULT_ADAPTER_FACTORY = object()
+
 _LOAD = "load"
 _STORE = "store"
 _DIRECTIONS = (_LOAD, _STORE)
@@ -707,7 +713,7 @@ class DSV41LwV2Connector(LMCacheMPConnector):
         self._lw_v2_current_step: StepView | None = None
         self._lw_v2_step_noted = False
         self._lw_v2_boundary_codec: Any = None
-        self._lw_v2_adapter_factory: Any = None
+        self._lw_v2_adapter_factory: Any = _USE_DEFAULT_ADAPTER_FACTORY
 
     # ------------------------------------------------------------------
     # Wiring seams (T4 builds the adapter on registration, T3 the boundary)
@@ -792,10 +798,13 @@ class DSV41LwV2Connector(LMCacheMPConnector):
         self._lw_v2_boundary_codec = codec
 
     def bind_adapter_factory(self, factory: Any) -> None:
-        """Bind the factory that builds the group adapter on registration.
+        """Override the factory that builds the group adapter on registration.
 
-        Signature: ``factory(plan, connector) -> DSV41LwV2Adapter``. It is
-        optional so tests and the engine seam can bind a prebuilt adapter.
+        Signature: ``factory(plan, connector) -> DSV41LwV2Adapter``. The
+        production factory is installed by default; passing ``None`` disables
+        it explicitly, which makes ``register_kv_caches`` fail closed instead
+        of silently falling back to stock full-tensor behavior. Tests that
+        bind a prebuilt adapter directly do not need this seam.
         """
         if factory is not None and not callable(factory):
             raise DSV41LwV2ConfigError("adapter factory must be callable")
@@ -817,20 +826,40 @@ class DSV41LwV2Connector(LMCacheMPConnector):
         are available before ``initialize_kv_cache`` installs the engine seam
         (the engine reads ``current_step``/``boundary_codec`` from here).
 
-        Without a factory the connector stays explicit ``NotReady`` on a real
-        hit instead of silently falling back to the stock full-tensor path.
+        The production factory is the default. A missing dependency (no
+        worker adapter, no registered caches, no multiprocess request client,
+        no chunk geometry, no grouped plan) raises ``NotReady`` naming the
+        dependency: the connector never silently falls back to the stock
+        full-tensor path.
         """
         super().register_kv_caches(kv_caches)
-        factory = self._lw_v2_adapter_factory
-        if factory is None or self.adapter is not None:
+        if self.adapter is not None:
+            # Repeated stock registration (heartbeats) is idempotent: the
+            # adapter and its single codec are built exactly once.
             return
+        # First Party
+        from lmcache_ascend.integration.vllm.dsv41_lw_v2 import production
+
+        factory = self._lw_v2_adapter_factory
+        if factory is _USE_DEFAULT_ADAPTER_FACTORY:
+            factory = production.DEFAULT_ADAPTER_FACTORY
+        if factory is None:
+            raise DSV41LwV2NotReadyError(
+                "no layerwise v2 adapter factory is bound; refusing to fall "
+                "back to the stock full-tensor transfer path"
+            )
         plan = self._lw_v2_plan
         if plan is None:
-            raise DSV41LwV2ConfigError(
-                "an adapter factory requires a grouped plan bound before "
-                "register_kv_caches"
-            )
-        adapter = factory(plan, self)
+            plan = self._build_plan_from_registration()
+            self.bind_plan(plan)
+        try:
+            adapter = factory(plan, self)
+        except production.DSV41LwV2ProductionUnavailable as exc:
+            raise DSV41LwV2NotReadyError(
+                "the layerwise v2 adapter cannot be built: "
+                f"{exc.dependency} is unavailable ({exc}); bind the missing "
+                "dependency before registering KV caches"
+            ) from exc
         self.bind_adapter(adapter)
         if self._lw_v2_boundary_codec is not None:
             return
@@ -842,6 +871,36 @@ class DSV41LwV2Connector(LMCacheMPConnector):
         )
 
         install_dsv41_lw_v2_boundary_codec(self, adapter=adapter)
+
+    def _build_plan_from_registration(self) -> GroupedTransferPlan:
+        """Derive the grouped plan from this worker's stock registration."""
+        # First Party
+        from lmcache_ascend.integration.vllm.dsv41_lw_v2 import production
+
+        worker_adapter = getattr(self, "worker_adapter", None)
+        if worker_adapter is None:
+            raise DSV41LwV2NotReadyError(
+                "cannot derive the grouped plan: worker_adapter is not "
+                "initialized (the scheduler role does not register caches)"
+            )
+        kv_caches = getattr(worker_adapter, "kv_caches", None)
+        if not kv_caches:
+            raise DSV41LwV2NotReadyError(
+                "cannot derive the grouped plan: worker_adapter.kv_caches is "
+                "empty after stock registration"
+            )
+        engine_group_infos = (
+            getattr(worker_adapter, "engine_group_infos", None) or ()
+        )
+        try:
+            return production.build_grouped_plan_from_registration(
+                kv_caches, engine_group_infos
+            )
+        except production.DSV41LwV2ProductionUnavailable as exc:
+            raise DSV41LwV2NotReadyError(
+                f"cannot derive the grouped plan: {exc.dependency} is "
+                f"unavailable ({exc})"
+            ) from exc
 
     @property
     def metrics(self) -> dict[str, int]:
