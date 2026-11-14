@@ -287,7 +287,9 @@ class DSV41LwV2Adapter(Protocol):
 
     def drain_stores(self) -> None: ...
 
-    def take_finished(self) -> tuple[set[str], set[str]]: ...
+    def take_finished(
+        self, *, finished_req_ids: set[str] | None = None
+    ) -> tuple[set[str], set[str]]: ...
 
     def take_failed_receiving(self) -> set[str]: ...
 
@@ -412,9 +414,10 @@ class GroupTransferRouter:
             step.registration_epoch != self._registration_epoch
             or step.server_generation != self._server_generation
         ):
-            self._clear_stale_ops()
-            self._registration_epoch = step.registration_epoch
-            self._server_generation = step.server_generation
+            self.set_generations(
+                registration_epoch=step.registration_epoch,
+                server_generation=step.server_generation,
+            )
         # A new step supersedes any unfinished routing state; terminal
         # operation state itself lives in the adapter.
         self.finish_step()
@@ -453,6 +456,30 @@ class GroupTransferRouter:
                     group.group_id, load_ids, step
                 )
                 self._counters["group_load_scheduled"] += 1
+
+    def set_generations(
+        self, *, registration_epoch: int, server_generation: int
+    ) -> None:
+        """Advance the generation and drop every pending op immediately.
+
+        The drop must not wait for the next ``note_step``: ``flush_step`` (run
+        by the next ``start_load_kv``) would otherwise close the previous step
+        first and the stale request ids would never reach the adapter.
+        """
+        registration_epoch = _non_negative_int(
+            registration_epoch, "registration_epoch"
+        )
+        server_generation = _non_negative_int(
+            server_generation, "server_generation"
+        )
+        if (
+            registration_epoch == self._registration_epoch
+            and server_generation == self._server_generation
+        ):
+            return
+        self._clear_stale_ops()
+        self._registration_epoch = registration_epoch
+        self._server_generation = server_generation
 
     def _clear_stale_ops(self) -> None:
         stale = [
@@ -583,14 +610,32 @@ class GroupTransferRouter:
 
 
     def wait_for_save(self) -> None:
-        """Submit every pending store, then drain whatever is outstanding."""
+        """Drain stores submitted by the previous forward, keep this step.
+
+        vLLM calls ``wait_for_save`` *before* the forward that
+        ``start_load_kv`` just prepared (it waits for the previous step's
+        saves).  Finishing the routing step here would erase the live
+        per-group ops before the post-forward boundary capture/group store
+        hooks run, which is exactly the t13 F5 failure.  The step therefore
+        stays alive until the next ``start_load_kv`` (or ``get_finished``).
+        """
+        self.drain_pending_stores()
+
+    def flush_step(self) -> None:
+        """Close the current step after its forward and store submission."""
+        if self._step is None:
+            return
         for group in self._plan.groups:
             self.submit_group_store(group.group_id)
+        self.drain_pending_stores()
+        self.finish_step()
+
+    def drain_pending_stores(self) -> None:
+        """Drain already-submitted store batches without touching step ops."""
         if self._adapter is not None and self._pending_stores > 0:
             self._adapter.drain_stores()
             self._pending_stores = 0
             self._counters["group_store_drained"] += 1
-        self.finish_step()
 
     def finish_step(self) -> None:
         self._ops.clear()
@@ -939,13 +984,21 @@ class DSV41LwV2Connector(LMCacheMPConnector):
     def start_load_kv(self, forward_context: Any, **kwargs: Any) -> None:
         """Queue one retrieve per group; never wait and never copy inline."""
         router = self._require_router()
+        # The previous forward's captures already happened; submit any store
+        # it did not hand off and drain those batches before blocks are
+        # reused.  This is the "wait for the previous step's saves" point.
+        router.flush_step()
         metadata = getattr(self, "_connector_metadata", None)
         if metadata is None:
             return
-        self._lw_v2_step_noted = True
         step = self._build_step_view(metadata)
         if step is None:
+            # No retrieves and no stores: there is no live v2 step, so no
+            # boundary may be captured or restored for it.
+            self._lw_v2_step_noted = False
+            self._lw_v2_current_step = None
             return
+        self._lw_v2_step_noted = True
         self._lw_v2_current_step = step
         router.note_step(step)
 
@@ -973,13 +1026,14 @@ class DSV41LwV2Connector(LMCacheMPConnector):
         self.submit_group_store(group.group_id)
 
     def wait_for_save(self) -> None:
-        """Submit pending group stores and drain them; the only store wait."""
+        """Wait for the previous forward's saves, keeping the live step.
+
+        The current step's captures/submits happen later in the forward; this
+        hook must not submit or finish them (see ``GroupTransferRouter.
+        wait_for_save``).
+        """
         router = self._require_router()
-        if not self._lw_v2_step_noted:
-            self.start_load_kv(None)
         router.wait_for_save()
-        self._lw_v2_step_noted = False
-        self._lw_v2_current_step = None
 
     def get_finished(
         self, finished_req_ids: set[str]
@@ -992,11 +1046,23 @@ class DSV41LwV2Connector(LMCacheMPConnector):
         merged ``(finished_sending, finished_receiving)`` pair keeps the stock
         scheduler's request lifecycle intact.
         """
+        router = self._lw_v2_router
+        if router is not None and router.current_step is not None:
+            # The forward and its post-forward captures are done: hand off any
+            # remaining group stores and drain them before reporting terminal
+            # requests.  This is the only point where the routing step closes.
+            router.flush_step()
+        self._lw_v2_step_noted = False
+        self._lw_v2_current_step = None
         sending, receiving = super().get_finished(finished_req_ids)
         adapter = self.adapter
         if adapter is None:
             return sending, receiving
-        v2_sending, v2_receiving = adapter.take_finished()
+        # Stock contract: a finished id may only be reported when the request
+        # finished (this call or a prior one); the adapter keeps the rest.
+        v2_sending, v2_receiving = adapter.take_finished(
+            finished_req_ids=finished_req_ids
+        )
         return (
             _merge_id_sets(sending, v2_sending),
             _merge_id_sets(receiving, v2_receiving),
@@ -1179,15 +1245,24 @@ class DSV41LwV2Connector(LMCacheMPConnector):
     ) -> None:
         """Advance the registration/generation identity of the worker.
 
-        The router notices the change on the next step and clears stale group
-        operations (reporting them as dropped) before scheduling new ones.
+        Pending group operations of the retired generation are dropped right
+        away (reported as ``generation_changed``) instead of waiting for the
+        next step, then the adapter's own generation is advanced.
         """
-        self._lw_v2_registration_epoch = _non_negative_int(
+        registration_epoch = _non_negative_int(
             registration_epoch, "registration_epoch"
         )
-        self._lw_v2_server_generation = _non_negative_int(
+        server_generation = _non_negative_int(
             server_generation, "server_generation"
         )
+        router = self._lw_v2_router
+        if router is not None:
+            router.set_generations(
+                registration_epoch=registration_epoch,
+                server_generation=server_generation,
+            )
+        self._lw_v2_registration_epoch = registration_epoch
+        self._lw_v2_server_generation = server_generation
         adapter = self.adapter
         setter = getattr(adapter, "set_generations", None)
         if callable(setter):

@@ -49,12 +49,21 @@ import time
 import uuid
 
 # Third Party
-import msgspec
 import torch
 
 # First Party
+from lmcache.v1.multiprocess import resource_block_protocol as _wire
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.layerwise import CacheTransferResource
+from lmcache.v1.multiprocess.resource_block_protocol import (
+    ResourceBlockAck,
+    ResourceBlockLayout,
+    ResourceBlockLookupRequest,
+    ResourceBlockLookupResult,
+    ResourceBlockRegistration,
+    ResourceBlockResult,
+    ResourceBlockSpec,
+)
 from lmcache_ascend.integration.vllm.dsv41_lw_v2.plan import (
     GroupedTransferPlan,
     TransferGroup,
@@ -69,36 +78,32 @@ from lmcache_ascend.integration.vllm.dsv41_lw_v2.connector import (
 # Protocol constants
 # ---------------------------------------------------------------------------
 
-RESOURCE_BLOCK_PROTOCOL_VERSION = 1
-RESOURCE_BLOCK_LAYOUT_ENCODINGS = ("token_range_v1", "boundary_schema2")
-REQUIRED_CAPABILITIES = (
-    "resource_blocks_v1",
-    "stock_prefix_visibility_v1",
-    "boundary_schema2",
-)
+RESOURCE_BLOCK_PROTOCOL_VERSION = _wire.RESOURCE_BLOCK_PROTOCOL_VERSION
+RESOURCE_BLOCK_LAYOUT_ENCODINGS = _wire.RESOURCE_BLOCK_ENCODINGS
+REQUIRED_CAPABILITIES = _wire.RESOURCE_BLOCK_CAPABILITIES
 
-TOKEN_PAYLOAD_MAGIC = b"DSV2TR1\n"
-BOUNDARY_PAYLOAD_MAGIC = b"DSV2BC1\n"
+TOKEN_PAYLOAD_MAGIC = _wire.TOKEN_PAYLOAD_MAGIC
+BOUNDARY_PAYLOAD_MAGIC = _wire.BOUNDARY_PAYLOAD_MAGIC
 
-STATUS_OK = "ok"
-STATUS_MISS = "miss"
-STATUS_INVALID = "invalid"
-STATUS_FAILED = "failed"
+STATUS_OK = _wire.STATUS_OK
+STATUS_MISS = _wire.STATUS_MISS
+STATUS_INVALID = _wire.STATUS_INVALID
+STATUS_FAILED = _wire.STATUS_FAILED
 
-ALREADY_PRESENT = "ALREADY_PRESENT"
-RESOURCE_MISSING = "RESOURCE_MISSING"
-PREFIX_INCOMPLETE = "PREFIX_INCOMPLETE"
-INVALID_SPEC = "INVALID_SPEC"
-STALE_EPOCH = "STALE_EPOCH"
-STALE_GENERATION = "STALE_GENERATION"
-LAYOUT_MISMATCH = "LAYOUT_MISMATCH"
-PLAN_MISMATCH = "PLAN_MISMATCH"
-UNSUPPORTED_BOUNDARY_SCHEMA = "UNSUPPORTED_BOUNDARY_SCHEMA"
-PAYLOAD_CORRUPT = "PAYLOAD_CORRUPT"
-IO_ERROR = "IO_ERROR"
+ALREADY_PRESENT = _wire.ERROR_ALREADY_PRESENT
+RESOURCE_MISSING = _wire.ERROR_RESOURCE_MISSING
+PREFIX_INCOMPLETE = _wire.ERROR_PREFIX_INCOMPLETE
+INVALID_SPEC = _wire.ERROR_INVALID_SPEC
+STALE_EPOCH = _wire.ERROR_STALE_EPOCH
+STALE_GENERATION = _wire.ERROR_STALE_GENERATION
+LAYOUT_MISMATCH = _wire.ERROR_LAYOUT_MISMATCH
+PLAN_MISMATCH = _wire.ERROR_PLAN_MISMATCH
+UNSUPPORTED_BOUNDARY_SCHEMA = _wire.ERROR_UNSUPPORTED_BOUNDARY_SCHEMA
+PAYLOAD_CORRUPT = _wire.ERROR_PAYLOAD_CORRUPT
+IO_ERROR = _wire.ERROR_IO_ERROR
 QUEUE_FULL = "QUEUE_FULL"
-CANCELLED = "CANCELLED"
-TIMEOUT = "TIMEOUT"
+CANCELLED = _wire.ERROR_CANCELLED
+TIMEOUT = _wire.ERROR_TIMEOUT
 INTERNAL_ERROR = "INTERNAL_ERROR"
 
 _LOAD = "load"
@@ -106,120 +111,10 @@ _STORE = "store"
 _TERMINAL_EVENT_STATUSES = ("ok", "drop", "timeout", "failed")
 
 
-# ---------------------------------------------------------------------------
-# Neutral wire DTOs (resource_blocks_v1)
-# ---------------------------------------------------------------------------
-
-
-class ResourceBlockLayout(msgspec.Struct, frozen=True):
-    """Registered geometry of one transferable resource.
-
-    Attributes:
-        resource_id: Plan resource id (cache name for the engine side).
-        cache_name: Engine cache name the resource resolves to.
-        dtype: Torch dtype string of one element (for example ``float32``).
-        shape: Per-block element shape of one resource payload plane.
-        strides: Element strides of one payload plane (row-major).
-        max_payload_bytes: Hard upper bound of one resource payload.
-        encoding: ``token_range_v1`` or ``boundary_schema2``.
-    """
-
-    resource_id: str
-    cache_name: str
-    dtype: str
-    shape: tuple[int, ...]
-    strides: tuple[int, ...]
-    max_payload_bytes: int
-    encoding: str
-
-
-class ResourceBlockRegistration(msgspec.Struct, frozen=True):
-    """Worker registration for engine-neutral resource blocks."""
-
-    protocol_version: int
-    instance_id: str
-    model_name: str
-    world_size: int
-    worker_id: int | None
-    plan_hash: str
-    layout_hash: str
-    registration_epoch: int
-    resources: tuple[CacheTransferResource, ...]
-    layouts: tuple[ResourceBlockLayout, ...]
-
-
-class ResourceBlockAck(msgspec.Struct, frozen=True):
-    """Server acknowledgement of one resource-block registration."""
-
-    instance_id: str
-    registration_epoch: int
-    plan_hash: str
-    layout_hash: str
-    server_generation: int
-    capabilities: tuple[str, ...]
-
-
-class ResourceBlockSpec(msgspec.Struct, frozen=True):
-    """One resource block store/retrieve request.
-
-    ``stock_key`` is the request's stock cache identity; the server derives
-    the chunk hashes from it, so a suffix can never decide the identity of a
-    shared prefix.
-    """
-
-    operation_id: str
-    direction: str
-    instance_id: str
-    request_id: str
-    step_id: int
-    registration_epoch: int
-    server_generation: int
-    plan_hash: str
-    layout_hash: str
-    stock_key: IPCCacheServerKey
-    resource_id: str
-    engine_group_id: int | None
-    block_ids: tuple[int, ...]
-    start_token: int
-    end_token: int
-    prefix_end: int
-    skip_first_n_tokens: int
-    boundary: Any = None
-
-
-class ResourceBlockResult(msgspec.Struct, frozen=True):
-    """Echoed terminal result of one resource block operation."""
-
-    operation_id: str
-    direction: str
-    resource_id: str
-    registration_epoch: int
-    server_generation: int
-    status: str
-    error_code: str = ""
-
-    @property
-    def ok(self) -> bool:
-        return self.status == STATUS_OK
-
-
-class ResourceBlockLookupResult(msgspec.Struct, frozen=True):
-    """Derived prefix visibility of one resource-block namespace.
-
-    Attributes:
-        prefix_end: Longest chunk-aligned prefix that has every token-range
-            resource committed for every kv rank, capped by the boundary
-            terminal endpoint when the namespace has boundaries.
-        token_prefix_end: Longest prefix with complete token-range resources.
-        boundary_prefix_end: Longest complete boundary endpoint (0 without
-            boundary resources).
-    """
-
-    prefix_end: int
-    token_prefix_end: int
-    boundary_prefix_end: int
-
-
+# The wire DTOs are the server contract dataclasses themselves.  A typed RPC
+# client decodes an ack/result into ``lmcache.v1.multiprocess.
+# resource_block_protocol`` instances, so ``isinstance`` checks in this module
+# must see exactly those classes instead of a private copy.
 @runtime_checkable
 class ResourceBlockTransport(Protocol):
     """Client side of the engine-neutral resource-block RPCs."""
@@ -320,21 +215,11 @@ class MPResourceBlockTransport:
         return self._submit("lookup_resource_blocks", request)
 
 
-class _ResourceBlockLookupRequest(msgspec.Struct, frozen=True):
-    registration_epoch: int
-    stock_key: IPCCacheServerKey
-    limit: int
-
-
 def resource_block_lookup_request(
     registration_epoch: int, stock_key: IPCCacheServerKey, limit: int
-) -> Any:
-    """Build the wire payload of ``lookup_resource_blocks``.
-
-    Kept as a public helper so the server module and clients share one type
-    without importing each other.
-    """
-    return _ResourceBlockLookupRequest(
+) -> ResourceBlockLookupRequest:
+    """Build the wire payload of ``lookup_resource_blocks``."""
+    return ResourceBlockLookupRequest(
         registration_epoch=int(registration_epoch),
         stock_key=stock_key,
         limit=int(limit),
@@ -974,13 +859,29 @@ class DSV41LwV2GroupAdapter:
         """Drop every non-terminal operation of the previous generation."""
         self._drop_where(lambda key: True, reason=reason, counter="stale_ops_cleared")
 
-    def take_finished(self) -> tuple[set[str], set[str]]:
-        """Return request ids whose receiving/sending direction is settled."""
+    def take_finished(
+        self, *, finished_req_ids: set[str] | None = None
+    ) -> tuple[set[str], set[str]]:
+        """Return terminal ids, keeping those the scheduler has not finished.
+
+        The stock connector may only report ``finished_sending`` /
+        ``finished_receiving`` for requests in the scheduler's finished set; a
+        request whose stores completed earlier must stay queued until vLLM
+        really finishes it.  ``None`` keeps the legacy drain-everything
+        behaviour for internal callers.
+        """
+        requested = None if finished_req_ids is None else set(finished_req_ids)
         with self._lock:
-            finished_receiving = set(self._receiving_ready)
-            self._receiving_ready.clear()
-            finished_sending = set(self._sending_ready)
-            self._sending_ready.clear()
+            if requested is None:
+                finished_receiving = set(self._receiving_ready)
+                self._receiving_ready.clear()
+                finished_sending = set(self._sending_ready)
+                self._sending_ready.clear()
+            else:
+                finished_receiving = self._receiving_ready & requested
+                self._receiving_ready -= finished_receiving
+                finished_sending = self._sending_ready & requested
+                self._sending_ready -= finished_sending
             self._counters["requests_finished_sending"] += len(
                 finished_sending
             )

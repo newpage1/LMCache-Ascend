@@ -599,6 +599,10 @@ def create_production_adapter(
             registration_epoch=adapter.registration_epoch,
             server_generation=ack.server_generation,
         )
+    # Cold STORE steps build their stock key on the worker before any
+    # scheduler lookup exists.  Reuse the worker adapter's own key
+    # constructor so the store key is byte-for-byte the stock lookup key.
+    connector.bind_stock_key_factory(worker_adapter._create_key)
     return adapter
 
 

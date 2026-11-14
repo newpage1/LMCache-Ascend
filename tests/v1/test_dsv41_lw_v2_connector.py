@@ -347,11 +347,20 @@ class RecordingAdapter:
     def drain_stores(self):
         self.drain_count += 1
 
-    def take_finished(self):
-        sending = set(self.finished_sending)
-        receiving = set(self.finished_receiving)
-        self.finished_sending.clear()
-        self.finished_receiving.clear()
+    def take_finished(self, *, finished_req_ids=None):
+        requested = (
+            None if finished_req_ids is None else set(finished_req_ids)
+        )
+        if requested is None:
+            sending = set(self.finished_sending)
+            receiving = set(self.finished_receiving)
+            self.finished_sending.clear()
+            self.finished_receiving.clear()
+        else:
+            sending = self.finished_sending & requested
+            receiving = self.finished_receiving & requested
+            self.finished_sending -= sending
+            self.finished_receiving -= receiving
         return sending, receiving
 
     def take_failed_receiving(self):
@@ -735,22 +744,65 @@ def test_store_only_step_captures_and_submits_per_group():
     assert connector.metrics["group_store_drained"] == 1
 
 
-def test_wait_for_save_submits_pending_stores_and_drains():
-    connector, adapter, _hook = _bound()
+def test_wait_for_save_drains_previous_stores_and_keeps_the_live_step():
+    connector, adapter, hook = _bound()
     connector._connector_metadata = _metadata(_store(end=2048))
     connector.start_load_kv(None)
     connector.save_kv_layer(_layer(8), None, None)
+    live_step = connector.current_step
+    assert live_step is not None
 
+    # vLLM calls wait_for_save before the forward this step prepared: it may
+    # drain the store submitted by an earlier forward, but must not submit or
+    # finish the live step (t13 F5).
     connector.wait_for_save()
-    assert ("g8", ("r1",)) in adapter.stores
-    assert ("g2", ("r1",)) in adapter.stores
+    assert adapter.stores == [("g8", ("r1",))]
     assert adapter.drain_count == 1
+    assert connector.current_step is live_step
+    assert connector._lw_v2_step_noted is True
 
-    # Nothing pending on the next save hook: no duplicate drain.
+    # The post-forward capture of another group must still see its ops.
+    connector.save_kv_layer(_layer(2), None, None)
+    assert ("g2", ("r1",)) in adapter.stores
+    assert hook.calls == [("capture", "g8"), ("capture", "g2")]
+
+    # The next start_load_kv closes the previous step and hands off the rest.
     connector._connector_metadata = _metadata()
     connector.start_load_kv(None)
+    for group_id in ("g14", "g20"):
+        assert (group_id, ("r1",)) in adapter.stores
+    assert connector.current_step is None
+
+
+def test_capture_precedes_submit_and_wait_for_save_keeps_ops():
+    connector, adapter, hook = _bound()
+    connector._connector_metadata = _metadata(_store(end=2048))
+    connector.start_load_kv(None)
+
+    # Post-forward per head: capture, then submit (never submit first).
+    connector.save_kv_layer(_layer(2), None, None)
+    assert hook.calls == [("capture", "g2")]
+    assert adapter.stores == [("g2", ("r1",))]
+
+    # vLLM's pre-forward wait_for_save runs before the next forward; it must
+    # not erase g8/g14/g20's ops, otherwise their captures see has_ops=False.
     connector.wait_for_save()
-    assert adapter.drain_count == 1
+    connector.save_kv_layer(_layer(8), None, None)
+    connector.save_kv_layer(_layer(14), None, None)
+    assert hook.calls == [
+        ("capture", "g2"),
+        ("capture", "g8"),
+        ("capture", "g14"),
+    ]
+    assert adapter.stores == [
+        ("g2", ("r1",)),
+        ("g8", ("r1",)),
+        ("g14", ("r1",)),
+    ]
+
+    # Reporting finished requests closes the step and hands off g20.
+    connector.get_finished({"r1"})
+    assert ("g20", ("r1",)) in adapter.stores
 
 
 def test_no_hit_decode_step_is_a_complete_noop():
@@ -1026,11 +1078,33 @@ def test_get_finished_merges_stock_and_adapter_terminal_sets():
     adapter.finished_sending.update({"v2-send"})
     adapter.finished_receiving.update({"v2-recv"})
 
-    sending, receiving = connector.get_finished({"ignored"})
+    sending, receiving = connector.get_finished(
+        {"stock-send", "stock-recv", "v2-send", "v2-recv"}
+    )
 
     assert sending == {"stock-send", "v2-send"}
     assert receiving == {"stock-recv", "v2-recv"}
     # ``take_finished`` drains the adapter half; the stock sets stay visible.
+    assert adapter.finished_sending == set()
+    assert adapter.finished_receiving == set()
+
+
+def test_get_finished_defers_terminal_ids_for_unfinished_requests():
+    connector, adapter, _ = _bound()
+    adapter.finished_sending.add("later")
+    adapter.finished_receiving.add("later-recv")
+
+    # Store completion is not the same as request completion: vLLM frees
+    # blocks on finished_sending and asserts the request is finished, so an
+    # id outside the finished set stays queued in the adapter.
+    sending, receiving = connector.get_finished({"other"})
+    assert sending == set() and receiving == set()
+    assert adapter.finished_sending == {"later"}
+    assert adapter.finished_receiving == {"later-recv"}
+
+    sending, receiving = connector.get_finished({"later", "later-recv"})
+    assert sending == {"later"}
+    assert receiving == {"later-recv"}
     assert adapter.finished_sending == set()
     assert adapter.finished_receiving == set()
 

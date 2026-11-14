@@ -18,6 +18,7 @@ from __future__ import annotations
 from concurrent.futures import Future
 from pathlib import Path
 import importlib.util
+import struct
 import subprocess
 import sys
 import types
@@ -246,6 +247,7 @@ class FakeTypedRequestClient:
 class _ParallelStrategy:
     def __init__(self, worker_id=0) -> None:
         self.kv_worker_id = worker_id
+        self.num_kv_readers = 1
 
 
 class FakeWorkerAdapter:
@@ -273,6 +275,32 @@ class FakeWorkerAdapter:
         self.lmcache_tokens_per_chunk = chunk_size
         self.blocks_in_chunk = blocks_in_chunk
         self.parallel_strategy = _ParallelStrategy()
+
+    def _create_key(
+        self,
+        token_bytes,
+        start,
+        end,
+        request_id,
+        cache_salt="",
+        request_configs=None,
+    ):
+        """Stock worker key constructor the production factory must reuse."""
+        # First Party
+        from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
+
+        return IPCCacheServerKey(
+            num_kv_readers=self.parallel_strategy.num_kv_readers,
+            model_name=self.model_name,
+            world_size=self.world_size,
+            worker_id=0,
+            token_bytes=token_bytes,
+            start=start,
+            end=end,
+            request_id=request_id,
+            cache_salt=cache_salt,
+            request_configs=request_configs,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +347,44 @@ def test_default_factory_uses_worker_registration_not_the_argument():
     connector.register_kv_caches({"unrelated": torch.zeros(1)})
     assert connector.adapter is not None
     assert len(connector.adapter.layouts) == 11
+
+
+def test_production_factory_serves_cold_store_with_the_stock_key():
+    worker = FakeWorkerAdapter()
+    connector = _connector(worker)
+    connector.register_kv_caches(worker.kv_caches)
+
+    # A cold STORE has no scheduler lookup to borrow a key from: the worker
+    # must build it with the same constructor the stock lookup uses.
+    metadata = types.SimpleNamespace(
+        synthetic=False,
+        requests=[
+            types.SimpleNamespace(
+                request_id="r1",
+                direction="STORE",
+                cache_salt="",
+                op=types.SimpleNamespace(
+                    start=0,
+                    end=8,
+                    skip_first_n_tokens=0,
+                    token_bytes=struct.pack(">2I", 1, 2),
+                    block_ids=((1, 2),),
+                ),
+            )
+        ],
+    )
+    connector._connector_metadata = metadata
+    connector.start_load_kv(None)
+
+    step = connector.current_step
+    assert step is not None
+    request = step.requests[0]
+    assert request.request_id == "r1"
+    assert request.store_prefix_end == 8
+    assert request.stock_key.model_name == "DeepSeek-V4.1-Flash"
+    assert request.stock_key.request_id == "r1"
+    assert request.stock_key.end == 8
+    assert request.stock_key.token_bytes == struct.pack(">2I", 1, 2)
 
 
 def test_repeated_registration_is_idempotent():

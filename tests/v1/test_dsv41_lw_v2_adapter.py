@@ -53,12 +53,29 @@ class _StubConnector:
         self.kv_cache_config = kv_cache_config
         self._connector_metadata = None
         self.kv_caches = {}
+        self.stock_finished_sending: set[str] = set()
+        self.stock_finished_receiving: set[str] = set()
+        self.stock_failed_recving: set[str] = set()
 
     def register_kv_caches(self, kv_caches) -> None:
         # The stock base registers layouts with the LMCache server; the
         # CPU stub only records the caches the v2 factory reads back.
         self.kv_caches = dict(kv_caches)
         _StubConnector.instances.append(self)
+
+    def get_finished(self, finished_req_ids):
+        return (
+            set(self.stock_finished_sending),
+            set(self.stock_finished_receiving),
+        )
+
+    def get_transfer_results(self, finished_req_ids):
+        sending, receiving = self.get_finished(finished_req_ids)
+        return types.SimpleNamespace(
+            finished_sending=sending,
+            finished_recving=receiving,
+            failed_recving=set(self.stock_failed_recving),
+        )
 
 
 def _install_stock_stub() -> None:
@@ -1063,3 +1080,45 @@ def test_boundary_wrong_prefix_on_restore_is_rejected():
             restore_view, _TensorView(_ring(), (0, 1), 4, 2)
         )
     assert adapter.metrics["boundary_restore_failed"] == 1
+
+
+def test_wire_dtos_are_shared_server_types_and_round_trip():
+    """F1: the adapter must not define its own copies of the wire DTOs.
+
+    A typed ``msgspec`` decode produces the server dataclass; if the adapter
+    declared a second ``ResourceBlockSpec`` the subsequent ``isinstance``
+    check failed with INVALID_SPEC on every real server reply.
+    """
+    # First Party
+    import msgspec
+    from lmcache.v1.multiprocess import resource_block_protocol as wire
+
+    assert adapter_mod.ResourceBlockSpec is wire.ResourceBlockSpec
+    assert adapter_mod.ResourceBlockRegistration is wire.ResourceBlockRegistration
+    assert adapter_mod.ResourceBlockAck is wire.ResourceBlockAck
+
+    spec = adapter_mod.ResourceBlockSpec(
+        operation_id="op-1",
+        direction="load",
+        instance_id="instance-1",
+        request_id="r1",
+        step_id=3,
+        registration_epoch=1,
+        server_generation=2,
+        plan_hash=PLAN_HASH,
+        layout_hash=LAYOUT_HASH,
+        stock_key=_stock_key("r1", _token_bytes(TOKENS)),
+        resource_id=next(iter(PLAN_RESOURCES)),
+        engine_group_id=0,
+        block_ids=(0, 1),
+        start_token=0,
+        end_token=4,
+        prefix_end=4,
+        skip_first_n_tokens=0,
+    )
+    decoded = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(spec), type=wire.ResourceBlockSpec
+    )
+    assert type(decoded) is wire.ResourceBlockSpec
+    assert isinstance(decoded, adapter_mod.ResourceBlockSpec)
+    assert decoded == spec
