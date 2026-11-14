@@ -822,9 +822,14 @@ class DSV41LwV2Connector(LMCacheMPConnector):
         The stock registration derives the edited cache views and registers
         the layer layout with the LMCache server. Once that has happened the
         optional adapter factory builds the group adapter over the edited
-        caches and the connector installs the schema-2 boundary codec, so both
-        are available before ``initialize_kv_cache`` installs the engine seam
-        (the engine reads ``current_step``/``boundary_codec`` from here).
+        caches and the connector installs the schema-2 boundary codec, so a
+        ready engine finds both before the first forward.
+
+        Registration itself does not open a step: ``current_step`` is ``None``
+        here and is filled by each step's ``start_load_kv`` and cleared by
+        ``wait_for_save``. The engine seam therefore reads a step (and the
+        schema-2 ``boundary_codec``, installed at the end of this method) only
+        during the forward phase.
 
         The production factory is the default. A missing dependency (no
         worker adapter, no registered caches, no multiprocess request client,

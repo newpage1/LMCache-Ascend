@@ -57,6 +57,19 @@ DSV41_LW_V2_TOKEN_RANGE_COUNT = 8
 DSV41_LW_V2_BOUNDARY_RESOURCE_COUNT = 3
 DSV41_LW_V2_TRANSFER_RESOURCE_COUNT = 11
 
+#: Consumer segment of each KV source group (inclusive), as full backbone
+#: layer indices. This mirrors
+#: ``vllm_ascend.models.deepseek_v41.topology.DSV41_LW_V2_CONSUMER_SEGMENTS``,
+#: which remains the engine-side source of truth and validates the same table
+#: when it builds the DSV4.1 topology. Keeping a copy here lets the
+#: stock-manifest validator enforce the fixed layout without importing vllm.
+DSV41_LW_V2_CONSUMER_SEGMENTS: tuple[tuple[int, tuple[int, ...]], ...] = (
+    (2, tuple(range(2, 8))),
+    (8, tuple(range(8, 14))),
+    (14, tuple(range(14, 20))),
+    (20, tuple(range(20, DSV41_LW_V2_LAYER_COUNT))),
+)
+
 _LONG_KV_SUFFIX = ".long_kv_cache"
 _INDEX_K_SUFFIX = ".indexer.k_cache"
 _FOLDED_INDEX_SUFFIX = ".indexer.k_cache_folded"
@@ -520,6 +533,14 @@ def _validate_default_dsv41_manifest(
             "DSV4.1 layer_order must cover layers 0.."
             f"{DSV41_LW_V2_LAYER_COUNT - 1} exactly once"
         )
+    layer_by_index = dict(zip(indices, base.layer_order))
+    segment_by_source = dict(DSV41_LW_V2_CONSUMER_SEGMENTS)
+    if tuple(segment_by_source) != DSV41_LW_V2_SOURCE_LAYERS:
+        raise ValueError(
+            "DSV41_LW_V2_CONSUMER_SEGMENTS must be ordered by source layer "
+            f"{list(DSV41_LW_V2_SOURCE_LAYERS)!r}, got "
+            f"{list(segment_by_source)!r}"
+        )
 
     expected_ids: set[str] = set()
     for layer_name in base.layer_order:
@@ -656,6 +677,59 @@ def _validate_default_dsv41_manifest(
             raise ValueError(
                 f"Group {group.group_id} does not cover every resource of "
                 f"source layer {group.source_layer}"
+            )
+        expected_consumers = tuple(
+            layer_by_index[index]
+            for index in segment_by_source[group.source_layer]
+        )
+        if tuple(group.consumer_layers) != expected_consumers:
+            raise ValueError(
+                f"Group {group.group_id} consumers must be the fixed DSV4.1 "
+                f"segment {list(expected_consumers)!r}, got "
+                f"{list(group.consumer_layers)!r}"
+            )
+        long_kv_resources = [
+            resource
+            for resource in group.token_range_resources
+            if resource.resource_id.endswith(_LONG_KV_SUFFIX)
+        ]
+        if len(long_kv_resources) != 1 or tuple(
+            long_kv_resources[0].consumer_layers
+        ) != expected_consumers:
+            actual = (
+                list(long_kv_resources[0].consumer_layers)
+                if long_kv_resources
+                else []
+            )
+            raise ValueError(
+                f"Long KV resource of group {group.group_id} must be consumed "
+                f"by the fixed DSV4.1 segment {list(expected_consumers)!r}, "
+                f"got {actual!r}"
+            )
+        index_k_resources = [
+            resource
+            for resource in group.token_range_resources
+            if resource.resource_id.endswith(_INDEX_K_SUFFIX)
+        ]
+        index_consumers = (
+            tuple(index_k_resources[0].consumer_layers)
+            if len(index_k_resources) == 1
+            else ()
+        )
+        outside_segment = [
+            layer
+            for layer in index_consumers
+            if layer not in expected_consumers
+        ]
+        if len(index_k_resources) != 1 or not index_consumers or outside_segment:
+            detail = (
+                f" (outside: {outside_segment!r})" if outside_segment else ""
+            )
+            raise ValueError(
+                f"Index K resource of group {group.group_id} must be consumed "
+                f"by the index-source subset of the fixed DSV4.1 segment "
+                f"{list(expected_consumers)!r}, got "
+                f"{list(index_consumers)!r}{detail}"
             )
         for resource in group.token_range_resources:
             if not resource.resource_id.endswith(

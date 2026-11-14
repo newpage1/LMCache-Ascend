@@ -10,6 +10,7 @@ segment.
 """
 
 # Standard
+import ast
 import importlib.util
 import sys
 from dataclasses import replace
@@ -851,3 +852,101 @@ def test_generic_swa_as_transferable_rejected():
             source_layer_ids=(1, 4),
             boundary_source_layer_ids=(1,),
         )
+
+
+# ---------------------------------------------------------------------------
+# F4: exact consumer segments are part of the fixed topology
+# ---------------------------------------------------------------------------
+
+
+def test_f4_consumer_segment_constant_matches_fixed_table():
+    expected = tuple(
+        (source, tuple(range(source, SEGMENT_END[source] + 1)))
+        for source in SOURCES
+    )
+    assert plan_mod.DSV41_LW_V2_CONSUMER_SEGMENTS == expected
+
+
+def test_f4_consumer_segments_match_engine_topology_constant():
+    topology = (
+        ROOT.parent
+        / "vllm-ascend/vllm_ascend/models/deepseek_v41/topology.py"
+    )
+    if not topology.is_file():
+        pytest.skip("vllm-ascend checkout is not next to this repository")
+    tree = ast.parse(topology.read_text(encoding="utf-8"))
+    engine_segments = None
+    for node in tree.body:
+        name = None
+        if isinstance(node, ast.AnnAssign):
+            name = getattr(node.target, "id", None)
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1:
+            name = getattr(node.targets[0], "id", None)
+        if name == "DSV41_LW_V2_CONSUMER_SEGMENTS":
+            engine_segments = ast.literal_eval(node.value)
+    assert engine_segments is not None, (
+        "vllm-ascend topology must define DSV41_LW_V2_CONSUMER_SEGMENTS"
+    )
+    assert plan_mod.DSV41_LW_V2_CONSUMER_SEGMENTS == engine_segments
+
+
+def test_f4_wrong_but_self_consistent_segment_rejected():
+    # Source 2's long KV and index K both shrink to 2-6: the group union is
+    # consistent with its own resources, but it is not the fixed 2-7 segment.
+    base = _replace_resource(
+        _base_plan(),
+        f"{_stem(2)}.long_kv_cache",
+        consumer_layers=tuple(_layer(index) for index in range(2, 7)),
+    )
+    with pytest.raises(ValueError, match="fixed DSV4.1 segment"):
+        build_grouped_plan(
+            base,
+            source_layer_ids=SOURCES,
+            boundary_source_layer_ids=BOUNDARIES,
+        )
+
+
+def test_f4_long_kv_must_cover_the_whole_segment():
+    # The group union is exactly 2-7, but layer 7 is only a consumer of the
+    # index K resource: the long KV descriptor itself no longer matches the
+    # fixed layout and must be rejected.
+    base = _replace_resource(
+        _base_plan(),
+        f"{_stem(2)}.indexer.k_cache",
+        consumer_layers=(_layer(2), _layer(4), _layer(6), _layer(7)),
+    )
+    base = _replace_resource(
+        base,
+        f"{_stem(2)}.long_kv_cache",
+        consumer_layers=tuple(_layer(index) for index in range(2, 7)),
+    )
+    with pytest.raises(ValueError, match="Long KV resource of group g2"):
+        build_grouped_plan(
+            base,
+            source_layer_ids=SOURCES,
+            boundary_source_layer_ids=BOUNDARIES,
+        )
+
+
+def test_f4_normal_plan_keeps_segment_while_index_stays_a_subset():
+    plan = _default_plan()
+    for source in SOURCES:
+        segment = tuple(
+            _layer(index)
+            for index in range(source, SEGMENT_END[source] + 1)
+        )
+        group = _group(plan, f"g{source}")
+        assert group.consumer_layers == segment
+        long_kv = next(
+            resource
+            for resource in group.transfer_resources
+            if resource.resource_id.endswith(".long_kv_cache")
+        )
+        assert long_kv.consumer_layers == segment
+        index_k = next(
+            resource
+            for resource in group.transfer_resources
+            if resource.resource_id.endswith(".indexer.k_cache")
+        )
+        assert set(index_k.consumer_layers) <= set(segment)
+
