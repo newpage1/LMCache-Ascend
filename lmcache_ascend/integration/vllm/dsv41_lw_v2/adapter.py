@@ -89,6 +89,9 @@ REQUIRED_CAPABILITIES = _wire.RESOURCE_BLOCK_CAPABILITIES
 
 TOKEN_PAYLOAD_MAGIC = _wire.TOKEN_PAYLOAD_MAGIC
 BOUNDARY_PAYLOAD_MAGIC = _wire.BOUNDARY_PAYLOAD_MAGIC
+#: Number of immutable boundary snapshots kept per (request, resource)
+#: while the store endpoint is still one step behind the live ring.
+_BOUNDARY_STAGE_LIMIT = 4
 
 STATUS_OK = _wire.STATUS_OK
 STATUS_MISS = _wire.STATUS_MISS
@@ -509,7 +512,9 @@ class DSV41LwV2GroupAdapter:
             for group in plan.groups
             if group.boundary_resource is not None
         }
-        self._boundary_stage: dict[tuple[str, str], _BoundaryCapture] = {}
+        self._boundary_stage: dict[
+            tuple[str, str], dict[int, _BoundaryCapture]
+        ] = {}
         self._boundary_payloads: dict[tuple[str, str, int], bytes] = {}
         self._failed_receiving: set[str] = set()
         self._failed_receiving_reported: set[str] = set()
@@ -538,6 +543,7 @@ class DSV41LwV2GroupAdapter:
             "boundary_attached": 0,
             "boundary_captured": 0,
             "boundary_capture_discarded": 0,
+            "boundary_deferred": 0,
             "boundary_stage_released": 0,
             "boundary_restored": 0,
             "boundary_restore_failed": 0,
@@ -548,6 +554,8 @@ class DSV41LwV2GroupAdapter:
             "payload_corrupt": 0,
             "requests_finished_sending": 0,
             "requests_failed_receiving": 0,
+            "worker_jobs": 0,
+            "worker_failures": 0,
         }
 
         self._jobs: queue.Queue[Any] = queue.Queue(maxsize=self._max_queue)
@@ -970,19 +978,28 @@ class DSV41LwV2GroupAdapter:
             boundary_end=int(boundary_end),
         )
         key = (request_id, resource_id)
-        replaced: _BoundaryCapture | None = None
+        released: list[_BoundaryCapture] = []
         with self._lock:
-            replaced = self._boundary_stage.pop(key, None)
-            self._boundary_stage[key] = capture
+            slot = self._boundary_stage.setdefault(key, {})
+            replaced = slot.get(capture.boundary_end)
             if replaced is not None:
+                released.append(replaced)
                 self._counters["boundary_stage_released"] += 1
-        if replaced is not None:
+            slot[capture.boundary_end] = capture
+            while len(slot) > _BOUNDARY_STAGE_LIMIT:
+                oldest = min(slot)
+                released.append(slot.pop(oldest))
+                self._counters["boundary_stage_released"] += 1
+        for replaced in released:
             replaced.release()
         if not self._enqueue(("capture", capture)):
             with self._lock:
                 self._counters["group_store_dropped"] += 1
-                if self._boundary_stage.get(key) is capture:
-                    self._boundary_stage.pop(key, None)
+                slot = self._boundary_stage.get(key)
+                if slot is not None and slot.get(capture.boundary_end) is capture:
+                    slot.pop(capture.boundary_end)
+                    if not slot:
+                        self._boundary_stage.pop(key, None)
                 self._counters["boundary_stage_released"] += 1
             capture.release()
 
@@ -1043,6 +1060,8 @@ class DSV41LwV2GroupAdapter:
             if job is None:
                 return
             kind, payload = job
+            with self._lock:
+                self._counters["worker_jobs"] += 1
             try:
                 if kind == "load":
                     self._run_load(payload)
@@ -1051,6 +1070,8 @@ class DSV41LwV2GroupAdapter:
                 elif kind == "capture":
                     self._run_capture(payload)
             except Exception as exc:  # noqa: BLE001 - worker must not die
+                with self._lock:
+                    self._counters["worker_failures"] += 1
                 self._record_worker_failure(kind, payload, exc)
 
     def _run_load(self, job: "_LoadJob") -> None:
@@ -1595,29 +1616,37 @@ class DSV41LwV2GroupAdapter:
         staging dict (which used to leak the device page clone).
         """
         key = (request_id, resource_id)
+        released: list[_BoundaryCapture] = []
         with self._lock:
-            capture = self._boundary_stage.pop(key, None)
-        if capture is None:
-            return None
-        if capture.boundary_end == store_end:
-            return capture
-        if capture.boundary_end > store_end:
-            reason = "unaligned_endpoint"
-        else:
-            reason = "stale_capture"
-        logger_warning(
-            "dsv41 lw v2 boundary capture discarded for request %s "
-            "resource %s: capture boundary_end=%s store_end=%s (%s)",
-            request_id,
-            resource_id,
-            capture.boundary_end,
-            store_end,
-            reason,
-        )
-        capture.release()
-        with self._lock:
-            self._counters["boundary_capture_discarded"] += 1
-        return None
+            slot = self._boundary_stage.get(key)
+            if not slot:
+                return None
+            capture = slot.pop(store_end, None)
+            # A snapshot taken after this store endpoint belongs to a later
+            # window: keep it staged (the store for its own endpoint is
+            # submitted right after this forward) instead of handing the
+            # wrong compressor state to this window.  Snapshots older than
+            # the endpoint can never be attached correctly again.
+            for endpoint in sorted(slot):
+                if endpoint < store_end:
+                    released.append(slot.pop(endpoint))
+                    self._counters["boundary_capture_discarded"] += 1
+                else:
+                    self._counters["boundary_deferred"] += 1
+            if not slot:
+                self._boundary_stage.pop(key, None)
+        for stale in released:
+            logger_warning(
+                "dsv41 lw v2 boundary capture discarded for request %s "
+                "resource %s: capture boundary_end=%s store_end=%s "
+                "(stale_capture)",
+                request_id,
+                resource_id,
+                stale.boundary_end,
+                store_end,
+            )
+            stale.release()
+        return capture
 
     def _await_capture(self, capture: Any) -> bytes:
         if isinstance(capture, bytes):
@@ -1952,7 +1981,7 @@ class DSV41LwV2GroupAdapter:
             # Boundary staging keys do not carry a step id; map the resource
             # back to its group so group/request scoped drops behave the same.
             released: list[_BoundaryCapture] = []
-            for (request_id, resource_id), capture in list(
+            for (request_id, resource_id), slot in list(
                 self._boundary_stage.items()
             ):
                 group_id = self._boundary_group_by_resource.get(
@@ -1961,7 +1990,7 @@ class DSV41LwV2GroupAdapter:
                 if not predicate((group_id, request_id, -1)):
                     continue
                 self._boundary_stage.pop((request_id, resource_id), None)
-                released.append(capture)
+                released.extend(slot.values())
             for key in list(self._boundary_payloads):
                 request_id, resource_id, _ = key
                 group_id = self._boundary_group_by_resource.get(
@@ -1986,13 +2015,13 @@ class DSV41LwV2GroupAdapter:
         bookkeeping.
         """
         released: list[_BoundaryCapture] = []
-        for (request_id, resource_id), capture in list(
+        for (request_id, resource_id), slot in list(
             self._boundary_stage.items()
         ):
             if request_id not in request_ids:
                 continue
             self._boundary_stage.pop((request_id, resource_id), None)
-            released.append(capture)
+            released.extend(slot.values())
         for key in list(self._boundary_payloads):
             if key[0] in request_ids:
                 self._boundary_payloads.pop(key, None)

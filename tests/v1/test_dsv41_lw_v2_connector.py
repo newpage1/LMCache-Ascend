@@ -744,7 +744,7 @@ def test_store_only_step_captures_and_submits_per_group():
     assert connector.metrics["group_store_drained"] == 1
 
 
-def test_wait_for_save_drains_previous_stores_and_keeps_the_live_step():
+def test_wait_for_save_submits_live_stores_and_keeps_the_live_step():
     connector, adapter, hook = _bound()
     connector._connector_metadata = _metadata(_store(end=2048))
     connector.start_load_kv(None)
@@ -752,25 +752,23 @@ def test_wait_for_save_drains_previous_stores_and_keeps_the_live_step():
     live_step = connector.current_step
     assert live_step is not None
 
-    # vLLM calls wait_for_save before the forward this step prepared: it may
-    # drain the store submitted by an earlier forward, but must not submit or
-    # finish the live step (t13 F5).
+    # vLLM 0.30 runs start_load_kv after the forward, so wait_for_save is the
+    # first point where this step's ops and KV rows both exist: submit them
+    # here (a decode step served from a CUDA graph may have no later hook).
     connector.wait_for_save()
-    assert adapter.stores == [("g8", ("r1",))]
+    for group_id in ("g2", "g8", "g14", "g20"):
+        assert (group_id, ("r1",)) in adapter.stores
     assert adapter.drain_count == 1
     assert connector.current_step is live_step
     assert connector._lw_v2_step_noted is True
 
-    # The post-forward capture of another group must still see its ops.
+    # The step stays live, so another head can still capture after the drain.
     connector.save_kv_layer(_layer(2), None, None)
-    assert ("g2", ("r1",)) in adapter.stores
     assert hook.calls == [("capture", "g8"), ("capture", "g2")]
 
-    # The next start_load_kv closes the previous step and hands off the rest.
+    # The next start_load_kv closes the previous step.
     connector._connector_metadata = _metadata()
     connector.start_load_kv(None)
-    for group_id in ("g14", "g20"):
-        assert (group_id, ("r1",)) in adapter.stores
     assert connector.current_step is None
 
 
@@ -784,8 +782,8 @@ def test_capture_precedes_submit_and_wait_for_save_keeps_ops():
     assert hook.calls == [("capture", "g2")]
     assert adapter.stores == [("g2", ("r1",))]
 
-    # vLLM's pre-forward wait_for_save runs before the next forward; it must
-    # not erase g8/g14/g20's ops, otherwise their captures see has_ops=False.
+    # wait_for_save submits the live step once; the step and its ops stay
+    # available, so later heads still capture (submit is idempotent).
     connector.wait_for_save()
     connector.save_kv_layer(_layer(8), None, None)
     connector.save_kv_layer(_layer(14), None, None)
@@ -794,15 +792,11 @@ def test_capture_precedes_submit_and_wait_for_save_keeps_ops():
         ("capture", "g8"),
         ("capture", "g14"),
     ]
-    assert adapter.stores == [
-        ("g2", ("r1",)),
-        ("g8", ("r1",)),
-        ("g14", ("r1",)),
-    ]
+    for group_id in ("g2", "g8", "g14", "g20"):
+        assert adapter.stores.count((group_id, ("r1",))) == 1
 
-    # Reporting finished requests closes the step and hands off g20.
+    # Reporting finished requests closes the step.
     connector.get_finished({"r1"})
-    assert ("g20", ("r1",)) in adapter.stores
 
 
 def test_no_hit_decode_step_is_a_complete_noop():

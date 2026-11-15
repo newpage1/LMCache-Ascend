@@ -1213,7 +1213,8 @@ def test_unaligned_boundary_capture_is_discarded_and_never_leaks(monkeypatch):
         unaligned,
         _TensorView(_ring(pages=2423), (unaligned.ring_page,), 4, 2),
     )
-    capture = adapter._boundary_stage[("r1", resource_id)]  # noqa: SLF001
+    slot = adapter._boundary_stage[("r1", resource_id)]  # noqa: SLF001
+    capture = slot[9690]
     assert capture.page is not None
     assert adapter.metrics["boundary_staged"] == 2
 
@@ -1221,17 +1222,27 @@ def test_unaligned_boundary_capture_is_discarded_and_never_leaks(monkeypatch):
         adapter, step_id=1, start=8192, end=9472, blocks=tuple(range(64, 74))
     )
 
-    # The unaligned page is dropped with an explicit reason and freed.
-    assert adapter.metrics["boundary_capture_discarded"] == 1
+    # The unaligned page is newer than this window's endpoint: it is kept
+    # staged for the window it actually belongs to, never attached to 9472.
+    assert adapter.metrics["boundary_capture_discarded"] == 0
+    assert adapter.metrics["boundary_deferred"] == 1
     assert adapter.metrics["boundary_attached"] == 1
     assert adapter.metrics["boundary_captured"] == 1
-    assert adapter._boundary_stage == {}  # noqa: SLF001
-    assert capture.page is None
-    assert warnings and "unaligned_endpoint" in warnings[-1]
+    assert capture.released is False
+    assert capture.encoded is not None
     # The server still exposes only the last complete, attached endpoint.
     boundary_keys = list(server.boundaries)
     assert len(boundary_keys) == 1
     assert boundary_keys[0][:4] == (PLAN_HASH, LAYOUT_HASH, resource_id, 8192)
+
+    # When the request finishes, the deferred page is released, not leaked.
+    adapter._sending_ready.add("r1")  # noqa: SLF001
+    adapter.take_finished()
+    assert adapter._boundary_stage == {}  # noqa: SLF001
+    assert capture.page is None
+    assert capture.encoded is None
+    assert capture.released is True
+    assert warnings == []
 
 
 def test_drop_request_releases_staged_boundary_capture():
@@ -1244,7 +1255,9 @@ def test_drop_request_releases_staged_boundary_capture():
         _boundary_view("r1", prefix_end=TOKENS - 1),
         _TensorView(_ring(fill=1.0), (0, 1), 4, 2),
     )
-    capture = adapter._boundary_stage[("r1", resource_id)]  # noqa: SLF001
+    capture = next(
+        iter(adapter._boundary_stage[("r1", resource_id)].values())  # noqa: SLF001
+    )
     assert capture.page is not None
 
     adapter.drop_request("r1", reason="dropped")
@@ -1264,9 +1277,13 @@ def test_replacing_a_boundary_capture_releases_the_previous_page():
         _boundary_view("r1", prefix_end=TOKENS - 1),
         _TensorView(_ring(fill=1.0), (0, 1), 4, 2),
     )
-    first = adapter._boundary_stage[("r1", resource_id)]  # noqa: SLF001
+    first = next(
+        iter(adapter._boundary_stage[("r1", resource_id)].values())  # noqa: SLF001
+    )
 
+    # Same endpoint => the newer page replaces the older one.
     second = _boundary_view("r1", prefix_end=TOKENS + 3)
+    second.boundary_end = TOKENS
     second.ring_page = 2
     second.written_rows = (11,)
     codec.capture_layer_boundary(
@@ -1289,7 +1306,9 @@ def test_finished_requests_release_any_staged_boundary_capture():
         _boundary_view("r1", prefix_end=TOKENS - 1),
         _TensorView(_ring(fill=1.0), (0, 1), 4, 2),
     )
-    capture = adapter._boundary_stage[("r1", resource_id)]  # noqa: SLF001
+    capture = next(
+        iter(adapter._boundary_stage[("r1", resource_id)].values())  # noqa: SLF001
+    )
     adapter._sending_ready.add("r1")  # noqa: SLF001
 
     finished_sending, finished_receiving = adapter.take_finished()
@@ -1476,3 +1495,114 @@ def test_store_staging_keeps_load_and_store_endpoints_independent(monkeypatch):
     adapter.drain_stores()
     assert adapter.metrics["group_store_dropped"] == 0
     assert adapter.metrics["group_store_committed"] == 1
+
+
+class _LiveBoundaryHook:
+    """A stand-in for the T3 engine hook that captures the live ring page."""
+
+    def __init__(self, codec, ring: torch.Tensor) -> None:
+        self.codec = codec
+        self.ring = ring
+        self.prefix = 0
+        self.calls: list[str] = []
+
+    def capture_group_boundary(self, group_id: str) -> None:
+        self.calls.append(group_id)
+        if group_id != "g2":
+            return
+        prefix = self.prefix
+        if prefix <= 0 or prefix % CHUNK_SIZE:
+            return
+        view = _BoundaryView(
+            request_id="r1",
+            resource_id=PLAN.group_by_id("g2").boundary_resource.resource_id,
+            prefix_end=prefix - 1,
+            boundary_end=prefix,
+            next_slot=(prefix - 1) % 4,
+            ring_page=(prefix - 1) // 4,
+            written_rows=((prefix - 1),),
+            step_id=prefix,
+        )
+        self.codec.capture_layer_boundary(
+            view,
+            _TensorView(self.ring, (view.ring_page,), 4, 2),
+        )
+
+    def restore_group_boundary(self, group_id: str) -> None:
+        raise AssertionError(f"unexpected boundary restore for {group_id}")
+
+
+def test_post_forward_ordering_stores_each_window_and_defers_boundary():
+    """vLLM 0.30 calls start_load_kv *after* the forward for cold requests.
+
+    The routing step is therefore created post-forward.  Stores must be
+    submitted from ``wait_for_save`` (same step, KV rows still live) instead of
+    waiting for a later forward, and a boundary captured one step ahead must be
+    deferred to its own window rather than dropped or mislabelled.
+    """
+    server = _FakeServer()
+    adapter = _make_adapter(FakeTransport(server))
+    adapter.register()
+    codec = _codec(adapter)
+    ring = _ring(pages=8, fill=1.0)
+    hook = _LiveBoundaryHook(codec, ring)
+    router = connector_mod.GroupTransferRouter(
+        PLAN, adapter=adapter, boundary_hook=hook
+    )
+
+    def forward(live_prefix: int) -> None:
+        hook.prefix = live_prefix
+        router.wait_group_load("g2")
+        router.restore_group_boundary("g2")
+        router.capture_group_boundary("g2")
+        router.submit_group_store("g2")
+
+    def post_forward(request) -> None:
+        # ``start_load_kv`` (flush + note) runs after the forward; the
+        # connector's ``wait_for_save`` then submits the new step's stores.
+        router.flush_step()
+        router.note_step(_step(request))
+        router.wait_for_save()
+
+    # r1 step 0: 0..4 computed, live prefix 4.
+    forward(4)
+    post_forward(
+        _request(
+            "r1", step_id=0, load_prefix_end=0, store_prefix_end=4,
+            store_start=0,
+        )
+    )
+    assert len(server.blocks) == 8
+    assert not server.boundaries
+
+    # r1 step 1: 4..8 computed, live prefix 8 => boundary endpoint 8.
+    forward(8)
+    post_forward(
+        _request(
+            "r1", step_id=1, load_prefix_end=0, store_prefix_end=8,
+            store_start=4,
+        )
+    )
+    assert len(server.blocks) == 16
+    boundary_keys = list(server.boundaries)
+    assert len(boundary_keys) == 1
+    assert boundary_keys[0][3] == 8
+    assert adapter.metrics["boundary_captured"] == 1
+    assert adapter.metrics["boundary_attached"] == 1
+
+    # r2 is a single-step request: its stores must be submitted without any
+    # further forward (a decode step served from a CUDA graph has no hooks).
+    forward(8)
+    post_forward(
+        _request(
+            "r2", step_id=2, load_prefix_end=0, store_prefix_end=8,
+            store_start=0,
+        )
+    )
+    r2_specs = [spec for spec in server.store_specs if spec.request_id == "r2"]
+    assert len(r2_specs) == 16
+    # r2 shares r1's prefix, so the same stock block keys are rewritten.
+    assert len(server.blocks) == 16
+    assert router.metrics["steps_with_store"] == 3
+    assert adapter.metrics["group_store_dropped"] == 0
+    assert adapter.metrics["worker_failures"] == 0

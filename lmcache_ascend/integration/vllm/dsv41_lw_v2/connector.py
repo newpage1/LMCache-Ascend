@@ -379,6 +379,14 @@ class GroupTransferRouter:
             "boundary_restored": 0,
             "requests_dropped": 0,
             "stale_ops_cleared": 0,
+            "steps_noted": 0,
+            "steps_synthetic": 0,
+            "steps_empty": 0,
+            "steps_with_load": 0,
+            "steps_with_store": 0,
+            "boundary_capture_calls": 0,
+            "boundary_capture_skipped": 0,
+            "store_requests_submitted": 0,
         }
 
     @property
@@ -439,7 +447,9 @@ class GroupTransferRouter:
         # operation state itself lives in the adapter.
         self.finish_step()
         self._step = step
+        self._counters["steps_noted"] += 1
         if step.synthetic:
+            self._counters["steps_synthetic"] += 1
             return
 
         load_ids = tuple(
@@ -452,6 +462,12 @@ class GroupTransferRouter:
             for request in step.requests
             if request.store_prefix_end > 0
         )
+        if load_ids:
+            self._counters["steps_with_load"] += 1
+        if store_ids:
+            self._counters["steps_with_store"] += 1
+        if not load_ids and not store_ids:
+            self._counters["steps_empty"] += 1
         if load_ids and self._adapter is None:
             raise DSV41LwV2NotReadyError(
                 "step has a real external load hit but no v2 transport "
@@ -594,8 +610,10 @@ class GroupTransferRouter:
         group = self._require_group(group_id)
         ops = self._ops.get(group.group_id)
         if ops is None or not ops.store_request_ids or not group.has_boundary:
+            self._counters["boundary_capture_skipped"] += 1
             return
         if ops.boundary_captured:
+            self._counters["boundary_capture_skipped"] += 1
             return
         if self._boundary_hook is None:
             raise DSV41LwV2NotReadyError(
@@ -603,6 +621,7 @@ class GroupTransferRouter:
                 "codec is bound (BOUNDARY_NOT_BOUND)"
             )
         self._boundary_hook.capture_group_boundary(group.group_id)
+        self._counters["boundary_capture_calls"] += 1
         ops.boundary_captured = True
         self._counters["boundary_captured"] += 1
 
@@ -624,6 +643,9 @@ class GroupTransferRouter:
         ops.submitted = True
         self._pending_stores += 1
         self._counters["group_store_submitted"] += 1
+        self._counters["store_requests_submitted"] += len(
+            ops.store_request_ids
+        )
 
 
     def wait_for_save(self) -> None:
@@ -636,7 +658,18 @@ class GroupTransferRouter:
         hooks run, which is exactly the t13 F5 failure.  The step therefore
         stays alive until the next ``start_load_kv`` (or ``get_finished``).
         """
+        # vLLM 0.30 runs ``start_load_kv`` after the forward for cold
+        # requests, so this step's ops are only known here.  Submitting them
+        # now (the forward's KV rows and boundary snapshot are already
+        # materialised) keeps stores from waiting for the next forward, which
+        # a decode step served from a CUDA graph may never reach.
+        self.submit_pending_stores()
         self.drain_pending_stores()
+
+    def submit_pending_stores(self) -> None:
+        """Submit this step's group stores without closing the step."""
+        for group in self._plan.groups:
+            self.submit_group_store(group.group_id)
 
     def flush_step(self) -> None:
         """Close the current step after its forward and store submission."""
@@ -987,8 +1020,23 @@ class DSV41LwV2Connector(LMCacheMPConnector):
 
     @property
     def metrics(self) -> dict[str, int]:
+        """Expose router counters plus ``adapter_*`` transport counters.
+
+        The router counters cover step routing (built/empty/store-load
+        requests, capture calls/skips, submitted/drained groups).  The
+        adapter counters cover transport terminal states (worker jobs,
+        committed/dropped stores, boundary staged/attached/discarded/
+        deferred, restore failures), which is what a serving validation
+        needs to read per request without enabling verbose logs.
+        """
         router = self._lw_v2_router
-        return router.metrics if router is not None else {}
+        metrics = dict(router.metrics) if router is not None else {}
+        adapter = self.adapter
+        adapter_metrics = getattr(adapter, "metrics", None)
+        if isinstance(adapter_metrics, Mapping):
+            for name, value in adapter_metrics.items():
+                metrics[f"adapter_{name}"] = value
+        return metrics
 
     def group_for_layer(self, layer_name: str) -> TransferGroup | None:
         """Pure mapping query; non-head and unknown layers return ``None``."""
