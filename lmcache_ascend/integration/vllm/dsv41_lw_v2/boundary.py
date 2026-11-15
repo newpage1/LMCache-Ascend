@@ -44,6 +44,7 @@ import torch
 from lmcache_ascend.integration.vllm.dsv41_lw_v2.adapter import (
     BOUNDARY_PAYLOAD_MAGIC,
     DSV41LwV2GroupAdapter,
+    _store_debug,
 )
 
 BOUNDARY_SCHEMA_VERSION = 2
@@ -510,6 +511,13 @@ class DSV41LwV2BoundaryCodec:
                 error_code=BOUNDARY_PAGE_MISMATCH,
             ) from None
         self._adapter.record_boundary_restored()
+        _store_debug(
+            "boundary restored resource=%s endpoint=%s ring_page=%s rows=%d",
+            resource_id,
+            int(request_view.prefix_end),
+            int(tensor_view.page_ids[int(request_view.request_index)]),
+            len(request_view.written_rows),
+        )
 
     # ------------------------------------------------------------------
     # Validation

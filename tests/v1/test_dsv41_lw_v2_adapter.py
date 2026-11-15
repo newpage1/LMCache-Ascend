@@ -1703,3 +1703,38 @@ def test_two_cold_requests_store_every_window_at_production_sizes():
     assert adapter.metrics["store_stage_empty"] == 0
     assert adapter.metrics["worker_failures"] == 0
     assert adapter.metrics["group_store_committed"] == 16
+
+
+class _RecordingIndexTarget:
+    """Target stand-in that records the device of the copy arguments."""
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self.index: torch.Tensor | None = None
+        self.value: torch.Tensor | None = None
+
+    def index_copy_(self, dim, index, value):
+        assert dim == 0
+        self.index = index
+        self.value = value
+        return self
+
+
+def test_non_cuda_index_copy_moves_the_cpu_index_to_the_target_device():
+    target = _RecordingIndexTarget(torch.device("meta"))
+    index = torch.tensor([1, 3], dtype=torch.long)
+    value = torch.zeros(2, 4)
+
+    assert adapter_mod._copy_rows(target, index, value) is None
+    assert target.index is not None
+    assert target.index.device.type == "meta"
+    assert target.value is not None
+    assert target.value.device.type == "meta"
+
+
+def test_retrieve_applies_rows_through_the_device_normalising_helper():
+    import inspect
+
+    source = inspect.getsource(adapter_mod.DSV41LwV2GroupAdapter._apply_retrieve)
+    assert "_copy_rows(" in source
+    assert "index_copy_" not in source

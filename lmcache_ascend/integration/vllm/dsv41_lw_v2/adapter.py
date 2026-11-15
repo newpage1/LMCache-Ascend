@@ -1354,14 +1354,9 @@ class DSV41LwV2GroupAdapter:
             index = torch.as_tensor(chunk.block_ids, dtype=torch.long)
             if device.type == "cuda":
                 stream = self._copy_stream_for(device)
-                with torch.cuda.stream(stream):
-                    host_value = value.to(device)
-                    target.index_copy_(0, index.to(device), host_value)
-                    event_obj = torch.cuda.Event()
-                    event_obj.record(stream)
-                copy_events.append(event_obj)
+                copy_events.append(_copy_rows(target, index, value, stream=stream))
             else:
-                target.index_copy_(0, index, value.to(device))
+                _copy_rows(target, index, value)
         for copy_event in copy_events:
             event.add_copy_event(copy_event)
 
@@ -2205,6 +2200,33 @@ def logger_warning(message: str, *args: Any) -> None:
         init_logger(__name__).warning(message, *args)
     except Exception:  # pragma: no cover - logging must never mask a failure
         return
+
+
+def _copy_rows(
+    target: Any,
+    index: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    stream: Any = None,
+) -> Any:
+    """Copy ``value`` rows into ``target`` at ``index`` on the target device.
+
+    ``index`` originates from the CPU-side ``block_ids`` list while ``target``
+    lives on the accelerator (NPU or CUDA).  Every backend requires the index
+    tensor on the destination device, so normalise *both* tensors here rather
+    than relying on implicit CPU-index handling that only some kernels provide.
+
+    Returns the recorded CUDA copy event, or ``None`` for other backends.
+    """
+    device = target.device
+    if device.type == "cuda":
+        with torch.cuda.stream(stream):
+            target.index_copy_(0, index.to(device), value.to(device))
+            event = torch.cuda.Event()
+            event.record(stream)
+        return event
+    target.index_copy_(0, index.to(device), value.to(device))
+    return None
 
 
 _STORE_DEBUG_FILE_ENV = "DSV41_LW_V2_STORE_DEBUG_FILE"
