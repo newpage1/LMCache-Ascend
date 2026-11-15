@@ -127,6 +127,7 @@ def _import_v2():
     )
     _install_package(PACKAGE, V2_DIR)
     plan_mod = _load_module(PACKAGE + ".plan", V2_DIR / "plan.py")
+    _load_module(PACKAGE + ".mask_trace", V2_DIR / "mask_trace.py")
     connector_mod = _load_module(
         PACKAGE + ".connector", V2_DIR / "connector.py"
     )
@@ -1750,3 +1751,180 @@ def test_token_payload_round_trips_int8_planes():
     (decoded,) = adapter_mod.decode_token_payload(payload, resource_id=None)
     assert decoded.dtype == torch.int8
     assert torch.equal(decoded, plane)
+
+
+def test_mask_trace_is_default_off_and_joins_load_wait_store_events(
+    tmp_path, monkeypatch
+):
+    """t66: the mask timeline is inert unless opted in, then covers both halves.
+
+    Off: the same group load produces no file at all.  On: one JSONL stream
+    carries ``load_start``/``load_ready``/``wait_enter``/``wait_exit`` and the
+    store half (``store_submit``/``store_done``) for the long and the short
+    request, with monotonic timestamps and joinable fields.
+    """
+    trace = sys.modules[PACKAGE + ".mask_trace"]
+    off_dir = tmp_path / "off"
+    off_dir.mkdir()
+    monkeypatch.delenv(trace.ENV_ENABLED, raising=False)
+    monkeypatch.setenv(trace.ENV_DIR, str(off_dir))
+    trace.reset_state()
+
+    server = _FakeServer()
+    adapter = _make_adapter(FakeTransport(server))
+    adapter.register()
+    request = _request()
+    # Scheduling already passes every emit point; the wait would need seeded
+    # payloads and is covered by the enabled half below.
+    adapter.schedule_group_retrieves("g20", ("r1",), _step(request))
+
+    assert list(off_dir.iterdir()) == []
+    assert trace.stats()["lines"] == 0
+
+    on_dir = tmp_path / "on"
+    on_dir.mkdir()
+    monkeypatch.setenv(trace.ENV_ENABLED, "1")
+    monkeypatch.setenv(trace.ENV_DIR, str(on_dir))
+    trace.reset_state()
+
+    server = _FakeServer()
+    adapter = _make_adapter(FakeTransport(server))
+    adapter.register()
+    router = connector_mod.GroupTransferRouter(PLAN)
+    router.bind_adapter(adapter)
+
+    loaded = _request("r1", step_id=0, load_prefix_end=TOKENS)
+    _seed_token_blocks(server, loaded)
+    router.note_step(_step(loaded))
+    router.wait_group_load("g20")
+
+    stored = _request(
+        "r1", step_id=1, load_prefix_end=0, store_prefix_end=TOKENS
+    )
+    router.note_step(_step(stored))
+    router.wait_for_save()
+    short = _request("r2", step_id=2, load_prefix_end=0, store_prefix_end=TOKENS)
+    router.note_step(_step(short))
+    router.wait_for_save()
+
+    files = list(on_dir.glob("mask-trace-*.jsonl"))
+    assert len(files) == 1
+    records = [
+        __import__("json").loads(line)
+        for line in files[0].read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    events = [record["event"] for record in records]
+    assert "load_start" in events
+    assert "load_ready" in events
+    assert "wait_enter" in events
+    assert "wait_exit" in events
+    assert "store_submit" in events
+    assert "store_done" in events
+    assert [record["ts_ns"] for record in records] == sorted(
+        record["ts_ns"] for record in records
+    )
+    assert [record["seq"] for record in records] == list(range(len(records)))
+    submit_requests = {
+        record["request_id"]
+        for record in records
+        if record["event"] == "store_submit"
+    }
+    assert submit_requests == {"r1", "r2"}
+    for record in records:
+        assert record["pid"]
+        if record["event"] in ("load_start", "load_ready"):
+            assert record["step_id"] == 0
+            assert record["group_id"].startswith("g")
+    assert "g20" in {
+        record["group_id"]
+        for record in records
+        if record["event"] in ("load_start", "load_ready")
+    }
+    assert trace.stats()["truncated_requests"] == 0
+    assert trace.stats()["lines"] == len(records)
+
+
+def test_mask_trace_covers_the_production_9690_and_543_store_windows(
+    tmp_path, monkeypatch
+):
+    """t66: the timeline covers both B01 request shapes end to end.
+
+    The long request stores 37 chunks (9690 tokens -> windows ending at 4096,
+    8192 and 9472) and the short request stores 2 chunks (543 tokens -> 512).
+    Every resource of every window must produce a ``store_submit`` and a
+    terminal ``store_done`` in the same stream.
+    """
+    trace = sys.modules[PACKAGE + ".mask_trace"]
+    monkeypatch.setenv(trace.ENV_ENABLED, "1")
+    monkeypatch.setenv(trace.ENV_DIR, str(tmp_path))
+    trace.reset_state()
+
+    server = _FakeServer()
+    adapter = _make_adapter(
+        FakeTransport(server),
+        caches=_make_caches(rows=80),
+        chunk_size=256,
+        block_size=128,
+        load_timeout=2.0,
+        store_timeout=2.0,
+    )
+    router = connector_mod.GroupTransferRouter(PLAN)
+    router.bind_adapter(adapter)
+
+    long_blocks = tuple(tuple(range(76)) for _ in range(12))
+    short_blocks = tuple(
+        tuple(range(5)) if index == 0 else (0,) for index in range(12)
+    )
+    long_tokens = _token_bytes(9690)
+    short_tokens = _token_bytes(543)
+    windows = (
+        ("r1", 0, 0, 4096),
+        ("r1", 1, 4096, 8192),
+        ("r1", 2, 8192, 9472),
+        ("r2", 3, 0, 512),
+    )
+    for request_id, step_id, start, end in windows:
+        request = _request(
+            request_id,
+            step_id=step_id,
+            load_prefix_end=0,
+            store_prefix_end=end,
+            store_start=start,
+            blocks=long_blocks if request_id == "r1" else short_blocks,
+            tokens=long_tokens if request_id == "r1" else short_tokens,
+        )
+        router.note_step(_step(request))
+        router.wait_for_save()
+
+    adapter.drain_stores()
+    files = list(tmp_path.glob("mask-trace-*.jsonl"))
+    assert len(files) == 1
+    records = [
+        __import__("json").loads(line)
+        for line in files[0].read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    submits = [
+        record for record in records if record["event"] == "store_submit"
+    ]
+    r1_ends = {
+        record["store_prefix_end"]
+        for record in submits
+        if record["request_id"] == "r1"
+    }
+    r2_ends = {
+        record["store_prefix_end"]
+        for record in submits
+        if record["request_id"] == "r2"
+    }
+    assert r1_ends == {4096, 8192, 9472}
+    assert r2_ends == {512}
+    assert all(
+        record["specs"] == 4
+        for record in submits
+        if record["request_id"] == "r2"
+    )
+    done = [record for record in records if record["event"] == "store_done"]
+    assert len(done) == 8 * 37 + 8 * 2
+    assert trace.stats()["truncated_requests"] == 0

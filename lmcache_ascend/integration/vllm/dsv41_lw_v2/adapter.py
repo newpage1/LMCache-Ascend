@@ -80,6 +80,7 @@ from lmcache_ascend.integration.vllm.dsv41_lw_v2.connector import (
     TransferRequest,
     _store_debug_enabled,
 )
+from lmcache_ascend.integration.vllm.dsv41_lw_v2 import mask_trace
 
 # ---------------------------------------------------------------------------
 # Protocol constants
@@ -88,6 +89,12 @@ from lmcache_ascend.integration.vllm.dsv41_lw_v2.connector import (
 RESOURCE_BLOCK_PROTOCOL_VERSION = _wire.RESOURCE_BLOCK_PROTOCOL_VERSION
 RESOURCE_BLOCK_LAYOUT_ENCODINGS = _wire.RESOURCE_BLOCK_ENCODINGS
 REQUIRED_CAPABILITIES = _wire.RESOURCE_BLOCK_CAPABILITIES
+
+def _mask_trace_enabled() -> bool:
+    """Cached switch read for the mask timeline (one env lookup per process)."""
+    return mask_trace.enabled()
+
+
 
 TOKEN_PAYLOAD_MAGIC = _wire.TOKEN_PAYLOAD_MAGIC
 BOUNDARY_PAYLOAD_MAGIC = _wire.BOUNDARY_PAYLOAD_MAGIC
@@ -508,6 +515,8 @@ class DSV41LwV2GroupAdapter:
         self._load_events: dict[tuple[str, str, int], GroupEvent] = {}
         self._store_batches: list[_StoreBatch] = []
         self._terminal_ops: set[tuple[str, str, str, int, str, int]] = set()
+        self._trace_load_ready: set[tuple[str, str, int]] = set()
+        self._trace_store_done: set[tuple[str, str, int, str]] = set()
         self._staged_ends: dict[tuple[str, str], int] = {}
         self._boundary_group_by_resource: dict[str, str] = {
             group.boundary_resource.resource_id: group.group_id
@@ -740,6 +749,19 @@ class DSV41LwV2GroupAdapter:
                             chunks=chunks,
                         )
                     )
+        if _mask_trace_enabled():
+            for job in jobs:
+                mask_trace.emit(
+                    "load_start",
+                    phase="load",
+                    step_id=step.step_id,
+                    group_id=group_id,
+                    request_id=job.request.request_id,
+                    prefix_end=job.request.load_prefix_end,
+                    chunks=len(job.chunks),
+                    resources=len(group.token_range_resources),
+                    has_boundary=group.has_boundary,
+                )
         for job in jobs:
             if not self._enqueue(("load", job)):
                 self._fail_event(
@@ -861,7 +883,20 @@ class DSV41LwV2GroupAdapter:
             batch = _StoreBatch(event=event, staged=staged)
             with self._lock:
                 self._store_batches.append(batch)
-            if not self._enqueue(("store", batch)):
+            queued = self._enqueue(("store", batch))
+            if _mask_trace_enabled():
+                mask_trace.emit(
+                    "store_submit",
+                    phase="store",
+                    step_id=step.step_id,
+                    group_id=group_id,
+                    request_id=request.request_id,
+                    store_start=request.store_start,
+                    store_prefix_end=request.store_prefix_end,
+                    specs=len(staged),
+                    queued=queued,
+                )
+            if not queued:
                 self._fail_event(
                     event,
                     resource_id=None,
@@ -889,6 +924,7 @@ class DSV41LwV2GroupAdapter:
                 with self._lock:
                     self._counters["group_store_failed"] += 1
                     self._mark_sending_ready_locked(event.request_id)
+                self._trace_store_timeout(event)
                 continue
             with self._lock:
                 if status == STATUS_OK:
@@ -1298,6 +1334,7 @@ class DSV41LwV2GroupAdapter:
             return
         self._terminal_ops.add(terminal)
         event.complete()
+        self._trace_load_terminal(event, request.step_id, "ok")
 
     def _apply_retrieve(
         self,
@@ -1455,6 +1492,7 @@ class DSV41LwV2GroupAdapter:
                 error_code=IO_ERROR,
                 message=f"store failed: {exc}",
             )
+            self._trace_store_terminal(event, staged, resource_id, "failed")
             return
         if not isinstance(result, ResourceBlockResult) or result.status not in (
             STATUS_OK,
@@ -1475,6 +1513,7 @@ class DSV41LwV2GroupAdapter:
                 error_code=getattr(result, "error_code", "") or IO_ERROR,
                 message=f"store status {getattr(result, 'status', '?')}",
             )
+            self._trace_store_terminal(event, staged, resource_id, "failed")
             return
         self._terminal_ops.add(terminal)
         with self._lock:
@@ -1487,6 +1526,97 @@ class DSV41LwV2GroupAdapter:
                 current, staged.chunk_end
             )
         event.complete()
+        self._trace_store_terminal(event, staged, resource_id, "ok")
+
+    # ------------------------------------------------------------------
+    # Default-off mask timeline (see mask_trace.py)
+    # ------------------------------------------------------------------
+
+    def _trace_load_terminal(
+        self, event: GroupEvent, step_id: int, status: str
+    ) -> None:
+        """Record one terminal load state per (group, request, step)."""
+        if not _mask_trace_enabled():
+            return
+        key = (event.group_id, event.request_id, int(step_id))
+        with self._lock:
+            if key in self._trace_load_ready:
+                return
+            self._trace_load_ready.add(key)
+        mask_trace.emit(
+            "load_ready",
+            phase="load",
+            step_id=int(step_id),
+            group_id=event.group_id,
+            request_id=event.request_id,
+            status=status,
+        )
+
+    def _trace_store_terminal(
+        self,
+        event: GroupEvent,
+        staged: _StagedStore,
+        resource_id: str,
+        status: str,
+    ) -> None:
+        """Record one terminal store result per (group, request, chunk, resource)."""
+        if not _mask_trace_enabled():
+            return
+        key = (
+            event.group_id,
+            event.request_id,
+            int(staged.chunk_end),
+            resource_id,
+        )
+        with self._lock:
+            if key in self._trace_store_done:
+                return
+            self._trace_store_done.add(key)
+        mask_trace.emit(
+            "store_done",
+            phase="store",
+            group_id=event.group_id,
+            request_id=event.request_id,
+            resource_id=resource_id,
+            chunk_start=int(staged.chunk_start),
+            chunk_end=int(staged.chunk_end),
+            boundary=bool(staged.is_boundary),
+            status=status,
+        )
+
+    def _trace_store_timeout(self, event: GroupEvent) -> None:
+        """Record the resources of a store batch that missed its deadline."""
+        if not _mask_trace_enabled():
+            return
+        with self._lock:
+            staged_items = [
+                item
+                for batch in self._store_batches
+                if batch.event is event
+                for item in batch.staged
+            ]
+        for item in staged_items:
+            key = (
+                event.group_id,
+                event.request_id,
+                int(item.chunk_end),
+                item.resource_id,
+            )
+            with self._lock:
+                if key in self._trace_store_done:
+                    continue
+                self._trace_store_done.add(key)
+            mask_trace.emit(
+                "store_done",
+                phase="store",
+                group_id=event.group_id,
+                request_id=event.request_id,
+                resource_id=item.resource_id,
+                chunk_start=int(item.chunk_start),
+                chunk_end=int(item.chunk_end),
+                boundary=bool(item.is_boundary),
+                status="timeout",
+            )
 
     def _run_capture(self, capture: _BoundaryCapture) -> None:
         try:

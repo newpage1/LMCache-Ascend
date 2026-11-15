@@ -49,6 +49,7 @@ from typing import (
 from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector
 
 # First Party
+from lmcache_ascend.integration.vllm.dsv41_lw_v2 import mask_trace
 from lmcache_ascend.integration.vllm.dsv41_lw_v2.plan import (
     GroupedTransferPlan,
     TransferGroup,
@@ -83,6 +84,12 @@ _USE_DEFAULT_ADAPTER_FACTORY = object()
 _LOAD = "load"
 _STORE = "store"
 _DIRECTIONS = (_LOAD, _STORE)
+
+def _trace_start() -> int | None:
+    """Monotonic start stamp when the mask timeline is on, else ``None``."""
+    return mask_trace.now_ns() if mask_trace.enabled() else None
+
+
 
 
 class DSV41LwV2ConfigError(ValueError):
@@ -677,9 +684,31 @@ class GroupTransferRouter:
             raise DSV41LwV2NotReadyError(
                 f"no v2 transport adapter bound for group {group_id}"
             )
-        self._adapter.wait_group(
-            group.group_id, ops.load_request_ids, step, stream=stream
-        )
+        trace_start = _trace_start()
+        if trace_start is not None:
+            mask_trace.emit(
+                "wait_enter",
+                phase="wait",
+                step_id=step.step_id,
+                group_id=group.group_id,
+                request_ids=list(ops.load_request_ids),
+            )
+        ok = False
+        try:
+            self._adapter.wait_group(
+                group.group_id, ops.load_request_ids, step, stream=stream
+            )
+            ok = True
+        finally:
+            if trace_start is not None:
+                mask_trace.emit(
+                    "wait_exit",
+                    phase="wait",
+                    step_id=step.step_id,
+                    group_id=group.group_id,
+                    ok=ok,
+                    elapsed_ns=mask_trace.now_ns() - trace_start,
+                )
         ops.waited = True
         self._counters["group_load_ready"] += 1
 
