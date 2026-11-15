@@ -1738,3 +1738,15 @@ def test_retrieve_applies_rows_through_the_device_normalising_helper():
     source = inspect.getsource(adapter_mod.DSV41LwV2GroupAdapter._apply_retrieve)
     assert "_copy_rows(" in source
     assert "index_copy_" not in source
+
+
+def test_token_payload_round_trips_int8_planes():
+    plane = torch.arange(-8, 8, dtype=torch.int8).reshape(4, 4)
+    payload = adapter_mod.encode_token_payload(
+        resource_id="language_model.model.layers.2.self_attn.indexer.k_cache",
+        block_ids=(0, 1),
+        planes=(plane,),
+    )
+    (decoded,) = adapter_mod.decode_token_payload(payload, resource_id=None)
+    assert decoded.dtype == torch.int8
+    assert torch.equal(decoded, plane)

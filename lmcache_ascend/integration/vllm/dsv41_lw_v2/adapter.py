@@ -2262,6 +2262,10 @@ _DTYPE_NAMES = {
     "float32": torch.float32,
     "float16": torch.float16,
     "bfloat16": torch.bfloat16,
+    # The indexer caches are quantized to int8 in production.
+    "int8": torch.int8,
+    "uint8": torch.uint8,
+    "int16": torch.int16,
     "int32": torch.int32,
     "int64": torch.int64,
 }
