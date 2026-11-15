@@ -62,6 +62,9 @@ class StubLMCacheMPConnector:
         self.stock_finished_sending: set[str] = set()
         self.stock_finished_receiving: set[str] = set()
         self.stock_failed_recving: set[str] = set()
+        # Stock lookup answer; the v2 connector turns a real hit into a
+        # synchronous load (see ``get_num_new_matched_tokens``).
+        self.stock_lookup_result: tuple[int | None, bool] = (0, False)
         # Stock metadata-build calls; the v2 connector must delegate to it.
         self.meta_calls: list[object] = []
 
@@ -74,6 +77,9 @@ class StubLMCacheMPConnector:
     def build_connector_meta(self, scheduler_output):
         self.meta_calls.append(scheduler_output)
         return None
+
+    def get_num_new_matched_tokens(self, request, num_computed_tokens):
+        return self.stock_lookup_result
 
     def get_finished(self, finished_req_ids):
         return (
@@ -1087,8 +1093,11 @@ def test_get_finished_merges_stock_and_adapter_terminal_sets():
         {"stock-send", "stock-recv", "v2-send", "v2-recv"}
     )
 
+    # Stores merge into the stock report; a load completion is consumed by
+    # the forward that used it and must not be reported as a finished receive
+    # (vLLM would free the request's blocks as if the request had finished).
     assert sending == {"stock-send", "v2-send"}
-    assert receiving == {"stock-recv", "v2-recv"}
+    assert receiving == {"stock-recv"}
     # ``take_finished`` drains the adapter half; the stock sets stay visible.
     assert adapter.finished_sending == set()
     assert adapter.finished_receiving == set()
@@ -1109,9 +1118,48 @@ def test_get_finished_defers_terminal_ids_for_unfinished_requests():
 
     sending, receiving = connector.get_finished({"later", "later-recv"})
     assert sending == {"later"}
-    assert receiving == {"later-recv"}
+    # The load completion is released from the adapter but never echoed: the
+    # request is not parked, so a finished receive would free live blocks.
+    assert receiving == set()
     assert adapter.finished_sending == set()
     assert adapter.finished_receiving == set()
+
+
+# ---------------------------------------------------------------------------
+# Lookup: a layerwise v2 hit must load synchronously (t44 root cause)
+# ---------------------------------------------------------------------------
+
+
+def test_lookup_hit_is_reported_as_a_synchronous_load():
+    connector, _adapter, _ = _bound()
+    connector.stock_lookup_result = (512, True)
+
+    num, load_async = connector.get_num_new_matched_tokens(
+        SimpleNamespace(request_id="r1"), 0
+    )
+
+    assert num == 512
+    # vLLM parks an async load as WAITING_FOR_REMOTE_KVS and skips the
+    # forward, so the group heads would never wait/restore the loaded rows.
+    assert load_async is False
+
+
+def test_lookup_pending_answer_is_kept():
+    connector, _adapter, _ = _bound()
+    connector.stock_lookup_result = (None, True)
+
+    assert connector.get_num_new_matched_tokens(
+        SimpleNamespace(request_id="r1"), 0
+    ) == (None, True)
+
+
+def test_lookup_zero_hit_stays_synchronous():
+    connector, _adapter, _ = _bound()
+    connector.stock_lookup_result = (0, False)
+
+    assert connector.get_num_new_matched_tokens(
+        SimpleNamespace(request_id="r1"), 0
+    ) == (0, False)
 
 
 def test_get_transfer_results_reports_failed_recving_for_bypass():

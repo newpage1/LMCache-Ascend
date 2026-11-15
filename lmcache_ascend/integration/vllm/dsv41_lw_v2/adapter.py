@@ -2128,6 +2128,9 @@ class DSV41LwV2GroupAdapter:
         for key in list(self._boundary_payloads):
             if key[0] in request_ids:
                 self._boundary_payloads.pop(key, None)
+        for request_id in request_ids:
+            self._expected_load_groups.pop(request_id, None)
+            self._completed_load_groups.pop(request_id, None)
         if released:
             self._counters["boundary_stage_released"] += len(released)
         return released

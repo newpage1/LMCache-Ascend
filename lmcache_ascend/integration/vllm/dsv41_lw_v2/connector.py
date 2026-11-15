@@ -1141,6 +1141,29 @@ class DSV41LwV2Connector(LMCacheMPConnector):
                 f"unavailable ({exc})"
             ) from exc
 
+    def get_num_new_matched_tokens(
+        self, request: Any, num_computed_tokens: int
+    ) -> tuple[int | None, bool]:
+        """Report an external hit as a *synchronous* load.
+
+        Layerwise v2 restores each group's boundary inside the forward that
+        consumes it: the group head waits for its load and then restores the
+        boundary.  vLLM only calls ``start_load_kv`` before that forward when
+        the hit is synchronous.  An asynchronous hit parks the request in
+        ``WAITING_FOR_REMOTE_KVS`` for one or more scheduler steps, and the
+        step that finally runs it carries no RETRIEVE metadata, so no group
+        would be waited for and no boundary could be restored.  The stock
+        lookup, the token count and the request lifecycle stay untouched;
+        only the timing of the load moves into the step that needs it.
+        """
+        num, load_async = super().get_num_new_matched_tokens(
+            request, num_computed_tokens
+        )
+        if num is None or not load_async:
+            # A pending lookup keeps the stock "ask me again" answer.
+            return num, load_async
+        return num, False
+
     def build_connector_meta(self, scheduler_output: Any) -> Any:
         """Build the stock metadata and explain store decisions on request.
 
@@ -1317,13 +1340,16 @@ class DSV41LwV2Connector(LMCacheMPConnector):
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:
-        """Merge v2 terminal request ids into the stock connector report.
+        """Merge the v2 adapter's terminal *stores* into the stock report.
 
-        The v2 adapter settles each direction asynchronously (retrieves are
-        waited per group head, stores are drained in ``wait_for_save``), so
-        the stock connector alone never learns about them.  Returning the
-        merged ``(finished_sending, finished_receiving)`` pair keeps the stock
-        scheduler's request lifecycle intact.
+        The v2 adapter settles stores asynchronously (drained in
+        ``wait_for_save`` / ``flush_step``), so the stock connector alone never
+        learns about them.  Loads are synchronous (see
+        ``get_num_new_matched_tokens``): their completion is consumed by the
+        forward that uses it, no request is parked, and reporting a finished
+        receive would make vLLM free the request's blocks as if it had
+        finished.  The adapter still hands the ids over so its request state
+        and boundary payloads are released.
         """
         router = self._lw_v2_router
         if router is not None and router.current_step is not None:
@@ -1339,13 +1365,9 @@ class DSV41LwV2Connector(LMCacheMPConnector):
             return sending, receiving
         # Stock contract: a finished id may only be reported when the request
         # finished (this call or a prior one); the adapter keeps the rest.
-        v2_sending, v2_receiving = adapter.take_finished(
-            finished_req_ids=finished_req_ids
-        )
-        return (
-            _merge_id_sets(sending, v2_sending),
-            _merge_id_sets(receiving, v2_receiving),
-        )
+        # Load completions are consumed above; only store ids are reported.
+        v2_sending, _ = adapter.take_finished(finished_req_ids=finished_req_ids)
+        return _merge_id_sets(sending, v2_sending), receiving
 
     def get_transfer_results(self, finished_req_ids: set[str]) -> Any:
         """Report v2 load failures as ``failed_recving`` so vLLM recomputes.

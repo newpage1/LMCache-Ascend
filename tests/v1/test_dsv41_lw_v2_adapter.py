@@ -53,6 +53,7 @@ class _StubConnector:
         self.kv_cache_config = kv_cache_config
         self._connector_metadata = None
         self.kv_caches = {}
+        self.stock_lookup_result: tuple[int | None, bool] = (0, False)
         self.stock_finished_sending: set[str] = set()
         self.stock_finished_receiving: set[str] = set()
         self.stock_failed_recving: set[str] = set()
@@ -67,6 +68,10 @@ class _StubConnector:
     def build_connector_meta(self, scheduler_output):
         self.meta_calls.append(scheduler_output)
         return getattr(scheduler_output, "kv_connector_metadata", None)
+
+    def get_num_new_matched_tokens(self, request, num_computed_tokens):
+        # Stock answer shape; the v2 connector converts a hit to a sync load.
+        return self.stock_lookup_result
 
     def get_finished(self, finished_req_ids):
         return (
@@ -1323,6 +1328,23 @@ def test_finished_requests_release_any_staged_boundary_capture():
     assert capture.page is None
     assert adapter._boundary_stage == {}  # noqa: SLF001
     assert adapter.metrics["boundary_stage_released"] == 1
+
+
+def test_finished_requests_release_load_group_bookkeeping():
+    adapter = _make_adapter(FakeTransport(_FakeServer()))
+    adapter._expected_load_groups["r1"] = {"g2", "g8"}  # noqa: SLF001
+    adapter._completed_load_groups["r1"] = {"g2", "g8"}  # noqa: SLF001
+    adapter._receiving_ready.add("r1")  # noqa: SLF001
+
+    sending, receiving = adapter.take_finished(finished_req_ids={"r1"})
+
+    assert sending == set()
+    assert receiving == {"r1"}
+    # Load bookkeeping must not grow with every request the connector
+    # finishes: the v2 connector consumes load completions in the forward and
+    # only reports stores.
+    assert "r1" not in adapter._expected_load_groups  # noqa: SLF001
+    assert "r1" not in adapter._completed_load_groups  # noqa: SLF001
 
 
 def test_wire_dtos_are_shared_server_types_and_round_trip():
