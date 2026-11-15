@@ -77,6 +77,7 @@ from lmcache_ascend.integration.vllm.dsv41_lw_v2.connector import (
     DSV41GroupLoadError,
     StepView,
     TransferRequest,
+    _store_debug_enabled,
 )
 
 # ---------------------------------------------------------------------------
@@ -539,6 +540,8 @@ class DSV41LwV2GroupAdapter:
             "group_store_committed": 0,
             "group_store_dropped": 0,
             "group_store_failed": 0,
+            "store_stage_empty": 0,
+            "store_stage_noop": 0,
             "boundary_staged": 0,
             "boundary_attached": 0,
             "boundary_captured": 0,
@@ -826,6 +829,16 @@ class DSV41LwV2GroupAdapter:
                 stage_failures.append((request, str(exc)))
                 continue
             if not staged:
+                self._counters["store_stage_empty"] += 1
+                if _store_debug_enabled():
+                    logger_warning(
+                        "dsv41 lw v2 store staged nothing for request %s "
+                        "group %s (store=[%s,%s))",
+                        request.request_id,
+                        group_id,
+                        request.store_start,
+                        request.store_prefix_end,
+                    )
                 continue
             event = GroupEvent(group_id, request.request_id, _STORE)
             event.add(len(staged))
@@ -1516,6 +1529,7 @@ class DSV41LwV2GroupAdapter:
         if request.store_start >= request.store_prefix_end:
             # Nothing new to store in this step; this is a normal no-op, not a
             # reason to drop the group.
+            self._counters["store_stage_noop"] += 1
             return []
         staged: list[_StagedStore] = []
         groups = request.block_ids_by_engine_group

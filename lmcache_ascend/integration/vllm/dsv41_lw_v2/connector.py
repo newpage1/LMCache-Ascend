@@ -33,6 +33,8 @@ from __future__ import annotations
 
 # Standard
 from dataclasses import dataclass
+import logging
+import os
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -146,6 +148,92 @@ def _merge_id_sets(
         return base  # type: ignore[return-value]
     base_ids = set(base) if base else set()
     return base_ids | extra_ids
+
+
+#: Environment switch for the store-plumbing diagnostics.  Unset by default:
+#: a serving deployment pays nothing unless an operator asks for the trace.
+_STORE_DEBUG_ENV = "DSV41_LW_V2_STORE_DEBUG"
+
+logger = logging.getLogger(__name__)
+
+
+def _store_debug_enabled() -> bool:
+    """Return whether ``DSV41_LW_V2_STORE_DEBUG`` is switched on."""
+    value = os.environ.get(_STORE_DEBUG_ENV, "")
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _render_store_decision(
+    *,
+    request_id: str,
+    kind: str,
+    tracker: Any,
+    group_tokens_per_block: Sequence[int],
+    tokens_per_chunk: int,
+    save_decode_cache: bool,
+    emitted: int,
+) -> str:
+    """Explain one request's ``GetStoreMetadata`` decision, read-only.
+
+    Mirrors the stock computation (``lmcache_mp_metadata``) without touching
+    the tracker, so a serving log can answer "why was there no STORE" with
+    the same numbers the scheduler used.
+    """
+    scheduled = int(getattr(tracker, "num_scheduled_tokens", 0) or 0)
+    engine_computed = int(
+        getattr(tracker, "num_engine_computed_tokens", 0) or 0
+    )
+    stored = int(getattr(tracker, "num_stored_tokens", 0) or 0)
+    vllm_hit = int(getattr(tracker, "num_vllm_hit_tokens", 0) or 0)
+    lmcache_hit = int(getattr(tracker, "num_lmcache_hit_tokens", 0) or 0)
+    prompt = int(getattr(tracker, "num_prompt_tokens", 0) or 0)
+    token_count = len(getattr(tracker, "all_token_ids", ()) or ())
+    max_offload = getattr(tracker, "max_offload_tokens", None)
+    num_allocated = getattr(tracker, "num_allocated_blocks", None)
+    allocated_blocks = {}
+    if callable(num_allocated):
+        allocated_blocks = dict(num_allocated())
+    group_tokens = tuple(int(value) for value in group_tokens_per_block)
+    computed = max(scheduled + max(vllm_hit, lmcache_hit), engine_computed)
+    allocated = min(
+        (
+            int(allocated_blocks.get(index, 0)) * span
+            for index, span in enumerate(group_tokens)
+            if span > 0
+        ),
+        default=0,
+    )
+    available = min(token_count, allocated, computed)
+    if not save_decode_cache:
+        available = min(available, prompt)
+    if max_offload is not None:
+        available = min(available, int(max_offload))
+    staging = available - stored
+    chunks = 0 if tokens_per_chunk <= 0 else staging // tokens_per_chunk
+    reasons: list[str] = []
+    if tokens_per_chunk <= 0:
+        reasons.append("chunk_size_unset")
+    if chunks < 1:
+        if allocated == 0:
+            reasons.append("allocated_tokens_zero")
+        elif computed < stored + tokens_per_chunk:
+            reasons.append("computed_below_next_chunk")
+        elif available < stored + tokens_per_chunk:
+            reasons.append("available_below_next_chunk")
+        elif stored % tokens_per_chunk != 0:
+            reasons.append("stored_not_chunk_aligned")
+        else:
+            reasons.append("no_complete_chunk")
+    reason = "+".join(reasons) or "store_emitted"
+    return (
+        f"dsv41 lw v2 store debug kind={kind} request={request_id} "
+        f"scheduled={scheduled} engine_computed={engine_computed} "
+        f"computed={computed} stored={stored} prompt={prompt} "
+        f"tokens={token_count} allocated_blocks={allocated_blocks} "
+        f"allocated_tokens={allocated} available={available} "
+        f"staging={staging} chunks={chunks} emitted={emitted} "
+        f"reason={reason}"
+    )
 
 
 @dataclass(frozen=True)
@@ -1018,6 +1106,71 @@ class DSV41LwV2Connector(LMCacheMPConnector):
                 f"unavailable ({exc})"
             ) from exc
 
+    def build_connector_meta(self, scheduler_output: Any) -> Any:
+        """Build the stock metadata and explain store decisions on request.
+
+        The decision itself stays in the stock connector; this hook only adds
+        diagnostics behind ``DSV41_LW_V2_STORE_DEBUG=1``.  It never mutates
+        the metadata and never raises into the scheduler.
+        """
+        metadata = super().build_connector_meta(scheduler_output)
+        if _store_debug_enabled():
+            try:
+                for line in self._store_debug_lines(
+                    scheduler_output, metadata
+                ):
+                    logger.info("%s", line)
+            except Exception:  # pragma: no cover - diagnostics only
+                logger.exception("dsv41 lw v2 store diagnostics failed")
+        return metadata
+
+    def _store_debug_lines(
+        self, scheduler_output: Any, metadata: Any
+    ) -> list[str]:
+        """Render one line per scheduled request for the store decision."""
+        trackers = getattr(self, "request_trackers", None)
+        if not isinstance(trackers, dict):
+            return []
+        scheduler_adapter = getattr(self, "scheduler_adapter", None)
+        tokens_per_chunk = int(
+            getattr(scheduler_adapter, "lmcache_tokens_per_chunk", 0) or 0
+        )
+        group_tokens = getattr(self, "_group_tokens_per_block", ()) or ()
+        save_decode_cache = bool(getattr(self, "_save_decode_cache", False))
+        emitted: dict[str, int] = {}
+        for entry in getattr(metadata, "requests", ()) or ():
+            if getattr(entry, "direction", None) == "STORE":
+                request_id = str(getattr(entry, "request_id", ""))
+                emitted[request_id] = emitted.get(request_id, 0) + 1
+        scheduled: list[tuple[str, str]] = []
+        for request in getattr(scheduler_output, "scheduled_new_reqs", ()) or ():
+            scheduled.append(("new", str(getattr(request, "req_id", ""))))
+        cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        for request_id in list(getattr(cached, "req_ids", ()) or ()):
+            scheduled.append(("cached", str(request_id)))
+        lines: list[str] = []
+        for kind, request_id in scheduled:
+            tracker = trackers.get(request_id)
+            if tracker is None:
+                lines.append(
+                    f"dsv41 lw v2 store debug kind={kind} "
+                    f"request={request_id} emitted=0 "
+                    "reason=missing_tracker"
+                )
+                continue
+            lines.append(
+                _render_store_decision(
+                    request_id=request_id,
+                    kind=kind,
+                    tracker=tracker,
+                    group_tokens_per_block=group_tokens,
+                    tokens_per_chunk=tokens_per_chunk,
+                    save_decode_cache=save_decode_cache,
+                    emitted=emitted.get(request_id, 0),
+                )
+            )
+        return lines
+
     @property
     def metrics(self) -> dict[str, int]:
         """Expose router counters plus ``adapter_*`` transport counters.
@@ -1062,10 +1215,28 @@ class DSV41LwV2Connector(LMCacheMPConnector):
             # boundary may be captured or restored for it.
             self._lw_v2_step_noted = False
             self._lw_v2_current_step = None
+            if _store_debug_enabled():
+                logger.info(
+                    "dsv41 lw v2 worker step empty: metadata_requests=%d "
+                    "no_transfer_endpoints=true",
+                    len(getattr(metadata, "requests", ()) or ()),
+                )
             return
         self._lw_v2_step_noted = True
         self._lw_v2_current_step = step
         router.note_step(step)
+        if _store_debug_enabled():
+            summary = ",".join(
+                f"{request.request_id}:load={request.load_prefix_end}"
+                f":store=[{request.store_start},{request.store_prefix_end})"
+                f":block_groups={len(request.block_ids_by_engine_group)}"
+                for request in step.requests
+            )
+            logger.info(
+                "dsv41 lw v2 worker step=%d requests=%s",
+                step.step_id,
+                summary or "-",
+            )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         router = self._require_router()
@@ -1098,6 +1269,14 @@ class DSV41LwV2Connector(LMCacheMPConnector):
         wait_for_save``).
         """
         router = self._require_router()
+        if _store_debug_enabled():
+            logger.info(
+                "dsv41 lw v2 wait_for_save step=%s store_ops=%d",
+                router.current_step.step_id
+                if router.current_step is not None
+                else "none",
+                len(router.operation_keys(_STORE)),
+            )
         router.wait_for_save()
 
     def get_finished(

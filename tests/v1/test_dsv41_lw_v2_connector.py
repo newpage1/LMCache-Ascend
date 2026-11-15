@@ -13,10 +13,12 @@ from __future__ import annotations
 
 # Standard
 import importlib.util
+import logging
 import sys
 import types
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 # Third Party
 import pytest
@@ -60,12 +62,18 @@ class StubLMCacheMPConnector:
         self.stock_finished_sending: set[str] = set()
         self.stock_finished_receiving: set[str] = set()
         self.stock_failed_recving: set[str] = set()
+        # Stock metadata-build calls; the v2 connector must delegate to it.
+        self.meta_calls: list[object] = []
 
     def register_kv_caches(self, kv_caches) -> None:
         # The stock base registers layouts with the LMCache server; the
         # CPU stub only records the caches the v2 factory reads back.
         self.kv_caches = dict(kv_caches)
         StubLMCacheMPConnector.instances.append(self)
+
+    def build_connector_meta(self, scheduler_output):
+        self.meta_calls.append(scheduler_output)
+        return None
 
     def get_finished(self, finished_req_ids):
         return (
@@ -1187,3 +1195,200 @@ def test_group_store_submission_is_idempotent_per_step():
     connector.submit_group_store("g2")
     connector.submit_group_store("g2")
     assert adapter.stores.count(("g2", ("r1",))) == 1
+
+
+# ---------------------------------------------------------------------------
+# Consecutive cold requests (B01 t34 shape) and store diagnostics
+# ---------------------------------------------------------------------------
+
+
+class _FakeTracker:
+    """The numeric surface ``_render_store_decision`` reads, read-only."""
+
+    def __init__(
+        self,
+        *,
+        scheduled: int,
+        computed: int,
+        stored: int,
+        tokens: int,
+        blocks: dict[int, int],
+        vllm_hit: int = 0,
+        lmcache_hit: int = 0,
+    ) -> None:
+        self.num_scheduled_tokens = scheduled
+        self.num_engine_computed_tokens = computed
+        self.num_stored_tokens = stored
+        self.num_vllm_hit_tokens = vllm_hit
+        self.num_lmcache_hit_tokens = lmcache_hit
+        self.num_prompt_tokens = tokens
+        self.all_token_ids = tuple(range(tokens))
+        self.max_offload_tokens = None
+        self._blocks = dict(blocks)
+
+    def num_allocated_blocks(self) -> dict[int, int]:
+        return dict(self._blocks)
+
+
+def _cold_tracker(tokens: int, blocks: dict[int, int]) -> _FakeTracker:
+    return _FakeTracker(
+        scheduled=tokens,
+        computed=tokens,
+        stored=0,
+        tokens=tokens,
+        blocks=blocks,
+    )
+
+
+def test_store_decision_diagnostics_explain_a_stored_request():
+    line = connector_mod._render_store_decision(
+        request_id="r1",
+        kind="new",
+        tracker=_cold_tracker(
+            9690, {0: 38, 1: 152, 2: 1212, 3: 2423}
+        ),
+        group_tokens_per_block=(256, 64, 8, 4),
+        tokens_per_chunk=256,
+        save_decode_cache=False,
+        emitted=1,
+    )
+    assert "request=r1" in line
+    assert "scheduled=9690" in line
+    assert "computed=9690" in line
+    assert "allocated_tokens=9692" in line
+    assert "chunks=37" in line
+    assert "emitted=1" in line
+    assert "reason=store_emitted" in line
+
+
+def test_store_decision_diagnostics_flags_zero_allocated_tokens():
+    line = connector_mod._render_store_decision(
+        request_id="r2",
+        kind="new",
+        tracker=_cold_tracker(543, {0: 0, 1: 0, 2: 0, 3: 0}),
+        group_tokens_per_block=(256, 64, 8, 4),
+        tokens_per_chunk=256,
+        save_decode_cache=False,
+        emitted=0,
+    )
+    assert "allocated_tokens=0" in line
+    assert "chunks=0" in line
+    assert "reason=allocated_tokens_zero" in line
+
+
+def test_store_decision_diagnostics_flags_computed_gap():
+    tracker = _FakeTracker(
+        scheduled=128,
+        computed=128,
+        stored=0,
+        tokens=543,
+        blocks={0: 3, 1: 9, 2: 68, 3: 136},
+    )
+    line = connector_mod._render_store_decision(
+        request_id="r3",
+        kind="cached",
+        tracker=tracker,
+        group_tokens_per_block=(256, 64, 8, 4),
+        tokens_per_chunk=256,
+        save_decode_cache=False,
+        emitted=0,
+    )
+    assert "computed=128" in line
+    assert "chunks=0" in line
+    assert "reason=computed_below_next_chunk" in line
+
+
+def test_store_debug_lines_cover_new_and_cached_requests():
+    connector, _adapter, _hook = _bound()
+    connector.request_trackers = {
+        "r1": _cold_tracker(512, {0: 2, 1: 8, 2: 64, 3: 128}),
+        "r2": _cold_tracker(543, {0: 3, 1: 9, 2: 68, 3: 136}),
+    }
+    connector.scheduler_adapter = SimpleNamespace(
+        lmcache_tokens_per_chunk=256
+    )
+    connector._group_tokens_per_block = (256, 64, 8, 4)
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(req_id="r1")],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=["r2"]),
+    )
+    metadata = _metadata(_store(request_id="r1", end=512))
+
+    lines = connector._store_debug_lines(scheduler_output, metadata)
+
+    assert len(lines) == 2
+    assert "kind=new request=r1" in lines[0]
+    assert "emitted=1" in lines[0]
+    assert "kind=cached request=r2" in lines[1]
+    assert "emitted=0" in lines[1]
+
+
+def test_build_connector_meta_delegates_to_the_stock_connector(monkeypatch):
+    monkeypatch.delenv("DSV41_LW_V2_STORE_DEBUG", raising=False)
+    connector, _adapter, _hook = _bound()
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[], scheduled_cached_reqs=None
+    )
+
+    result = connector.build_connector_meta(scheduler_output)
+
+    assert result is None
+    assert connector.meta_calls == [scheduler_output]
+
+
+def test_build_connector_meta_logs_store_decisions_when_enabled(
+    monkeypatch, caplog
+):
+    monkeypatch.setenv("DSV41_LW_V2_STORE_DEBUG", "1")
+    connector, _adapter, _hook = _bound()
+    connector.request_trackers = {"r2": _cold_tracker(543, {0: 0, 1: 0, 2: 0, 3: 0})}
+    connector.scheduler_adapter = SimpleNamespace(
+        lmcache_tokens_per_chunk=256
+    )
+    connector._group_tokens_per_block = (256, 64, 8, 4)
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(req_id="r2")],
+        scheduled_cached_reqs=None,
+    )
+
+    with caplog.at_level(logging.INFO, logger=connector_mod.logger.name):
+        connector.build_connector_meta(scheduler_output)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("dsv41 lw v2 store debug" in message for message in messages)
+    assert any("reason=allocated_tokens_zero" in message for message in messages)
+
+
+def test_consecutive_cold_requests_each_submit_group_stores():
+    """Every cold request, not only the first, reaches the group stores.
+
+    B01 t34 saw the first 9690-token request store and later independent
+    cold requests store nothing. The scheduler owns the STORE decision, but
+    the v2 worker step must keep working for each later request too; this
+    pins the 3-step + 1-step + 1-step sequence.
+    """
+    connector, adapter, _hook = _bound()
+    sequence = (
+        ("r1", (3072, 6144, 9472)),
+        ("r2", (512,)),
+        ("r3", (1280,)),
+    )
+
+    for request_id, ends in sequence:
+        for end in ends:
+            connector._connector_metadata = _metadata(
+                _store(request_id=request_id, end=end)
+            )
+            connector.start_load_kv(None)
+            connector.wait_for_save()
+
+    assert len(adapter.stores) == 5 * 4
+    for request_id in ("r1", "r2", "r3"):
+        stored_groups = {
+            group_id
+            for group_id, request_ids in adapter.stores
+            if request_ids == (request_id,)
+        }
+        assert stored_groups == {"g2", "g8", "g14", "g20"}
+    # One drain per step: three for r1 plus one for each later request.
+    assert adapter.drain_count == 5
