@@ -1578,7 +1578,13 @@ def test_post_forward_ordering_stores_each_window_and_defers_boundary():
         )
     )
     assert len(server.blocks) == 8
-    assert not server.boundaries
+    # The prefill forward captures at its own endpoint (4) before vLLM 0.30
+    # builds the store step; the post-forward submit attaches it to window
+    # [0, 4) instead of dropping it.
+    assert len(server.boundaries) == 1
+    assert next(iter(server.boundaries))[3] == 4
+    assert adapter.metrics["boundary_captured"] == 1
+    assert adapter.metrics["boundary_attached"] == 1
 
     # r1 step 1: 4..8 computed, live prefix 8 => boundary endpoint 8.
     forward(8)
@@ -1590,10 +1596,10 @@ def test_post_forward_ordering_stores_each_window_and_defers_boundary():
     )
     assert len(server.blocks) == 16
     boundary_keys = list(server.boundaries)
-    assert len(boundary_keys) == 1
-    assert boundary_keys[0][3] == 8
-    assert adapter.metrics["boundary_captured"] == 1
-    assert adapter.metrics["boundary_attached"] == 1
+    assert len(boundary_keys) == 2
+    assert sorted(key[3] for key in boundary_keys) == [4, 8]
+    assert adapter.metrics["boundary_captured"] == 2
+    assert adapter.metrics["boundary_attached"] == 2
 
     # r2 is a single-step request: its stores must be submitted without any
     # further forward (a decode step served from a CUDA graph has no hooks).
@@ -1609,6 +1615,10 @@ def test_post_forward_ordering_stores_each_window_and_defers_boundary():
     # r2 shares r1's prefix, so the same stock block keys are rewritten.
     assert len(server.blocks) == 16
     assert router.metrics["steps_with_store"] == 3
+    # r1's second forward already captured endpoint 8, so r2 rewrites tokens
+    # only; no further aligned prefill forward exists to capture a new page.
+    assert adapter.metrics["boundary_captured"] == 2
+    assert adapter.metrics["boundary_attached"] == 2
     assert adapter.metrics["group_store_dropped"] == 0
     assert adapter.metrics["worker_failures"] == 0
 

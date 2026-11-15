@@ -163,6 +163,16 @@ def _store_debug_enabled() -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _debug(message: str, *args: object) -> None:
+    """Emit a gated routing diagnostic; never changes a decision."""
+    if not _store_debug_enabled():
+        return
+    try:
+        logger.warning("dsv41 lw v2 store debug " + message, *args)
+    except Exception:  # pragma: no cover - diagnostics must never raise
+        return
+
+
 def _render_store_decision(
     *,
     request_id: str,
@@ -697,20 +707,45 @@ class GroupTransferRouter:
     def capture_group_boundary(self, group_id: str) -> None:
         group = self._require_group(group_id)
         ops = self._ops.get(group.group_id)
-        if ops is None or not ops.store_request_ids or not group.has_boundary:
+        step = self._step
+        if step is not None and step.synthetic:
             self._counters["boundary_capture_skipped"] += 1
+            _debug("capture skipped group=%s reason=synthetic_step", group_id)
             return
-        if ops.boundary_captured:
+        if not group.has_boundary:
             self._counters["boundary_capture_skipped"] += 1
+            _debug("capture skipped group=%s reason=no_boundary", group_id)
+            return
+        if ops is not None and ops.boundary_captured:
+            self._counters["boundary_capture_skipped"] += 1
+            _debug("capture skipped group=%s reason=already_captured", group_id)
             return
         if self._boundary_hook is None:
             raise DSV41LwV2NotReadyError(
                 f"group {group_id} must store a boundary but no boundary "
                 "codec is bound (BOUNDARY_NOT_BOUND)"
             )
+        _debug(
+            "capture group=%s step=%s store_ids=%s windows=%s",
+            group_id,
+            step.step_id if step is not None else None,
+            list(ops.store_request_ids) if ops is not None else [],
+            [
+                (request.request_id, request.load_prefix_end,
+                 request.store_start, request.store_prefix_end)
+                for request in (step.requests if step is not None else ())
+            ],
+        )
+        # vLLM 0.30 builds the store metadata only after the prefill forward.
+        # Capture from the live forward so the boundary state is taken at the
+        # endpoint a later store window will carry; the engine hook keeps only
+        # chunk-aligned endpoints.  A missing ops row is therefore expected on
+        # the cold prefill path, not a reason to skip the capture.
         self._boundary_hook.capture_group_boundary(group.group_id)
+        _debug("capture done group=%s", group_id)
         self._counters["boundary_capture_calls"] += 1
-        ops.boundary_captured = True
+        if ops is not None:
+            ops.boundary_captured = True
         self._counters["boundary_captured"] += 1
 
     def submit_group_store(self, group_id: str) -> None:
@@ -1498,6 +1533,16 @@ class DSV41LwV2Connector(LMCacheMPConnector):
             synthetic=synthetic,
             requests=tuple(requests),
         )
+
+    @property
+    def registration_epoch(self) -> int:
+        """Current worker registration epoch (engine boundary DTO facts)."""
+        return int(self._lw_v2_registration_epoch)
+
+    @property
+    def server_generation(self) -> int:
+        """Server generation the worker currently addresses."""
+        return int(self._lw_v2_server_generation)
 
     def set_generations(
         self, *, registration_epoch: int, server_generation: int

@@ -818,7 +818,10 @@ def test_no_hit_decode_step_is_a_complete_noop():
 
     assert adapter.calls == []
     assert adapter.drain_count == 0
-    assert hook.calls == []
+    # A head with no transport step still asks the engine for a boundary: the
+    # engine captures only chunk-aligned endpoints, so the decode attempt is
+    # a no-op there rather than a connector-side guess.
+    assert hook.calls == [("capture", "g2")]
     assert connector.metrics["requests_dropped"] == 0
 
 

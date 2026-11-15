@@ -1007,6 +1007,12 @@ class DSV41LwV2GroupAdapter:
             boundary_end=int(boundary_end),
         )
         key = (request_id, resource_id)
+        _store_debug(
+            "stage boundary request=%s resource=%s end=%s",
+            request_id,
+            resource_id,
+            boundary_end,
+        )
         released: list[_BoundaryCapture] = []
         with self._lock:
             slot = self._boundary_stage.setdefault(key, {})
@@ -1036,6 +1042,7 @@ class DSV41LwV2GroupAdapter:
         """Count one boundary page successfully staged by the codec."""
         with self._lock:
             self._counters["boundary_staged"] += 1
+        _store_debug("boundary staged counter advanced")
 
     def record_boundary_restored(self) -> None:
         """Count one boundary page actually written into a live ring."""
@@ -1679,6 +1686,14 @@ class DSV41LwV2GroupAdapter:
                     # attached to a store operation is not yet visible on the
                     # server, so gate-1 must use the committed counter.
                     self._counters["boundary_attached"] += 1
+        elif group.has_boundary:
+            _store_debug(
+                "boundary not staged request=%s group=%s store_end=%s "
+                "staged_tokens=0",
+                request.request_id,
+                group.group_id,
+                request.store_prefix_end,
+            )
         return staged
 
     def _take_boundary_capture(
@@ -1696,6 +1711,13 @@ class DSV41LwV2GroupAdapter:
         released: list[_BoundaryCapture] = []
         with self._lock:
             slot = self._boundary_stage.get(key)
+            _store_debug(
+                "take boundary request=%s resource=%s store_end=%s slot=%s",
+                request_id,
+                resource_id,
+                store_end,
+                sorted(slot) if slot else (),
+            )
             if not slot:
                 return None
             capture = slot.pop(store_end, None)
