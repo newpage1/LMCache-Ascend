@@ -56,12 +56,17 @@ class _StubConnector:
         self.stock_finished_sending: set[str] = set()
         self.stock_finished_receiving: set[str] = set()
         self.stock_failed_recving: set[str] = set()
+        self.meta_calls: list[object] = []
 
     def register_kv_caches(self, kv_caches) -> None:
         # The stock base registers layouts with the LMCache server; the
         # CPU stub only records the caches the v2 factory reads back.
         self.kv_caches = dict(kv_caches)
         _StubConnector.instances.append(self)
+
+    def build_connector_meta(self, scheduler_output):
+        self.meta_calls.append(scheduler_output)
+        return getattr(scheduler_output, "kv_connector_metadata", None)
 
     def get_finished(self, finished_req_ids):
         return (
@@ -1606,3 +1611,63 @@ def test_post_forward_ordering_stores_each_window_and_defers_boundary():
     assert router.metrics["steps_with_store"] == 3
     assert adapter.metrics["group_store_dropped"] == 0
     assert adapter.metrics["worker_failures"] == 0
+
+
+def test_two_cold_requests_store_every_window_at_production_sizes():
+    """t37: a 9690-token request then a 543-token request both submit stores.
+
+    Mirrors the B01 shape: chunk 256, block 128, twelve block groups, three
+    prefill windows for the long request and one 512-token window for the
+    short one.  Both requests must produce concrete store specs; nothing may
+    be silently dropped at the submit/stage boundary.
+    """
+    server = _FakeServer()
+    transport = FakeTransport(server)
+    caches = _make_caches(rows=80)
+    adapter = _make_adapter(
+        transport,
+        caches=caches,
+        chunk_size=256,
+        block_size=128,
+        load_timeout=2.0,
+        store_timeout=2.0,
+    )
+    router = connector_mod.GroupTransferRouter(PLAN)
+    router.bind_adapter(adapter)
+
+    long_blocks = tuple(tuple(range(76)) for _ in range(12))
+    short_blocks = tuple(
+        tuple(range(5)) if index == 0 else (0,) for index in range(12)
+    )
+    long_tokens = _token_bytes(9690)
+    short_tokens = _token_bytes(543)
+    windows = (
+        ("r1", 0, 0, 4096),
+        ("r1", 1, 4096, 8192),
+        ("r1", 2, 8192, 9472),
+        ("r2", 3, 0, 512),
+    )
+    for request_id, step_id, start, end in windows:
+        request = _request(
+            request_id,
+            step_id=step_id,
+            load_prefix_end=0,
+            store_prefix_end=end,
+            store_start=start,
+            blocks=long_blocks if request_id == "r1" else short_blocks,
+            tokens=long_tokens if request_id == "r1" else short_tokens,
+        )
+        router.note_step(_step(request))
+        router.wait_for_save()
+
+    adapter.drain_stores()
+
+    r1_specs = [spec for spec in server.store_specs if spec.request_id == "r1"]
+    r2_specs = [spec for spec in server.store_specs if spec.request_id == "r2"]
+    assert len(r1_specs) == 8 * 37
+    assert len(r2_specs) == 8 * 2
+    assert {spec.start_token for spec in r2_specs} == {0, 256}
+    assert adapter.metrics["group_store_dropped"] == 0
+    assert adapter.metrics["store_stage_empty"] == 0
+    assert adapter.metrics["worker_failures"] == 0
+    assert adapter.metrics["group_store_committed"] == 16

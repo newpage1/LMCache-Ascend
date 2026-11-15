@@ -48,6 +48,9 @@ class _StubStockConnector:
     def register_kv_caches(self, kv_caches) -> None:
         self.kv_caches = dict(kv_caches)
 
+    def build_connector_meta(self, scheduler_output):
+        return getattr(scheduler_output, "kv_connector_metadata", None)
+
 
 def _install_stock_stub() -> None:
     name = "lmcache.integration.vllm.lmcache_mp_connector"

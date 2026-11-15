@@ -47,6 +47,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, runtime_checkable
 import json
+import os
 import queue
 import struct
 import threading
@@ -819,9 +820,24 @@ class DSV41LwV2GroupAdapter:
         group = self._plan.group_by_id(group_id)
         self._remember_requests(step)
         requests = self._requests_for(step, request_ids)
+        _store_debug(
+            "submit group=%s step=%s requests=%s window=[%s,%s) resources=%d",
+            group_id,
+            step.step_id,
+            list(request_ids),
+            min((item.store_start for item in requests), default=-1),
+            max((item.store_prefix_end for item in requests), default=-1),
+            len(group.transfer_resources),
+        )
         stage_failures: list[tuple[TransferRequest, str]] = []
         for request in requests:
             if request.store_prefix_end <= 0:
+                _store_debug(
+                    "skip request=%s group=%s: store_prefix_end=%s",
+                    request.request_id,
+                    group_id,
+                    request.store_prefix_end,
+                )
                 continue
             try:
                 staged = self._stage_store(group, request)
@@ -1361,6 +1377,17 @@ class DSV41LwV2GroupAdapter:
                 prefix_end=staged.chunk_end,
             )
             payload = self._encode_staged(staged)
+            _store_debug(
+                "run store request=%s resource=%s chunk=[%s,%s) blocks=%d "
+                "bytes=%s op=%s",
+                staged.request_id,
+                staged.resource_id,
+                staged.chunk_start,
+                staged.chunk_end,
+                len(staged.block_ids),
+                -1 if payload is None else len(payload),
+                spec.operation_id,
+            )
             if payload is None:
                 event.fail(
                     resource_id=staged.resource_id,
@@ -1371,6 +1398,12 @@ class DSV41LwV2GroupAdapter:
             try:
                 future = self._transport.store_resource_block(spec, payload)
             except Exception as exc:  # noqa: BLE001 - terminal store failure
+                _store_debug(
+                    "transport store raised request=%s resource=%s: %r",
+                    staged.request_id,
+                    staged.resource_id,
+                    exc,
+                )
                 event.fail(
                     resource_id=staged.resource_id,
                     error_code=IO_ERROR,
@@ -1407,6 +1440,13 @@ class DSV41LwV2GroupAdapter:
         try:
             result = future.result()
         except Exception as exc:  # noqa: BLE001 - reported terminally
+            _store_debug(
+                "store future raised request=%s resource=%s chunk_end=%s: %r",
+                event.request_id,
+                resource_id,
+                staged.chunk_end,
+                exc,
+            )
             self._terminal_ops.add(terminal)
             event.fail(
                 resource_id=resource_id,
@@ -1417,6 +1457,16 @@ class DSV41LwV2GroupAdapter:
         if not isinstance(result, ResourceBlockResult) or result.status not in (
             STATUS_OK,
         ):
+            _store_debug(
+                "store result not ok request=%s resource=%s chunk_end=%s "
+                "status=%s error=%s op=%s",
+                event.request_id,
+                resource_id,
+                staged.chunk_end,
+                getattr(result, "status", "?"),
+                getattr(result, "error_code", ""),
+                getattr(result, "operation_id", "?"),
+            )
             self._terminal_ops.add(terminal)
             event.fail(
                 resource_id=resource_id,
@@ -1551,6 +1601,19 @@ class DSV41LwV2GroupAdapter:
                 (request.request_id, resource.resource_id), 0
             )
             start = max(stored_end, request.store_start)
+            _store_debug(
+                "stage request=%s group=%s resource=%s window=[%s,%s) "
+                "stored_end=%s start=%s blocks=%d needed=%d",
+                request.request_id,
+                group.group_id,
+                resource.resource_id,
+                request.store_start,
+                request.store_prefix_end,
+                stored_end,
+                start,
+                len(resource_blocks),
+                needed_blocks,
+            )
             while start < request.store_prefix_end:
                 chunk_end = min(start + self._chunk_size, request.store_prefix_end)
                 if chunk_end - start != self._chunk_size:
@@ -1921,8 +1984,12 @@ class DSV41LwV2GroupAdapter:
     def _enqueue(self, job: Any) -> bool:
         try:
             self._jobs.put_nowait(job)
+            kind = job[0] if isinstance(job, tuple) else type(job).__name__
+            _store_debug("enqueue kind=%s size=%d", kind, self._jobs.qsize())
             return True
         except queue.Full:
+            kind = job[0] if isinstance(job, tuple) else type(job).__name__
+            _store_debug("enqueue failed kind=%s queue is full", kind)
             with self._lock:
                 self._counters["queue_full"] += 1
             return False
@@ -2112,6 +2179,31 @@ def logger_warning(message: str, *args: Any) -> None:
 
         init_logger(__name__).warning(message, *args)
     except Exception:  # pragma: no cover - logging must never mask a failure
+        return
+
+
+_STORE_DEBUG_FILE_ENV = "DSV41_LW_V2_STORE_DEBUG_FILE"
+
+
+def _store_debug(message: str, *args: Any) -> None:
+    """Emit a gated store-path diagnostic; never changes a decision."""
+    if not _store_debug_enabled():
+        return
+    try:
+        text = message % args if args else message
+    except Exception:  # pragma: no cover - diagnostics must never raise
+        text = f"{message} {args!r}"
+    logger_warning("dsv41 lw v2 store debug %s", text)
+    path = os.environ.get(_STORE_DEBUG_FILE_ENV, "").strip()
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(
+                f"{time.time():.6f} {os.getpid()} "
+                f"{threading.get_ident()} {text}\n"
+            )
+    except OSError:  # pragma: no cover - diagnostics must never raise
         return
 
 
