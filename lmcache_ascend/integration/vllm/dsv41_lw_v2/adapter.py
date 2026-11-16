@@ -437,12 +437,24 @@ class _StagedStore:
     extraction: _StoreExtraction | None = None
 
 
+class _StoreCancelled(Exception):
+    """Raised when a batch's source ownership is force-released mid-read.
+
+    ``read_done`` alone cannot stop a worker that is already inside
+    ``_extract_staged``: once ``synchronize`` returns, the rows may be read
+    at any instant.  ``cancelled`` is the tombstone the worker re-checks
+    after the stream synchronisation and before ``index_select`` so a forced
+    batch is never submitted with rows the engine may already have released.
+    """
+
+
 @dataclass
 class _StoreBatch:
     event: GroupEvent
     staged: list[_StagedStore] = field(default_factory=list)
     read_done: threading.Event = field(default_factory=threading.Event)
     accounted: bool = False
+    cancelled: bool = False
 
 
 @dataclass
@@ -996,9 +1008,12 @@ class DSV41LwV2GroupAdapter:
             if not queued:
                 # The worker never picked this batch up, so it cannot be
                 # reading the source rows: source ownership is trivially
-                # released here.  Without this, flush_source_reads would
-                # wait out its timeout on every get_finished and the request
-                # would never be reported as finished_sending.
+                # released here.  Mark the tombstone as well so a batch that
+                # is somehow dequeued later cannot extract released rows.
+                # Without this, flush_source_reads would wait out its
+                # timeout on every get_finished and the request would never
+                # be reported as finished_sending.
+                batch.cancelled = True
                 batch.read_done.set()
                 self._fail_event(
                     event,
@@ -1128,12 +1143,18 @@ class DSV41LwV2GroupAdapter:
                             # After repeated timeouts, stop pinning the
                             # source: the batch is already terminal, so the
                             # request must be allowed to report finished.
+                            # The tombstone makes a worker that is still
+                            # inside the read abandon extraction instead of
+                            # submitting rows the engine may now release.
+                            batch.cancelled = True
                             batch.read_done.set()
-            logger_warning(
-                "dsv41 lw v2 source read did not finish for requests %s; "
-                "keeping their blocks alive",
-                sorted(timed_out - forced),
-            )
+            pending = timed_out - forced
+            if pending:
+                logger_warning(
+                    "dsv41 lw v2 source read did not finish for requests %s; "
+                    "keeping their blocks alive",
+                    sorted(pending),
+                )
             if forced:
                 logger_warning(
                     "dsv41 lw v2 source read forced done for requests %s "
@@ -1613,8 +1634,24 @@ class DSV41LwV2GroupAdapter:
         try:
             if event.is_terminal:
                 return
+            if batch.cancelled:
+                self._fail_event(
+                    event,
+                    resource_id=None,
+                    error_code=IO_ERROR,
+                    message="store cancelled: source rows released before extraction",
+                )
+                return
             for staged in batch.staged:
                 if event.is_terminal:
+                    return
+                if batch.cancelled:
+                    self._fail_event(
+                        event,
+                        resource_id=None,
+                        error_code=IO_ERROR,
+                        message="store cancelled: source rows released before extraction",
+                    )
                     return
                 self._run_store_one(batch, staged)
         finally:
@@ -1626,6 +1663,13 @@ class DSV41LwV2GroupAdapter:
 
     def _run_store_one(self, batch: _StoreBatch, staged: _StagedStore) -> None:
         event = batch.event
+        if batch.cancelled:
+            event.fail(
+                resource_id=staged.resource_id,
+                error_code=IO_ERROR,
+                message="store cancelled: source rows released before extraction",
+            )
+            return
         spec = self._spec(
             direction=_STORE,
             request=self._request_by_id(staged.request_id),
@@ -1641,7 +1685,17 @@ class DSV41LwV2GroupAdapter:
             ),
             prefix_end=staged.chunk_end,
         )
-        payload = self._encode_staged(staged)
+        try:
+            payload = self._encode_staged(
+                staged, cancelled=lambda: batch.cancelled
+            )
+        except _StoreCancelled:
+            event.fail(
+                resource_id=staged.resource_id,
+                error_code=IO_ERROR,
+                message="store cancelled: source rows released after stream synchronize",
+            )
+            return
         _store_debug(
             "run store request=%s resource=%s chunk=[%s,%s) blocks=%d "
             "bytes=%s op=%s",
@@ -2385,14 +2439,27 @@ class DSV41LwV2GroupAdapter:
             raise ValueError("boundary capture encoding failed")
         return capture.encoded
 
-    def _extract_staged(self, staged: _StagedStore) -> tuple[torch.Tensor, ...]:
+    def _extract_staged(
+        self,
+        staged: _StagedStore,
+        *,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> tuple[torch.Tensor, ...]:
         """Extract the staged rows on the worker thread.
 
         ``_stage_store`` only records the cache name and row indices.  The
         worker waits for the producer-stream event before reading, so the
         forward that wrote these rows has completed; it never holds the
         engine thread while slicing.
+
+        ``cancelled`` is checked before touching the cache and again after
+        ``synchronize``: a forced batch releases source ownership while the
+        worker may already be inside this method, so the second check is the
+        one that prevents reading (and submitting) rows the engine no longer
+        pins.
         """
+        if cancelled is not None and cancelled():
+            raise _StoreCancelled()
         extraction = staged.extraction
         if extraction is None:
             return staged.planes
@@ -2403,6 +2470,8 @@ class DSV41LwV2GroupAdapter:
             extraction.event.synchronize()
             if trace:
                 sync_ns = time.monotonic_ns() - sync_started
+        if cancelled is not None and cancelled():
+            raise _StoreCancelled()
         value = self._kv_caches.get(extraction.cache_name)
         if value is None:
             if trace:
@@ -2500,7 +2569,12 @@ class DSV41LwV2GroupAdapter:
             fields["error_code"] = error_code
         mask_trace.emit("store_extract", **fields)
 
-    def _encode_staged(self, staged: _StagedStore) -> bytes | None:
+    def _encode_staged(
+        self,
+        staged: _StagedStore,
+        *,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> bytes | None:
         trace = _mask_trace_enabled()
         if staged.is_boundary:
             capture = staged.capture
@@ -2537,7 +2611,7 @@ class DSV41LwV2GroupAdapter:
         payload = encode_token_payload(
             resource_id=staged.resource_id,
             block_ids=staged.block_ids,
-            planes=self._extract_staged(staged),
+            planes=self._extract_staged(staged, cancelled=cancelled),
             timings=timings,
         )
         if trace:
@@ -3132,6 +3206,7 @@ class DSV41LwV2GroupAdapter:
             # required for liveness; the failure itself still fails the
             # batch closed.
             if not batch.read_done.is_set():
+                batch.cancelled = True
                 batch.read_done.set()
                 with self._lock:
                     self._counters["source_read_forced"] += 1

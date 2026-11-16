@@ -2336,6 +2336,13 @@ def test_queue_full_submit_releases_source_reads_and_reports_finished():
     adapter.submit_group_store("g20", ("r1",), _step(request))
     assert time.monotonic() - started < 1.0
     assert adapter.metrics["queue_full"] >= 1
+    (batch,) = [
+        item
+        for item in adapter._store_batches
+        if item.event.request_id == "r1"
+    ]
+    assert batch.cancelled is True
+    assert batch.read_done.is_set()
 
     # queued=False means the worker never read the rows: flush must be a
     # no-op rather than waiting out the source-read timeout.
@@ -2361,6 +2368,7 @@ def test_worker_failure_releases_source_read_ownership():
         "store", batch, RuntimeError("worker died")
     )
     assert batch.read_done.is_set()
+    assert batch.cancelled is True
     assert adapter.flush_source_reads({"r1"}, timeout=0.01) == set()
     adapter.drain_stores()
     assert adapter.take_finished(finished_req_ids={"r1"})[0] == {"r1"}
@@ -2384,5 +2392,58 @@ def test_repeated_source_read_timeouts_force_the_batch_done():
         assert not batch.read_done.is_set()
     assert adapter.flush_source_reads({"r9"}, timeout=0.005) == set()
     assert batch.read_done.is_set()
+    assert batch.cancelled is True
     assert adapter.metrics["source_read_forced"] >= 1
+    adapter.close()
+
+
+def test_cancelled_batch_is_not_extracted_by_a_live_worker():
+    """t82: a forced batch must not read or submit rows it no longer pins."""
+    server = _FakeServer()
+    adapter = _make_adapter(FakeTransport(server), store_timeout=60.0)
+    entered = threading.Event()
+    release = threading.Event()
+    extract_calls = {"r1": 0, "r2": 0}
+    original_extract = adapter._extract_staged  # noqa: SLF001
+
+    def gated_extract(staged, *, cancelled=None):
+        extract_calls[staged.request_id] = (
+            extract_calls.get(staged.request_id, 0) + 1
+        )
+        if staged.request_id == "r1":
+            entered.set()
+            assert release.wait(5.0)
+        return original_extract(staged, cancelled=cancelled)
+
+    adapter._extract_staged = gated_extract  # noqa: SLF001
+
+    r1 = _request("r1", load_prefix_end=0, store_prefix_end=TOKENS)
+    adapter.submit_group_store("g20", ("r1",), _step(r1))
+    assert entered.wait(2.0), "r1 did not start extracting"
+
+    r2 = _request("r2", load_prefix_end=0, store_prefix_end=TOKENS)
+    adapter.submit_group_store("g20", ("r2",), _step(r2))
+    # The single worker is still inside r1's read, so r2 is queued and its
+    # source ownership can only be released by the repeated-timeout path.
+    for _ in range(adapter_mod._SOURCE_READ_FORCE_AFTER - 1):
+        assert adapter.flush_source_reads({"r2"}, timeout=0.005) == {"r2"}
+    assert adapter.flush_source_reads({"r2"}, timeout=0.005) == set()
+    batch2 = next(
+        item
+        for item in adapter._store_batches
+        if item.event.request_id == "r2"
+    )
+    assert batch2.cancelled is True
+    assert batch2.read_done.is_set()
+    assert extract_calls.get("r2", 0) == 0
+
+    release.set()
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and not batch2.event.is_terminal:
+        time.sleep(0.01)
+    assert batch2.event.is_terminal
+    assert extract_calls.get("r2", 0) == 0
+    assert not [spec for spec in server.store_specs if spec.request_id == "r2"]
+    adapter.drain_stores()
+    assert "r2" in adapter.take_finished(finished_req_ids={"r2"})[0]
     adapter.close()
