@@ -2131,9 +2131,16 @@ def test_async_store_trace_emits_describe_extract_encode_rpc_and_queue(
     assert rpc["bytes"] > 0
     assert rpc["status"] == "ok"
 
+    assert encode["copy_ns"] >= 0
+
     queue = [item for item in by_event["queue_wait"] if item.get("kind") == "store"]
     assert queue
     assert queue[0]["request_id"] == "r1"
+    assert queue[0]["group_id"] == "g20"
+    assert queue[0]["resources"]
+    assert queue[0]["bytes"] > 0
+    assert queue[0]["rows"] > 0
+    assert queue[0]["start_ns"] <= queue[0]["end_ns"]
     assert queue[0]["qsize"] >= 0
     assert queue[0]["status"] == "ok"
     adapter.close()
@@ -2192,6 +2199,127 @@ def test_async_store_trace_keeps_the_terminal_failure_path(
     assert failed
     assert failed[0]["error_code"] == "IO_ERROR"
     adapter.close()
+
+
+def test_async_store_trace_reports_queue_identity_and_planned_bytes(
+    tmp_path, monkeypatch
+):
+    """t78: queue_wait carries the batch identity, rows and planned bytes."""
+    trace = sys.modules[PACKAGE + ".mask_trace"]
+    monkeypatch.setenv(trace.ENV_ENABLED, "1")
+    monkeypatch.setenv(trace.ENV_DIR, str(tmp_path))
+    trace.reset_state()
+
+    adapter = _make_adapter(FakeTransport(_FakeServer()))
+    adapter.register()
+    request = _request("r1", load_prefix_end=0, store_prefix_end=TOKENS)
+    adapter.submit_group_store("g20", ("r1",), _step(request))
+    adapter.drain_stores()
+
+    queue = [
+        record
+        for record in _trace_records(tmp_path)
+        if record["event"] == "queue_wait" and record.get("kind") == "store"
+    ]
+    assert queue
+    record = queue[0]
+    assert record["group_id"] == "g20"
+    assert record["request_id"] == "r1"
+    group = PLAN.group_by_id("g20")
+    assert record["resources"] == sorted(
+        resource.resource_id for resource in group.transfer_resources
+    )
+    # rows count every token resource of the group, not one resource's rows.
+    assert record["rows"] == TOKENS * len(group.token_range_resources)
+    assert record["bytes"] > 0
+    assert record["chunk_start"] == 0
+    assert record["chunk_end"] == TOKENS
+    assert record["start_ns"] <= record["end_ns"]
+    assert record["tid"] > 0
+    assert record["rank"] == 0
+    adapter.close()
+
+
+def test_queue_wait_records_load_job_identity(tmp_path, monkeypatch):
+    """t78: load queue entries name the request, group and resources."""
+    trace = sys.modules[PACKAGE + ".mask_trace"]
+    monkeypatch.setenv(trace.ENV_ENABLED, "1")
+    monkeypatch.setenv(trace.ENV_DIR, str(tmp_path))
+    trace.reset_state()
+
+    adapter = _make_adapter(FakeTransport(_FakeServer()))
+    adapter.register()
+    request = _request("r1", load_prefix_end=TOKENS)
+    adapter.schedule_group_retrieves("g20", ("r1",), _step(request))
+
+    loads = [
+        record
+        for record in _trace_records(tmp_path)
+        if record["event"] == "queue_wait" and record.get("kind") == "load"
+    ]
+    assert loads
+    record = loads[0]
+    assert record["request_id"] == "r1"
+    assert record["group_id"] == "g20"
+    assert record["resources"]
+    assert record["prefix_end"] == TOKENS
+    # Retrieve payload size is only known after the RPC returns.
+    assert record["bytes"] == -1
+    assert record["bytes_status"] == "unavailable"
+    assert record["start_ns"] <= record["end_ns"]
+    adapter.close()
+
+
+def test_sync_store_path_traces_without_worker_extract(
+    tmp_path, monkeypatch
+):
+    """t78: DSV41_LW_V3_ASYNC_STORE=0 keeps the sync path observable."""
+    monkeypatch.setenv("DSV41_LW_V3_ASYNC_STORE", "0")
+    trace = sys.modules[PACKAGE + ".mask_trace"]
+    monkeypatch.setenv(trace.ENV_ENABLED, "1")
+    monkeypatch.setenv(trace.ENV_DIR, str(tmp_path))
+    trace.reset_state()
+
+    adapter = _make_adapter(FakeTransport(_FakeServer()))
+    assert adapter.metrics["store_async_fallbacks"] == 0
+    adapter.register()
+    request = _request("r1", load_prefix_end=0, store_prefix_end=TOKENS)
+    adapter.submit_group_store("g20", ("r1",), _step(request))
+    adapter.drain_stores()
+
+    events = {record["event"] for record in _trace_records(tmp_path)}
+    assert "store_rpc" in events
+    assert "store_encode" in events
+    assert "queue_wait" in events
+    # The sync fallback snapshots rows on the engine thread, so the worker
+    # has nothing left to extract and no descriptor is staged off-thread.
+    assert "store_extract" not in events
+    assert "store_describe" not in events
+    assert adapter.metrics["group_store_committed"] == 1
+    assert adapter.metrics["store_extract_engine_thread"] >= 1
+    assert adapter.metrics["store_extract_worker_thread"] == 0
+    adapter.close()
+
+
+def test_async_store_off_with_trace_off_stays_inert(tmp_path, monkeypatch):
+    """t78: async=0 and trace off must not create a trace file."""
+    monkeypatch.setenv("DSV41_LW_V3_ASYNC_STORE", "0")
+    trace = sys.modules[PACKAGE + ".mask_trace"]
+    monkeypatch.delenv(trace.ENV_ENABLED, raising=False)
+    monkeypatch.setenv(trace.ENV_DIR, str(tmp_path))
+    trace.reset_state()
+
+    adapter = _make_adapter(FakeTransport(_FakeServer()))
+    adapter.register()
+    request = _request("r1", load_prefix_end=0, store_prefix_end=TOKENS)
+    adapter.submit_group_store("g20", ("r1",), _step(request))
+    adapter.drain_stores()
+
+    assert adapter.metrics["group_store_committed"] == 1
+    assert list(tmp_path.iterdir()) == []
+    assert trace.stats()["lines"] == 0
+    adapter.close()
+
 
 def test_queue_full_submit_releases_source_reads_and_reports_finished():
     """t80 F1: a rejected batch must not pin its source rows forever."""

@@ -2533,10 +2533,12 @@ class DSV41LwV2GroupAdapter:
                 )
             return payload
         started = time.monotonic_ns() if trace else 0
+        timings: dict[str, int] | None = {} if trace else None
         payload = encode_token_payload(
             resource_id=staged.resource_id,
             block_ids=staged.block_ids,
             planes=self._extract_staged(staged),
+            timings=timings,
         )
         if trace:
             self._emit_store_encode(
@@ -2545,6 +2547,7 @@ class DSV41LwV2GroupAdapter:
                 time.monotonic_ns() - started,
                 "ok",
                 encoding="token_range_v1",
+                copy_ns=0 if timings is None else int(timings.get("copy_ns", 0)),
             )
         return payload
 
@@ -2557,6 +2560,7 @@ class DSV41LwV2GroupAdapter:
         *,
         encoding: str,
         error_code: str = "",
+        copy_ns: int = 0,
     ) -> None:
         """Record the worker-side envelope construction span."""
         if not _mask_trace_enabled():
@@ -2573,6 +2577,7 @@ class DSV41LwV2GroupAdapter:
             chunk_end=int(staged.chunk_end),
             boundary=bool(staged.is_boundary),
             bytes=len(payload),
+            copy_ns=int(copy_ns),
             elapsed_ns=int(elapsed_ns),
             status=status,
         )
@@ -2891,17 +2896,87 @@ class DSV41LwV2GroupAdapter:
             "tid": threading.get_ident(),
             "rank": -1 if self._worker_id is None else int(self._worker_id),
         }
+        end_ns = time.monotonic_ns()
+        fields.update(
+            start_ns=int(end_ns - fields["wait_ns"]),
+            end_ns=int(end_ns),
+        )
         if kind == "store" and isinstance(job, tuple) and len(job) > 1:
-            event = getattr(job[1], "event", None)
+            batch = job[1]
+            event = getattr(batch, "event", None)
             if event is not None:
                 fields.update(
                     request_id=event.request_id,
                     group_id=event.group_id,
                 )
+            staged = tuple(getattr(batch, "staged", ()) or ())
+            if staged:
+                fields.update(
+                    resources=sorted({item.resource_id for item in staged}),
+                    rows=sum(
+                        int(item.chunk_end) - int(item.chunk_start)
+                        for item in staged
+                    ),
+                    bytes=self._planned_store_bytes(staged),
+                    chunk_start=min(int(item.chunk_start) for item in staged),
+                    chunk_end=max(int(item.chunk_end) for item in staged),
+                )
+        elif kind == "load" and isinstance(job, tuple) and len(job) > 1:
+            load_job = job[1]
+            request = getattr(load_job, "request", None)
+            group = getattr(load_job, "group", None)
+            if request is not None and group is not None:
+                fields.update(
+                    request_id=request.request_id,
+                    group_id=group.group_id,
+                    resources=[
+                        resource.resource_id
+                        for resource in group.transfer_resources
+                    ],
+                    prefix_end=int(request.load_prefix_end),
+                    chunks=len(getattr(load_job, "chunks", ()) or ()),
+                    chunk_start=min(
+                        (
+                            int(chunk.start_token)
+                            for chunk in getattr(load_job, "chunks", ()) or ()
+                        ),
+                        default=0,
+                    ),
+                    chunk_end=int(request.load_prefix_end),
+                    # The payload size is unknown until the retrieve returns;
+                    # report it as unavailable instead of inventing a number.
+                    bytes=-1,
+                    bytes_status="unavailable",
+                )
         try:
             mask_trace.emit("queue_wait", **fields)
         except Exception:  # pragma: no cover - tracing must never raise
             return
+
+    def _planned_store_bytes(self, staged: Sequence[_StagedStore]) -> int:
+        """Source-row bytes of one store batch, from metadata only.
+
+        The async path never reads the rows on the engine thread, so this is
+        the size the worker will copy: row count times per-row tensor bytes.
+        Boundary items report the staged page bytes.
+        """
+        total = 0
+        for item in staged:
+            extraction = item.extraction
+            if extraction is not None:
+                total += self._trace_row_bytes(
+                    extraction.cache_name, len(extraction.rows)
+                )
+                continue
+            if item.is_boundary:
+                page = getattr(item.capture, "page", None)
+                if isinstance(page, torch.Tensor):
+                    total += int(page.numel()) * int(page.element_size())
+                continue
+            for plane in item.planes:
+                total += int(plane.numel()) * int(plane.element_size())
+        return int(total)
+
     def _fail_event(
         self,
         event: GroupEvent | None,
@@ -3182,6 +3257,7 @@ def encode_token_payload(
     resource_id: str,
     block_ids: Sequence[int],
     planes: Sequence[torch.Tensor],
+    timings: dict[str, int] | None = None,
 ) -> bytes:
     """Encode one chunk's token-range planes into a validated envelope.
 
@@ -3189,6 +3265,11 @@ def encode_token_payload(
     Every plane is written contiguously in its public dtype; the header keeps
     the exact per-plane shape so a decoder can reject geometry mismatches
     before it allocates or writes anything.
+
+    ``timings`` is an optional out-parameter used by the default-off store
+    trace: when given, ``copy_ns`` accumulates the device-to-host copy and
+    byte materialisation time (the "CPU copy" part of the store cost).  The
+    produced payload is identical either way.
     """
     if not resource_id:
         raise ValueError("resource_id must be nonempty")
@@ -3196,11 +3277,15 @@ def encode_token_payload(
         raise ValueError("a token payload needs at least one plane")
     header_planes = []
     chunks = []
+    copy_ns = 0
     for plane in planes:
         if not isinstance(plane, torch.Tensor):
             raise TypeError("payload planes must be torch tensors")
+        started = time.monotonic_ns() if timings is not None else 0
         tensor = plane.detach().to("cpu").contiguous()
         raw = tensors_to_bytes(tensor)
+        if timings is not None:
+            copy_ns += time.monotonic_ns() - started
         header_planes.append(
             {
                 "dtype": str(tensor.dtype).removeprefix("torch."),
@@ -3219,6 +3304,8 @@ def encode_token_payload(
         header, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     body = b"".join(chunks)
+    if timings is not None:
+        timings["copy_ns"] = int(copy_ns)
     return (
         TOKEN_PAYLOAD_MAGIC
         + struct.pack(">I", len(header_bytes))
