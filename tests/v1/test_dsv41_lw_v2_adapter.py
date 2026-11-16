@@ -557,6 +557,10 @@ def _make_adapter(
     world_size=WORLD,
     chunk_size=CHUNK_SIZE,
     block_size=BLOCK_SIZE,
+    max_queue=1024,
+    async_store=None,
+    store_retries=None,
+    store_backpressure_timeout=None,
 ):
     return adapter_mod.DSV41LwV2GroupAdapter(
         PLAN,
@@ -573,6 +577,10 @@ def _make_adapter(
         cache_names=_cache_names(),
         load_timeout=load_timeout,
         store_timeout=store_timeout,
+        max_queue=max_queue,
+        async_store=async_store,
+        store_retries=store_retries,
+        store_backpressure_timeout=store_backpressure_timeout,
     )
 
 
@@ -1928,3 +1936,123 @@ def test_mask_trace_covers_the_production_9690_and_543_store_windows(
     done = [record for record in records if record["event"] == "store_done"]
     assert len(done) == 8 * 37 + 8 * 2
     assert trace.stats()["truncated_requests"] == 0
+
+
+# ---------------------------------------------------------------------------
+# t71: async store (off-thread extraction, backpressure, retry, read ownership)
+# ---------------------------------------------------------------------------
+
+
+class _RetryOnceTransport(FakeTransport):
+    """First store attempt fails with a retryable IO error."""
+
+    def __init__(self, server: _FakeServer) -> None:
+        super().__init__(server)
+        self.failed_once = False
+
+    def store_resource_block(self, spec, payload):
+        if not self.failed_once:
+            self.failed_once = True
+            future = Future()
+            future.set_result(
+                adapter_mod.ResourceBlockResult(
+                    operation_id=spec.operation_id,
+                    direction=spec.direction,
+                    resource_id=spec.resource_id,
+                    registration_epoch=spec.registration_epoch,
+                    server_generation=spec.server_generation,
+                    status="failed",
+                    error_code="IO_ERROR",
+                )
+            )
+            return future
+        return super().store_resource_block(spec, payload)
+
+
+def test_async_store_extracts_on_the_worker_thread():
+    server = _FakeServer()
+    adapter = _make_adapter(FakeTransport(server))
+    adapter.register()
+    request = _request("r1", load_prefix_end=0, store_prefix_end=TOKENS)
+    step = _step(request)
+
+    adapter.submit_group_store("g2", ("r1",), step)
+    adapter.drain_stores()
+
+    metrics = adapter.metrics
+    assert adapter.async_store is True
+    assert metrics["store_extract_worker_thread"] >= 1
+    assert metrics["store_extract_engine_thread"] == 0
+    assert metrics["group_store_committed"] >= 1
+    assert server.store_specs
+
+
+def test_async_store_can_be_disabled_for_the_sync_fallback(monkeypatch):
+    monkeypatch.setenv("DSV41_LW_V3_ASYNC_STORE", "0")
+    server = _FakeServer()
+    adapter = _make_adapter(FakeTransport(server))
+    adapter.register()
+    request = _request("r1", load_prefix_end=0, store_prefix_end=TOKENS)
+    step = _step(request)
+
+    adapter.submit_group_store("g2", ("r1",), step)
+    adapter.drain_stores()
+
+    metrics = adapter.metrics
+    assert adapter.async_store is False
+    assert metrics["store_extract_engine_thread"] >= 1
+    assert metrics["store_extract_worker_thread"] == 0
+    assert server.store_specs
+
+
+def test_store_backpressure_fails_closed_when_the_queue_stays_full():
+    adapter = _make_adapter(
+        FakeTransport(_FakeServer()),
+        max_queue=1,
+        store_backpressure_timeout=0.01,
+    )
+    # Swap in a queue with no consumer so the bounded put is deterministic.
+    adapter._jobs = adapter_mod.queue.Queue(maxsize=1)  # noqa: SLF001
+    adapter._jobs.put(("noop", None))  # noqa: SLF001
+
+    queued = adapter._enqueue(("store", None), blocking=True)  # noqa: SLF001
+
+    assert queued is False
+    assert adapter.metrics["queue_full"] == 1
+
+
+def test_store_retries_once_after_a_retryable_io_error():
+    server = _FakeServer()
+    transport = _RetryOnceTransport(server)
+    adapter = _make_adapter(transport, store_retries=1)
+    adapter.register()
+    request = _request("r1", load_prefix_end=0, store_prefix_end=TOKENS)
+    step = _step(request)
+
+    adapter.submit_group_store("g2", ("r1",), step)
+    adapter.drain_stores()
+
+    metrics = adapter.metrics
+    assert metrics["store_retries"] >= 1
+    assert metrics["group_store_committed"] >= 1
+    assert metrics["group_store_failed"] == 0
+
+
+def test_terminal_store_batch_keeps_source_read_ownership_until_worker_stops():
+    adapter = _make_adapter(FakeTransport(_FakeServer()))
+    event = adapter_mod.GroupEvent("g2", "r1", "store")
+    batch = adapter_mod._StoreBatch(event=event)
+    adapter._store_batches.append(batch)  # noqa: SLF001
+    event.drop(reason="unit")
+
+    adapter.drain_stores(wait=False)
+
+    # Terminal status does not prove the worker stopped reading: the batch
+    # must stay discoverable and flush_source_reads must report it unsafe.
+    assert batch in adapter._store_batches  # noqa: SLF001
+    assert adapter.flush_source_reads({"r1"}, timeout=0.01) == {"r1"}
+
+    batch.read_done.set()
+    adapter.drain_stores(wait=False)
+    assert batch not in adapter._store_batches  # noqa: SLF001
+    assert adapter.flush_source_reads({"r1"}, timeout=0.01) == set()

@@ -98,6 +98,42 @@ def _mask_trace_enabled() -> bool:
 
 TOKEN_PAYLOAD_MAGIC = _wire.TOKEN_PAYLOAD_MAGIC
 BOUNDARY_PAYLOAD_MAGIC = _wire.BOUNDARY_PAYLOAD_MAGIC
+
+_ASYNC_STORE_ENV = "DSV41_LW_V3_ASYNC_STORE"
+_STORE_RETRIES_ENV = "DSV41_LW_V3_STORE_RETRIES"
+_STORE_BACKPRESSURE_ENV = "DSV41_LW_V3_STORE_BACKPRESSURE_TIMEOUT"
+
+
+def _read_flag_env(name: str, default: bool) -> bool:
+    """Read a boolean switch; empty/unset keeps the default."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _read_int_env(name: str, default: int, *, minimum: int = 0) -> int:
+    """Read a bounded integer switch; malformed values keep the default."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        return default
+    return value if value >= minimum else default
+
+
+def _read_float_env(name: str, default: float) -> float:
+    """Read a non-negative float switch; malformed values keep the default."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        return default
+    return value if value >= 0.0 else default
 #: Number of immutable boundary snapshots kept per (request, resource)
 #: while the store endpoint is still one step behind the live ring.
 _BOUNDARY_STAGE_LIMIT = 4
@@ -365,6 +401,21 @@ class _ChunkRef:
     block_ids: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class _StoreExtraction:
+    """Engine-side description of the rows the worker must extract.
+
+    The engine thread only resolves the cache name and the absolute row
+    indices; it never holds a tensor slice.  ``event`` is recorded on the
+    producer stream so the worker can order its read after the forward that
+    wrote these rows.
+    """
+
+    cache_name: str
+    rows: tuple[int, ...]
+    event: Any | None = None
+
+
 @dataclass
 class _StagedStore:
     request_id: str
@@ -377,12 +428,15 @@ class _StagedStore:
     operation_id: str
     is_boundary: bool = False
     capture: Any = None
+    extraction: _StoreExtraction | None = None
 
 
 @dataclass
 class _StoreBatch:
     event: GroupEvent
     staged: list[_StagedStore] = field(default_factory=list)
+    read_done: threading.Event = field(default_factory=threading.Event)
+    accounted: bool = False
 
 
 @dataclass
@@ -461,6 +515,9 @@ class DSV41LwV2GroupAdapter:
         load_timeout: float = 30.0,
         store_timeout: float = 60.0,
         max_queue: int = 1024,
+        async_store: bool | None = None,
+        store_retries: int | None = None,
+        store_backpressure_timeout: float | None = None,
     ) -> None:
         if not isinstance(plan, GroupedTransferPlan):
             raise TypeError("plan must be a GroupedTransferPlan")
@@ -495,6 +552,23 @@ class DSV41LwV2GroupAdapter:
         self._load_timeout = float(load_timeout)
         self._store_timeout = float(store_timeout)
         self._max_queue = int(max_queue)
+        # v3 async store: default on, with a one-switch fallback to the v2
+        # synchronous snapshot path.
+        self._async_store = (
+            bool(async_store)
+            if async_store is not None
+            else _read_flag_env(_ASYNC_STORE_ENV, True)
+        )
+        self._store_retries = (
+            max(0, int(store_retries))
+            if store_retries is not None
+            else _read_int_env(_STORE_RETRIES_ENV, 1)
+        )
+        self._store_backpressure_timeout = (
+            float(store_backpressure_timeout)
+            if store_backpressure_timeout is not None
+            else _read_float_env(_STORE_BACKPRESSURE_ENV, 1.0)
+        )
 
         self._lock = threading.RLock()
         self._cv = threading.Condition(self._lock)
@@ -569,6 +643,13 @@ class DSV41LwV2GroupAdapter:
             "requests_failed_receiving": 0,
             "worker_jobs": 0,
             "worker_failures": 0,
+            "store_extract_engine_thread": 0,
+            "store_extract_worker_thread": 0,
+            "store_backpressure_waits": 0,
+            "store_retries": 0,
+            "store_async_fallbacks": 0,
+            "source_read_done": 0,
+            "source_read_timeout": 0,
         }
 
         self._jobs: queue.Queue[Any] = queue.Queue(maxsize=self._max_queue)
@@ -600,6 +681,11 @@ class DSV41LwV2GroupAdapter:
     @property
     def server_generation(self) -> int:
         return self._server_generation
+
+    @property
+    def async_store(self) -> bool:
+        """Whether store extraction runs on the worker (v3 async store)."""
+        return self._async_store
 
     @property
     def boundary_resource_ids(self) -> tuple[str, ...]:
@@ -883,7 +969,9 @@ class DSV41LwV2GroupAdapter:
             batch = _StoreBatch(event=event, staged=staged)
             with self._lock:
                 self._store_batches.append(batch)
-            queued = self._enqueue(("store", batch))
+            queued = self._enqueue(
+                ("store", batch), blocking=self._async_store
+            )
             if _mask_trace_enabled():
                 mask_trace.emit(
                     "store_submit",
@@ -912,37 +1000,120 @@ class DSV41LwV2GroupAdapter:
                 message,
             )
 
-    def drain_stores(self) -> None:
-        """Wait every submitted store; failures degrade to dropped, never ok."""
-        deadline = time.monotonic() + self._store_timeout
+    def drain_stores(
+        self, *, wait: bool = True, request_ids: set[str] | None = None
+    ) -> None:
+        """Collect store terminal states.
+
+        ``wait=False`` is the async ``wait_for_save`` path: it only reaps
+        batches that already settled, so the next group's forward is never
+        blocked by a previous store.  A real wait keeps the fail-closed
+        timeout.  Only a server ``ok`` counts as committed.
+        """
+        deadline = time.monotonic() + (self._store_timeout if wait else 0.0)
+        requested = None if request_ids is None else set(request_ids)
         with self._lock:
-            events = [batch.event for batch in self._store_batches]
-        for event in events:
-            remaining = deadline - time.monotonic()
-            status = event.wait(max(0.0, remaining))
+            batches = [
+                batch
+                for batch in self._store_batches
+                if requested is None or batch.event.request_id in requested
+            ]
+        for batch in batches:
+            event = batch.event
+            if not wait:
+                if event.is_terminal:
+                    self._finalize_store_event(batch)
+                continue
+            remaining = max(0.0, deadline - time.monotonic())
+            status = event.wait(remaining)
             if status == "timeout":
                 with self._lock:
-                    self._counters["group_store_failed"] += 1
-                    self._mark_sending_ready_locked(event.request_id)
+                    if not batch.accounted:
+                        batch.accounted = True
+                        self._counters["group_store_failed"] += 1
+                        self._mark_sending_ready_locked(event.request_id)
                 self._trace_store_timeout(event)
                 continue
-            with self._lock:
-                if status == STATUS_OK:
-                    self._counters["group_store_committed"] += 1
-                elif status == "drop":
-                    self._counters["group_store_dropped"] += 1
-                else:
-                    self._counters["group_store_failed"] += 1
-                self._mark_sending_ready_locked(event.request_id)
+            self._finalize_store_event(batch)
         with self._lock:
+            # Ownership of the source rows is independent of the RPC status:
+            # a dropped/timed-out batch whose worker has not stopped reading
+            # must stay in this registry so flush_source_reads can still see
+            # it.  Only terminal *and* read batches may be forgotten.
             self._store_batches = [
                 batch
                 for batch in self._store_batches
-                if batch.event.status == "pending"
+                if not (batch.event.is_terminal and batch.read_done.is_set())
             ]
             for batch in self._store_batches:
-                batch.staged.clear()
+                if batch.read_done.is_set():
+                    batch.staged.clear()
         self._release_store_buffers()
+
+    def _finalize_store_event(self, batch: _StoreBatch) -> None:
+        event = batch.event
+        with self._lock:
+            if batch.accounted:
+                return
+            batch.accounted = True
+            status = event.status
+            if status == STATUS_OK:
+                self._counters["group_store_committed"] += 1
+            elif status == "drop":
+                self._counters["group_store_dropped"] += 1
+            else:
+                self._counters["group_store_failed"] += 1
+            self._mark_sending_ready_locked(event.request_id)
+
+    def flush_source_reads(
+        self, request_ids: set[str] | None = None, *, timeout: float | None = None
+    ) -> set[str]:
+        """Wait until worker source reads for ``request_ids`` are done.
+
+        ``producer_event.synchronize`` only orders write-before-read; this is
+        the second completion point that proves the rows are no longer being
+        read.  A request may only be released (or reported finished) after
+        this returns it in the result-free set.  Timeouts are returned so the
+        caller can keep the request un-finished instead of racing a free.
+        """
+        requested = None if request_ids is None else set(request_ids)
+        with self._lock:
+            batches = [
+                batch
+                for batch in self._store_batches
+                if requested is None or batch.event.request_id in requested
+            ]
+        if not batches:
+            return set()
+        deadline = time.monotonic() + (
+            self._store_timeout if timeout is None else float(timeout)
+        )
+        timed_out: set[str] = set()
+        for batch in batches:
+            remaining = max(0.0, deadline - time.monotonic())
+            if not batch.read_done.wait(remaining):
+                timed_out.add(batch.event.request_id)
+        if timed_out:
+            with self._lock:
+                self._counters["source_read_timeout"] += len(timed_out)
+            logger_warning(
+                "dsv41 lw v2 source read did not finish for requests %s; "
+                "keeping their blocks alive",
+                sorted(timed_out),
+            )
+        return timed_out
+
+    def flush_stores(self, request_ids: set[str] | None = None) -> set[str]:
+        """Finish source reads and collect commit state for the given requests.
+
+        Returns the requests whose source reads timed out; those must not be
+        reported as finished by the connector.
+        """
+        timed_out = self.flush_source_reads(request_ids)
+        if timed_out:
+            return timed_out
+        self.drain_stores(wait=True, request_ids=request_ids)
+        return set()
 
     # ------------------------------------------------------------------
     # Drops / terminal reports
@@ -1399,63 +1570,111 @@ class DSV41LwV2GroupAdapter:
 
     def _run_store(self, batch: _StoreBatch) -> None:
         event = batch.event
-        for staged in batch.staged:
-            spec = self._spec(
-                direction=_STORE,
-                request=self._request_by_id(staged.request_id),
-                step=self._step_for_request(staged.request_id),
+        try:
+            if event.is_terminal:
+                return
+            for staged in batch.staged:
+                if event.is_terminal:
+                    return
+                self._run_store_one(batch, staged)
+        finally:
+            # The source rows are no longer read after this point; only now
+            # may the connector flush/report the request as finished.
+            batch.read_done.set()
+            with self._lock:
+                self._counters["source_read_done"] += 1
+
+    def _run_store_one(self, batch: _StoreBatch, staged: _StagedStore) -> None:
+        event = batch.event
+        spec = self._spec(
+            direction=_STORE,
+            request=self._request_by_id(staged.request_id),
+            step=self._step_for_request(staged.request_id),
+            resource_id=staged.resource_id,
+            engine_group_id=self._resources[
+                staged.resource_id
+            ].engine_group_id,
+            chunk=_ChunkRef(
+                start_token=staged.chunk_start,
+                end_token=staged.chunk_end,
+                block_ids=staged.block_ids,
+            ),
+            prefix_end=staged.chunk_end,
+        )
+        payload = self._encode_staged(staged)
+        _store_debug(
+            "run store request=%s resource=%s chunk=[%s,%s) blocks=%d "
+            "bytes=%s op=%s",
+            staged.request_id,
+            staged.resource_id,
+            staged.chunk_start,
+            staged.chunk_end,
+            len(staged.block_ids),
+            -1 if payload is None else len(payload),
+            spec.operation_id,
+        )
+        if payload is None:
+            event.fail(
                 resource_id=staged.resource_id,
-                engine_group_id=self._resources[
-                    staged.resource_id
-                ].engine_group_id,
-                chunk=_ChunkRef(
-                    start_token=staged.chunk_start,
-                    end_token=staged.chunk_end,
-                    block_ids=staged.block_ids,
-                ),
-                prefix_end=staged.chunk_end,
+                error_code=PAYLOAD_CORRUPT,
+                message="boundary payload is missing for this store",
             )
-            payload = self._encode_staged(staged)
+            return
+        self._submit_store(
+            event=event,
+            staged=staged,
+            spec=spec,
+            payload=payload,
+        )
+
+    def _submit_store(
+        self,
+        *,
+        event: GroupEvent,
+        staged: _StagedStore,
+        spec: ResourceBlockSpec,
+        payload: bytes,
+        attempt: int = 0,
+    ) -> None:
+        """Submit one store attempt; retries stay bounded and fail closed."""
+        try:
+            future = self._transport.store_resource_block(spec, payload)
+        except Exception as exc:  # noqa: BLE001 - terminal store failure
             _store_debug(
-                "run store request=%s resource=%s chunk=[%s,%s) blocks=%d "
-                "bytes=%s op=%s",
+                "transport store raised request=%s resource=%s attempt=%d: %r",
                 staged.request_id,
                 staged.resource_id,
-                staged.chunk_start,
-                staged.chunk_end,
-                len(staged.block_ids),
-                -1 if payload is None else len(payload),
-                spec.operation_id,
+                attempt,
+                exc,
             )
-            if payload is None:
-                event.fail(
-                    resource_id=staged.resource_id,
-                    error_code=PAYLOAD_CORRUPT,
-                    message="boundary payload is missing for this store",
+            if attempt < self._store_retries:
+                with self._lock:
+                    self._counters["store_retries"] += 1
+                self._submit_store(
+                    event=event,
+                    staged=staged,
+                    spec=spec,
+                    payload=payload,
+                    attempt=attempt + 1,
                 )
-                continue
-            try:
-                future = self._transport.store_resource_block(spec, payload)
-            except Exception as exc:  # noqa: BLE001 - terminal store failure
-                _store_debug(
-                    "transport store raised request=%s resource=%s: %r",
-                    staged.request_id,
-                    staged.resource_id,
-                    exc,
-                )
-                event.fail(
-                    resource_id=staged.resource_id,
-                    error_code=IO_ERROR,
-                    message=f"store submit failed: {exc}",
-                )
-                continue
-            future.add_done_callback(
-                lambda done, rid=staged.resource_id, s=staged: (
-                    self._on_store_done(
-                        event=event, resource_id=rid, staged=s, future=done
-                    )
-                )
+                return
+            event.fail(
+                resource_id=staged.resource_id,
+                error_code=IO_ERROR,
+                message=f"store submit failed: {exc}",
             )
+            return
+        future.add_done_callback(
+            lambda done: self._on_store_done(
+                event=event,
+                resource_id=staged.resource_id,
+                staged=staged,
+                future=done,
+                spec=spec,
+                payload=payload,
+                attempt=attempt,
+            )
+        )
 
     def _on_store_done(
         self,
@@ -1464,6 +1683,9 @@ class DSV41LwV2GroupAdapter:
         resource_id: str,
         staged: _StagedStore,
         future: Future,
+        spec: ResourceBlockSpec,
+        payload: bytes,
+        attempt: int = 0,
     ) -> None:
         if event.is_terminal:
             return
@@ -1486,6 +1708,17 @@ class DSV41LwV2GroupAdapter:
                 staged.chunk_end,
                 exc,
             )
+            if attempt < self._store_retries:
+                with self._lock:
+                    self._counters["store_retries"] += 1
+                self._submit_store(
+                    event=event,
+                    staged=staged,
+                    spec=spec,
+                    payload=payload,
+                    attempt=attempt + 1,
+                )
+                return
             self._terminal_ops.add(terminal)
             event.fail(
                 resource_id=resource_id,
@@ -1497,16 +1730,32 @@ class DSV41LwV2GroupAdapter:
         if not isinstance(result, ResourceBlockResult) or result.status not in (
             STATUS_OK,
         ):
+            error_code = getattr(result, "error_code", "") or IO_ERROR
             _store_debug(
                 "store result not ok request=%s resource=%s chunk_end=%s "
-                "status=%s error=%s op=%s",
+                "status=%s error=%s op=%s attempt=%d",
                 event.request_id,
                 resource_id,
                 staged.chunk_end,
                 getattr(result, "status", "?"),
-                getattr(result, "error_code", ""),
+                error_code,
                 getattr(result, "operation_id", "?"),
+                attempt,
             )
+            if (
+                attempt < self._store_retries
+                and error_code in (IO_ERROR, TIMEOUT)
+            ):
+                with self._lock:
+                    self._counters["store_retries"] += 1
+                self._submit_store(
+                    event=event,
+                    staged=staged,
+                    spec=spec,
+                    payload=payload,
+                    attempt=attempt + 1,
+                )
+                return
             self._terminal_ops.add(terminal)
             event.fail(
                 resource_id=resource_id,
@@ -1714,6 +1963,17 @@ class DSV41LwV2GroupAdapter:
             self._counters["store_stage_noop"] += 1
             return []
         staged: list[_StagedStore] = []
+        async_store = self._async_store
+        producer_event = self._record_store_event() if async_store else None
+        allow_async = async_store and (
+            producer_event is not None or not self._accelerator_present()
+        )
+        if async_store and not allow_async:
+            # No producer-stream event on an accelerator: a bare row index
+            # would race the forward.  Degrade to the bounded synchronous
+            # snapshot instead of claiming a safe async extraction.
+            with self._lock:
+                self._counters["store_async_fallbacks"] += 1
         groups = request.block_ids_by_engine_group
         needed_blocks = (
             request.store_prefix_end - request.store_start
@@ -1760,28 +2020,54 @@ class DSV41LwV2GroupAdapter:
                         f"resource {resource.resource_id} has too few blocks "
                         f"for tokens [{start}, {chunk_end})"
                     )
-                planes = self._resource_planes(resource.resource_id)
-                cloned = tuple(
-                    plane.index_select(
-                        0,
-                        torch.as_tensor(blocks, dtype=torch.long, device=plane.device),
+                if allow_async:
+                    # Engine thread: only resolve identity and rows.  The
+                    # worker reads the live rows after the producer event.
+                    extraction = _StoreExtraction(
+                        cache_name=self._cache_name_for(resource),
+                        rows=tuple(int(block) for block in blocks),
+                        event=producer_event,
                     )
-                    .detach()
-                    .clone()
-                    for plane in planes
-                )
-                staged.append(
-                    _StagedStore(
-                        request_id=request.request_id,
-                        group_id=group.group_id,
-                        resource_id=resource.resource_id,
-                        chunk_start=start,
-                        chunk_end=chunk_end,
-                        block_ids=tuple(blocks),
-                        planes=cloned,
-                        operation_id=uuid.uuid4().hex,
+                    staged.append(
+                        _StagedStore(
+                            request_id=request.request_id,
+                            group_id=group.group_id,
+                            resource_id=resource.resource_id,
+                            chunk_start=start,
+                            chunk_end=chunk_end,
+                            block_ids=tuple(blocks),
+                            planes=(),
+                            operation_id=uuid.uuid4().hex,
+                            extraction=extraction,
+                        )
                     )
-                )
+                else:
+                    planes = self._resource_planes(resource.resource_id)
+                    cloned = tuple(
+                        plane.index_select(
+                            0,
+                            torch.as_tensor(
+                                blocks, dtype=torch.long, device=plane.device
+                            ),
+                        )
+                        .detach()
+                        .clone()
+                        for plane in planes
+                    )
+                    with self._lock:
+                        self._counters["store_extract_engine_thread"] += 1
+                    staged.append(
+                        _StagedStore(
+                            request_id=request.request_id,
+                            group_id=group.group_id,
+                            resource_id=resource.resource_id,
+                            chunk_start=start,
+                            chunk_end=chunk_end,
+                            block_ids=tuple(blocks),
+                            planes=cloned,
+                            operation_id=uuid.uuid4().hex,
+                        )
+                    )
                 start = chunk_end
         if group.has_boundary and staged:
             assert group.boundary_resource is not None
@@ -1886,6 +2172,37 @@ class DSV41LwV2GroupAdapter:
             raise ValueError("boundary capture encoding failed")
         return capture.encoded
 
+    def _extract_staged(self, staged: _StagedStore) -> tuple[torch.Tensor, ...]:
+        """Extract the staged rows on the worker thread.
+
+        ``_stage_store`` only records the cache name and row indices.  The
+        worker waits for the producer-stream event before reading, so the
+        forward that wrote these rows has completed; it never holds the
+        engine thread while slicing.
+        """
+        extraction = staged.extraction
+        if extraction is None:
+            return staged.planes
+        if extraction.event is not None:
+            extraction.event.synchronize()
+        value = self._kv_caches.get(extraction.cache_name)
+        if value is None:
+            raise KeyError(
+                f"registered kv cache {extraction.cache_name!r} for resource "
+                f"{staged.resource_id!r} is not bound"
+            )
+        planes = (
+            tuple(value) if isinstance(value, (tuple, list)) else (value,)
+        )
+        if not planes:
+            return ()
+        rows = torch.as_tensor(
+            extraction.rows, dtype=torch.long, device=planes[0].device
+        )
+        with self._lock:
+            self._counters["store_extract_worker_thread"] += 1
+        return tuple(plane.detach().index_select(0, rows) for plane in planes)
+
     def _encode_staged(self, staged: _StagedStore) -> bytes | None:
         if staged.is_boundary:
             capture = staged.capture
@@ -1898,7 +2215,7 @@ class DSV41LwV2GroupAdapter:
         return encode_token_payload(
             resource_id=staged.resource_id,
             block_ids=staged.block_ids,
-            planes=staged.planes,
+            planes=self._extract_staged(staged),
         )
 
     def _spec_stock_key(self, stock_key: IPCCacheServerKey) -> IPCCacheServerKey:
@@ -2025,6 +2342,36 @@ class DSV41LwV2GroupAdapter:
             )
         return self._cache_names[index]
 
+    def _cache_name_for(self, resource: CacheTransferResource) -> str:
+        name = self._cache_names_for(resource)
+        if self._kv_caches.get(name) is None:
+            raise KeyError(
+                f"registered kv cache {name!r} for resource "
+                f"{resource.resource_id!r} is not bound"
+            )
+        return name
+
+    def _accelerator_present(self) -> bool:
+        cuda = getattr(torch, "cuda", None)
+        if cuda is not None and cuda.is_available():
+            return True
+        npu = getattr(torch, "npu", None)
+        return bool(npu is not None and npu.is_available())
+
+    def _record_store_event(self) -> Any | None:
+        """Record the producer stream position without synchronising."""
+        cuda = getattr(torch, "cuda", None)
+        if cuda is not None and cuda.is_available():
+            event = cuda.Event()
+            event.record()
+            return event
+        npu = getattr(torch, "npu", None)
+        if npu is not None and npu.is_available():
+            event = npu.Event()
+            event.record()
+            return event
+        return None
+
     def _build_layouts(self) -> None:
         for resource in self._resources.values():
             if resource.storage_kind == "boundary_state":
@@ -2128,18 +2475,33 @@ class DSV41LwV2GroupAdapter:
                     error_code=error_code,
                 )
 
-    def _enqueue(self, job: Any) -> bool:
+    def _enqueue(self, job: Any, *, blocking: bool = False) -> bool:
+        """Queue a worker job.
+
+        ``blocking`` is used by the async store path: the engine thread waits
+        for room (bounded by ``store_backpressure_timeout``) so a burst of
+        stores cannot grow the queue without bound.  Timeout still fails the
+        batch closed instead of losing memory silently.
+        """
+        kind = job[0] if isinstance(job, tuple) else type(job).__name__
+        waited = 0.0
         try:
-            self._jobs.put_nowait(job)
-            kind = job[0] if isinstance(job, tuple) else type(job).__name__
-            _store_debug("enqueue kind=%s size=%d", kind, self._jobs.qsize())
-            return True
+            if blocking:
+                started = time.monotonic()
+                self._jobs.put(job, timeout=self._store_backpressure_timeout)
+                waited = time.monotonic() - started
+            else:
+                self._jobs.put_nowait(job)
         except queue.Full:
-            kind = job[0] if isinstance(job, tuple) else type(job).__name__
             _store_debug("enqueue failed kind=%s queue is full", kind)
             with self._lock:
                 self._counters["queue_full"] += 1
             return False
+        if waited > 0.0:
+            with self._lock:
+                self._counters["store_backpressure_waits"] += 1
+        _store_debug("enqueue kind=%s size=%d", kind, self._jobs.qsize())
+        return True
 
     def _fail_event(
         self,
@@ -2183,6 +2545,7 @@ class DSV41LwV2GroupAdapter:
         counter: str | None = None,
     ) -> None:
         dropped = 0
+        dropped_store_requests: set[str] = set()
         with self._lock:
             for (group_id, request_id, step_id), event in list(
                 self._load_events.items()
@@ -2206,6 +2569,7 @@ class DSV41LwV2GroupAdapter:
                 batch.event.drop(reason=reason)
                 dropped += 1
                 self._counters["group_store_dropped"] += 1
+                dropped_store_requests.add(batch.event.request_id)
             # Boundary staging keys do not carry a step id; map the resource
             # back to its group so group/request scoped drops behave the same.
             released: list[_BoundaryCapture] = []
@@ -2232,6 +2596,10 @@ class DSV41LwV2GroupAdapter:
                 self._counters[counter] += dropped
         for capture in released:
             capture.release()
+        if dropped_store_requests:
+            # A dropped store is not a stopped read: do not release the
+            # request until the worker has really left those source rows.
+            self.flush_source_reads(dropped_store_requests)
 
     def _release_boundary_state_locked(
         self, request_ids: set[str]
@@ -2263,7 +2631,8 @@ class DSV41LwV2GroupAdapter:
     def _release_store_buffers(self) -> None:
         with self._lock:
             for batch in self._store_batches:
-                batch.staged.clear()
+                if batch.read_done.is_set():
+                    batch.staged.clear()
 
     def _record_worker_failure(
         self, kind: str, payload: Any, exc: BaseException

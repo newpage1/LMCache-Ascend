@@ -800,7 +800,7 @@ class GroupTransferRouter:
         )
 
 
-    def wait_for_save(self) -> None:
+    def wait_for_save(self, *, wait: bool = True) -> None:
         """Drain stores submitted by the previous forward, keep this step.
 
         vLLM calls ``wait_for_save`` *before* the forward that
@@ -815,28 +815,67 @@ class GroupTransferRouter:
         # now (the forward's KV rows and boundary snapshot are already
         # materialised) keeps stores from waiting for the next forward, which
         # a decode step served from a CUDA graph may never reach.
+        #
+        # This is explicitly a *late* metadata path: the stores were produced
+        # by the forward that just ended, but their StepView only exists now.
+        # Trace it so t73/t75 can distinguish it from warm per-group submits.
+        if self._step is not None and mask_trace.enabled():
+            for group in self._plan.groups:
+                ops = self._ops.get(group.group_id)
+                if ops is None or not ops.store_request_ids:
+                    continue
+                mask_trace.emit(
+                    "store_submit_late",
+                    phase="store",
+                    step_id=self._step.step_id,
+                    group_id=group.group_id,
+                    request_ids=list(ops.store_request_ids),
+                    metadata_late=True,
+                    reason="cold_post_forward_start_load_kv",
+                )
         self.submit_pending_stores()
-        self.drain_pending_stores()
+        self.drain_pending_stores(wait=wait)
 
     def submit_pending_stores(self) -> None:
         """Submit this step's group stores without closing the step."""
         for group in self._plan.groups:
             self.submit_group_store(group.group_id)
 
-    def flush_step(self) -> None:
-        """Close the current step after its forward and store submission."""
+    def flush_step(self, *, wait: bool = False) -> None:
+        """Detach the current step after submitting its stores.
+
+        ``wait=False`` is the async path: in-flight batches stay owned by the
+        adapter (keyed by request/step/epoch) and are only waited on at a real
+        source-reuse point (final finished ids).  A global commit wait here
+        would serialise every step and defeat the async store.
+        """
         if self._step is None:
             return
         for group in self._plan.groups:
             self.submit_group_store(group.group_id)
-        self.drain_pending_stores()
+        self.drain_pending_stores(wait=wait)
         self.finish_step()
 
-    def drain_pending_stores(self) -> None:
-        """Drain already-submitted store batches without touching step ops."""
+    def drain_pending_stores(self, *, wait: bool = True) -> None:
+        """Drain already-submitted store batches without touching step ops.
+
+        ``wait=False`` is the async path: it only reaps settled batches so
+        the next group's forward is not blocked; the final ``flush_step`` and
+        ``get_finished`` still wait and account every commit.
+        """
         if self._adapter is not None and self._pending_stores > 0:
-            self._adapter.drain_stores()
-            self._pending_stores = 0
+            drain = getattr(self._adapter, "drain_stores", None)
+            if callable(drain):
+                try:
+                    drain(wait=wait)
+                except TypeError:
+                    drain()
+            if wait:
+                self._pending_stores = 0
+            else:
+                # Batches stay in flight; count them as still pending so a
+                # later final flush knows there is commit state outstanding.
+                self._pending_stores = max(self._pending_stores, 1)
             self._counters["group_store_drained"] += 1
 
     def finish_step(self) -> None:
@@ -1290,9 +1329,12 @@ class DSV41LwV2Connector(LMCacheMPConnector):
         """Queue one retrieve per group; never wait and never copy inline."""
         router = self._require_router()
         # The previous forward's captures already happened; submit any store
-        # it did not hand off and drain those batches before blocks are
-        # reused.  This is the "wait for the previous step's saves" point.
-        router.flush_step()
+        # it did not hand off and detach the step so these ops cannot leak
+        # into the new one.  Only the sync fallback waits here; async batches
+        # stay in flight and are waited on at get_finished/source reuse.
+        adapter = self.adapter
+        async_store = bool(getattr(adapter, "async_store", False))
+        router.flush_step(wait=not async_store)
         metadata = getattr(self, "_connector_metadata", None)
         if metadata is None:
             return
@@ -1364,7 +1406,9 @@ class DSV41LwV2Connector(LMCacheMPConnector):
                 else "none",
                 len(router.operation_keys(_STORE)),
             )
-        router.wait_for_save()
+        adapter = self.adapter
+        async_store = bool(getattr(adapter, "async_store", False))
+        router.wait_for_save(wait=not async_store)
 
     def get_finished(
         self, finished_req_ids: set[str]
@@ -1392,10 +1436,31 @@ class DSV41LwV2Connector(LMCacheMPConnector):
         adapter = self.adapter
         if adapter is None:
             return sending, receiving
+        # Source-read completion point: never report a store as finished while
+        # the worker may still be reading that request's KV rows.  A timeout
+        # keeps the request un-reported (blocks stay alive) and is retried on
+        # the next call instead of racing a block free.
+        flush = getattr(adapter, "flush_stores", None)
+        if callable(flush):
+            if finished_req_ids:
+                timed_out = flush(set(finished_req_ids))
+            else:
+                # Nothing finished: only reap settled batches, never block a
+                # scheduler step on unrelated in-flight stores.
+                timed_out = set()
+                drain = getattr(adapter, "drain_stores", None)
+                if callable(drain):
+                    try:
+                        drain(wait=False)
+                    except TypeError:
+                        pass
+        else:
+            timed_out = set()
+        reportable = set(finished_req_ids) - set(timed_out or ())
         # Stock contract: a finished id may only be reported when the request
         # finished (this call or a prior one); the adapter keeps the rest.
         # Load completions are consumed above; only store ids are reported.
-        v2_sending, _ = adapter.take_finished(finished_req_ids=finished_req_ids)
+        v2_sending, _ = adapter.take_finished(finished_req_ids=reportable)
         return _merge_id_sets(sending, v2_sending), receiving
 
     def get_transfer_results(self, finished_req_ids: set[str]) -> Any:
