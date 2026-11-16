@@ -591,6 +591,7 @@ class DSV41LwV2GroupAdapter:
         self._terminal_ops: set[tuple[str, str, str, int, str, int]] = set()
         self._trace_load_ready: set[tuple[str, str, int]] = set()
         self._trace_store_done: set[tuple[str, str, int, str]] = set()
+        self._trace_rpc_started: dict[str, int] = {}
         self._staged_ends: dict[tuple[str, str], int] = {}
         self._boundary_group_by_resource: dict[str, str] = {
             group.boundary_resource.resource_id: group.group_id
@@ -1637,9 +1638,21 @@ class DSV41LwV2GroupAdapter:
         attempt: int = 0,
     ) -> None:
         """Submit one store attempt; retries stay bounded and fail closed."""
+        trace = _mask_trace_enabled()
+        submit_started = time.monotonic_ns() if trace else 0
         try:
             future = self._transport.store_resource_block(spec, payload)
         except Exception as exc:  # noqa: BLE001 - terminal store failure
+            if trace:
+                self._emit_store_rpc(
+                    staged=staged,
+                    spec=spec,
+                    payload=payload,
+                    rpc_phase="submit",
+                    elapsed_ns=time.monotonic_ns() - submit_started,
+                    status="failed",
+                    error_code=IO_ERROR,
+                )
             _store_debug(
                 "transport store raised request=%s resource=%s attempt=%d: %r",
                 staged.request_id,
@@ -1664,6 +1677,16 @@ class DSV41LwV2GroupAdapter:
                 message=f"store submit failed: {exc}",
             )
             return
+        if trace:
+            self._trace_rpc_started[spec.operation_id] = submit_started
+            self._emit_store_rpc(
+                staged=staged,
+                spec=spec,
+                payload=payload,
+                rpc_phase="submit",
+                elapsed_ns=time.monotonic_ns() - submit_started,
+                status="ok",
+            )
         future.add_done_callback(
             lambda done: self._on_store_done(
                 event=event,
@@ -1689,6 +1712,17 @@ class DSV41LwV2GroupAdapter:
     ) -> None:
         if event.is_terminal:
             return
+        trace = _mask_trace_enabled()
+        rpc_started = (
+            self._trace_rpc_started.pop(spec.operation_id, None)
+            if trace
+            else None
+        )
+        rpc_elapsed = (
+            time.monotonic_ns() - rpc_started
+            if rpc_started is not None
+            else 0
+        )
         terminal = (
             event.group_id,
             event.request_id,
@@ -1726,6 +1760,16 @@ class DSV41LwV2GroupAdapter:
                 message=f"store failed: {exc}",
             )
             self._trace_store_terminal(event, staged, resource_id, "failed")
+            if trace:
+                self._emit_store_rpc(
+                    staged=staged,
+                    spec=spec,
+                    payload=payload,
+                    rpc_phase="done",
+                    elapsed_ns=rpc_elapsed,
+                    status="failed",
+                    error_code=IO_ERROR,
+                )
             return
         if not isinstance(result, ResourceBlockResult) or result.status not in (
             STATUS_OK,
@@ -1763,6 +1807,16 @@ class DSV41LwV2GroupAdapter:
                 message=f"store status {getattr(result, 'status', '?')}",
             )
             self._trace_store_terminal(event, staged, resource_id, "failed")
+            if trace:
+                self._emit_store_rpc(
+                    staged=staged,
+                    spec=spec,
+                    payload=payload,
+                    rpc_phase="done",
+                    elapsed_ns=rpc_elapsed,
+                    status="failed",
+                    error_code=getattr(result, "error_code", "") or IO_ERROR,
+                )
             return
         self._terminal_ops.add(terminal)
         with self._lock:
@@ -1776,6 +1830,15 @@ class DSV41LwV2GroupAdapter:
             )
         event.complete()
         self._trace_store_terminal(event, staged, resource_id, "ok")
+        if trace:
+            self._emit_store_rpc(
+                staged=staged,
+                spec=spec,
+                payload=payload,
+                rpc_phase="done",
+                elapsed_ns=rpc_elapsed,
+                status="ok",
+            )
 
     # ------------------------------------------------------------------
     # Default-off mask timeline (see mask_trace.py)
@@ -1866,6 +1929,103 @@ class DSV41LwV2GroupAdapter:
                 boundary=bool(item.is_boundary),
                 status="timeout",
             )
+
+
+    def _trace_store_identity(
+        self, *, request_id: str, group_id: str, resource_id: str
+    ) -> dict[str, Any]:
+        """Identity fields shared by every store-path span."""
+        return {
+            "phase": "store",
+            "request_id": request_id,
+            "group_id": group_id,
+            "resource_id": resource_id,
+            "rank": -1 if self._worker_id is None else int(self._worker_id),
+            "tid": threading.get_ident(),
+        }
+
+    def _trace_row_bytes(self, cache_name: str, rows: int) -> int:
+        """Bytes of one row window, from tensor metadata only (no read)."""
+        value = self._kv_caches.get(cache_name)
+        if value is None:
+            return 0
+        planes = value if isinstance(value, (tuple, list)) else (value,)
+        per_row = 0
+        for plane in planes:
+            size = int(plane.element_size())
+            for dim in plane.shape[1:]:
+                size *= int(dim)
+            per_row += size
+        return int(per_row * rows)
+
+    def _emit_store_describe(
+        self,
+        *,
+        request_id: str,
+        group_id: str,
+        resource_id: str,
+        cache_name: str,
+        rows: tuple[int, ...],
+        chunk_start: int,
+        chunk_end: int,
+        elapsed_ns: int,
+        status: str = "ok",
+    ) -> None:
+        if not _mask_trace_enabled():
+            return
+        fields = self._trace_store_identity(
+            request_id=request_id,
+            group_id=group_id,
+            resource_id=resource_id,
+        )
+        fields.update(
+            thread="engine",
+            cache_name=cache_name,
+            rows=len(rows),
+            bytes=self._trace_row_bytes(cache_name, len(rows)),
+            chunk_start=int(chunk_start),
+            chunk_end=int(chunk_end),
+            elapsed_ns=int(elapsed_ns),
+            status=status,
+        )
+        mask_trace.emit("store_describe", **fields)
+
+    def _emit_store_rpc(
+        self,
+        *,
+        staged: _StagedStore,
+        spec: ResourceBlockSpec,
+        payload: bytes,
+        rpc_phase: str,
+        elapsed_ns: int,
+        status: str,
+        error_code: str = "",
+    ) -> None:
+        if not _mask_trace_enabled():
+            return
+        fields = self._trace_store_identity(
+            request_id=staged.request_id,
+            group_id=staged.group_id,
+            resource_id=staged.resource_id,
+        )
+        fields.update(
+            thread="worker",
+            operation_id=spec.operation_id,
+            chunk_start=int(staged.chunk_start),
+            chunk_end=int(staged.chunk_end),
+            bytes=len(payload),
+            boundary=bool(staged.is_boundary),
+            rpc_phase=rpc_phase,
+            elapsed_ns=int(elapsed_ns),
+            status=status,
+            # The server-side hash span lives in LMCache and is not wired
+            # here; mark it planned instead of inventing a duration.
+            server_hash="unavailable",
+            server_hash_status="planned",
+        )
+        if error_code:
+            fields["error_code"] = error_code
+        mask_trace.emit("store_rpc", **fields)
 
     def _run_capture(self, capture: _BoundaryCapture) -> None:
         try:
@@ -2023,8 +2183,11 @@ class DSV41LwV2GroupAdapter:
                 if allow_async:
                     # Engine thread: only resolve identity and rows.  The
                     # worker reads the live rows after the producer event.
+                    trace = _mask_trace_enabled()
+                    describe_started = time.monotonic_ns() if trace else 0
+                    cache_name = self._cache_name_for(resource)
                     extraction = _StoreExtraction(
-                        cache_name=self._cache_name_for(resource),
+                        cache_name=cache_name,
                         rows=tuple(int(block) for block in blocks),
                         event=producer_event,
                     )
@@ -2041,6 +2204,17 @@ class DSV41LwV2GroupAdapter:
                             extraction=extraction,
                         )
                     )
+                    if trace:
+                        self._emit_store_describe(
+                            request_id=request.request_id,
+                            group_id=group.group_id,
+                            resource_id=resource.resource_id,
+                            cache_name=cache_name,
+                            rows=extraction.rows,
+                            chunk_start=start,
+                            chunk_end=chunk_end,
+                            elapsed_ns=time.monotonic_ns() - describe_started,
+                        )
                 else:
                     planes = self._resource_planes(resource.resource_id)
                     cloned = tuple(
@@ -2183,10 +2357,25 @@ class DSV41LwV2GroupAdapter:
         extraction = staged.extraction
         if extraction is None:
             return staged.planes
+        trace = _mask_trace_enabled()
+        sync_ns = 0
         if extraction.event is not None:
+            sync_started = time.monotonic_ns() if trace else 0
             extraction.event.synchronize()
+            if trace:
+                sync_ns = time.monotonic_ns() - sync_started
         value = self._kv_caches.get(extraction.cache_name)
         if value is None:
+            if trace:
+                self._emit_store_extract(
+                    staged,
+                    extraction,
+                    sync_ns,
+                    0,
+                    0,
+                    status="failed",
+                    error_code=INTERNAL_ERROR,
+                )
             raise KeyError(
                 f"registered kv cache {extraction.cache_name!r} for resource "
                 f"{staged.resource_id!r} is not bound"
@@ -2195,15 +2384,85 @@ class DSV41LwV2GroupAdapter:
             tuple(value) if isinstance(value, (tuple, list)) else (value,)
         )
         if not planes:
+            if trace:
+                self._emit_store_extract(
+                    staged, extraction, sync_ns, 0, 0, status="ok"
+                )
             return ()
         rows = torch.as_tensor(
             extraction.rows, dtype=torch.long, device=planes[0].device
         )
+        index_started = time.monotonic_ns() if trace else 0
+        try:
+            extracted = tuple(
+                plane.detach().index_select(0, rows) for plane in planes
+            )
+        except Exception:
+            if trace:
+                self._emit_store_extract(
+                    staged,
+                    extraction,
+                    sync_ns,
+                    time.monotonic_ns() - index_started,
+                    0,
+                    status="failed",
+                    error_code=INTERNAL_ERROR,
+                )
+            raise
+        index_ns = time.monotonic_ns() - index_started if trace else 0
         with self._lock:
             self._counters["store_extract_worker_thread"] += 1
-        return tuple(plane.detach().index_select(0, rows) for plane in planes)
+        if trace:
+            payload_bytes = 0
+            for plane in extracted:
+                payload_bytes += int(plane.numel()) * int(
+                    plane.element_size()
+                )
+            self._emit_store_extract(
+                staged,
+                extraction,
+                sync_ns,
+                index_ns,
+                payload_bytes,
+                status="ok",
+            )
+        return extracted
+
+    def _emit_store_extract(
+        self,
+        staged: _StagedStore,
+        extraction: _StoreExtraction,
+        sync_ns: int,
+        index_ns: int,
+        payload_bytes: int,
+        *,
+        status: str,
+        error_code: str = "",
+    ) -> None:
+        """Record the worker-side synchronise/index_select/copy span."""
+        if not _mask_trace_enabled():
+            return
+        fields = self._trace_store_identity(
+            request_id=staged.request_id,
+            group_id=staged.group_id,
+            resource_id=staged.resource_id,
+        )
+        fields.update(
+            thread="worker",
+            cache_name=extraction.cache_name,
+            rows=len(extraction.rows),
+            bytes=int(payload_bytes),
+            sync_ns=int(sync_ns),
+            index_ns=int(index_ns),
+            elapsed_ns=int(sync_ns + index_ns),
+            status=status,
+        )
+        if error_code:
+            fields["error_code"] = error_code
+        mask_trace.emit("store_extract", **fields)
 
     def _encode_staged(self, staged: _StagedStore) -> bytes | None:
+        trace = _mask_trace_enabled()
         if staged.is_boundary:
             capture = staged.capture
             if isinstance(capture, (bytes, bytearray)):
@@ -2211,12 +2470,76 @@ class DSV41LwV2GroupAdapter:
             if not isinstance(capture, _BoundaryCapture):
                 return None
             # Encoding happens on the worker, never on the forward thread.
-            return self._await_capture(capture)
-        return encode_token_payload(
+            started = time.monotonic_ns() if trace else 0
+            try:
+                payload = self._await_capture(capture)
+            except Exception:
+                if trace:
+                    self._emit_store_encode(
+                        staged,
+                        b"",
+                        time.monotonic_ns() - started,
+                        "failed",
+                        encoding="boundary_schema2",
+                        error_code=INTERNAL_ERROR,
+                    )
+                raise
+            if trace:
+                self._emit_store_encode(
+                    staged,
+                    payload or b"",
+                    time.monotonic_ns() - started,
+                    "ok",
+                    encoding="boundary_schema2",
+                )
+            return payload
+        started = time.monotonic_ns() if trace else 0
+        payload = encode_token_payload(
             resource_id=staged.resource_id,
             block_ids=staged.block_ids,
             planes=self._extract_staged(staged),
         )
+        if trace:
+            self._emit_store_encode(
+                staged,
+                payload,
+                time.monotonic_ns() - started,
+                "ok",
+                encoding="token_range_v1",
+            )
+        return payload
+
+    def _emit_store_encode(
+        self,
+        staged: _StagedStore,
+        payload: bytes,
+        elapsed_ns: int,
+        status: str,
+        *,
+        encoding: str,
+        error_code: str = "",
+    ) -> None:
+        """Record the worker-side envelope construction span."""
+        if not _mask_trace_enabled():
+            return
+        fields = self._trace_store_identity(
+            request_id=staged.request_id,
+            group_id=staged.group_id,
+            resource_id=staged.resource_id,
+        )
+        fields.update(
+            thread="worker",
+            encoding=encoding,
+            chunk_start=int(staged.chunk_start),
+            chunk_end=int(staged.chunk_end),
+            boundary=bool(staged.is_boundary),
+            bytes=len(payload),
+            elapsed_ns=int(elapsed_ns),
+            status=status,
+        )
+        if error_code:
+            fields["error_code"] = error_code
+        mask_trace.emit("store_encode", **fields)
 
     def _spec_stock_key(self, stock_key: IPCCacheServerKey) -> IPCCacheServerKey:
         """Return the single-rank view of a step's stock key.
@@ -2496,13 +2819,50 @@ class DSV41LwV2GroupAdapter:
             _store_debug("enqueue failed kind=%s queue is full", kind)
             with self._lock:
                 self._counters["queue_full"] += 1
+            if _mask_trace_enabled():
+                self._emit_queue_wait(job, kind, waited, status="queue_full")
             return False
         if waited > 0.0:
             with self._lock:
                 self._counters["store_backpressure_waits"] += 1
         _store_debug("enqueue kind=%s size=%d", kind, self._jobs.qsize())
+        if _mask_trace_enabled():
+            self._emit_queue_wait(job, kind, waited, status="ok")
         return True
 
+
+    def _emit_queue_wait(
+        self,
+        job: Any,
+        kind: str,
+        waited: float,
+        *,
+        status: str,
+    ) -> None:
+        """Record the engine-side queue wait and depth."""
+        if not _mask_trace_enabled():
+            return
+        fields: dict[str, Any] = {
+            "phase": "store" if kind == "store" else "queue",
+            "kind": str(kind),
+            "qsize": int(self._jobs.qsize()),
+            "wait_ns": int(waited * 1_000_000_000),
+            "status": status,
+            "thread": "engine",
+            "tid": threading.get_ident(),
+            "rank": -1 if self._worker_id is None else int(self._worker_id),
+        }
+        if kind == "store" and isinstance(job, tuple) and len(job) > 1:
+            event = getattr(job[1], "event", None)
+            if event is not None:
+                fields.update(
+                    request_id=event.request_id,
+                    group_id=event.group_id,
+                )
+        try:
+            mask_trace.emit("queue_wait", **fields)
+        except Exception:  # pragma: no cover - tracing must never raise
+            return
     def _fail_event(
         self,
         event: GroupEvent | None,

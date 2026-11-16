@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import hashlib
 import importlib.util
+import json
 import struct
 import sys
 import threading
@@ -2056,3 +2057,137 @@ def test_terminal_store_batch_keeps_source_read_ownership_until_worker_stops():
     adapter.drain_stores(wait=False)
     assert batch not in adapter._store_batches  # noqa: SLF001
     assert adapter.flush_source_reads({"r1"}, timeout=0.01) == set()
+
+# ---------------------------------------------------------------------------
+# t78: async-store C-component instrumentation
+# ---------------------------------------------------------------------------
+
+
+def _trace_records(directory: Path) -> list[dict]:
+    records: list[dict] = []
+    for trace_path in sorted(directory.glob("mask-trace-*.jsonl")):
+        for line in trace_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                records.append(json.loads(line))
+    return records
+
+
+def test_async_store_trace_emits_describe_extract_encode_rpc_and_queue(
+    tmp_path, monkeypatch
+):
+    """t78: every async store component lands in the JSONL stream."""
+    trace = sys.modules[PACKAGE + ".mask_trace"]
+    monkeypatch.setenv(trace.ENV_ENABLED, "1")
+    monkeypatch.setenv(trace.ENV_DIR, str(tmp_path))
+    trace.reset_state()
+
+    server = _FakeServer()
+    adapter = _make_adapter(FakeTransport(server))
+    adapter.register()
+    request = _request("r1", load_prefix_end=0, store_prefix_end=TOKENS)
+    adapter.submit_group_store("g20", ("r1",), _step(request))
+    adapter.drain_stores()
+
+    records = _trace_records(tmp_path)
+    by_event: dict[str, list[dict]] = {}
+    for record in records:
+        by_event.setdefault(record["event"], []).append(record)
+    for name in (
+        "store_describe",
+        "store_extract",
+        "store_encode",
+        "store_rpc",
+        "queue_wait",
+    ):
+        assert by_event.get(name), f"missing {name} in {sorted(by_event)}"
+
+    describe = by_event["store_describe"][0]
+    assert describe["thread"] == "engine"
+    assert describe["request_id"] == "r1"
+    assert describe["group_id"] == "g20"
+    assert describe["rank"] == 0
+    assert describe["tid"] > 0
+    assert describe["bytes"] > 0
+    assert describe["status"] == "ok"
+
+    extract = by_event["store_extract"][0]
+    assert extract["thread"] == "worker"
+    assert extract["bytes"] > 0
+    assert extract["sync_ns"] >= 0
+    assert extract["index_ns"] >= 0
+    assert extract["status"] == "ok"
+
+    encode = by_event["store_encode"][0]
+    assert encode["thread"] == "worker"
+    assert encode["encoding"] == "token_range_v1"
+    assert encode["bytes"] > 0
+    assert encode["status"] == "ok"
+
+    rpc = by_event["store_rpc"][0]
+    assert rpc["rpc_phase"] in {"submit", "done"}
+    assert rpc["server_hash"] == "unavailable"
+    assert rpc["server_hash_status"] == "planned"
+    assert rpc["bytes"] > 0
+    assert rpc["status"] == "ok"
+
+    queue = [item for item in by_event["queue_wait"] if item.get("kind") == "store"]
+    assert queue
+    assert queue[0]["request_id"] == "r1"
+    assert queue[0]["qsize"] >= 0
+    assert queue[0]["status"] == "ok"
+    adapter.close()
+
+
+def test_async_store_trace_is_inert_when_disabled(tmp_path, monkeypatch):
+    """t78: no opt-in means no file and no ordering side effects."""
+    trace = sys.modules[PACKAGE + ".mask_trace"]
+    monkeypatch.delenv(trace.ENV_ENABLED, raising=False)
+    monkeypatch.setenv(trace.ENV_DIR, str(tmp_path))
+    trace.reset_state()
+
+    server = _FakeServer()
+    adapter = _make_adapter(FakeTransport(server))
+    adapter.register()
+    request = _request("r1", load_prefix_end=0, store_prefix_end=TOKENS)
+    adapter.submit_group_store("g20", ("r1",), _step(request))
+    adapter.drain_stores()
+
+    assert adapter.metrics["group_store_committed"] == 1
+    assert list(tmp_path.iterdir()) == []
+    assert trace.stats()["lines"] == 0
+    adapter.close()
+
+
+def test_async_store_trace_keeps_the_terminal_failure_path(
+    tmp_path, monkeypatch
+):
+    """t78: tracing a failed store must not swallow or reorder the failure."""
+    trace = sys.modules[PACKAGE + ".mask_trace"]
+    monkeypatch.setenv(trace.ENV_ENABLED, "1")
+    monkeypatch.setenv(trace.ENV_DIR, str(tmp_path))
+    trace.reset_state()
+
+    server = _FakeServer()
+    transport = FakeTransport(server)
+
+    def failing_store(spec, payload):
+        raise OSError("boom")
+
+    transport.store_resource_block = failing_store  # type: ignore[assignment]
+    adapter = _make_adapter(transport, store_retries=0)
+    adapter.register()
+    request = _request("r1", load_prefix_end=0, store_prefix_end=TOKENS)
+    adapter.submit_group_store("g20", ("r1",), _step(request))
+    adapter.drain_stores()
+
+    assert adapter.metrics["group_store_committed"] == 0
+    assert adapter.metrics["group_store_failed"] >= 1
+    assert adapter.take_finished()[0] == {"r1"}
+    failed = [
+        record
+        for record in _trace_records(tmp_path)
+        if record["event"] == "store_rpc" and record["status"] == "failed"
+    ]
+    assert failed
+    assert failed[0]["error_code"] == "IO_ERROR"
+    adapter.close()
