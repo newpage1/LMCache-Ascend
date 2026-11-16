@@ -24,6 +24,7 @@ import json
 import struct
 import sys
 import threading
+import time
 import types
 
 # Third Party
@@ -2190,4 +2191,70 @@ def test_async_store_trace_keeps_the_terminal_failure_path(
     ]
     assert failed
     assert failed[0]["error_code"] == "IO_ERROR"
+    adapter.close()
+
+def test_queue_full_submit_releases_source_reads_and_reports_finished():
+    """t80 F1: a rejected batch must not pin its source rows forever."""
+    adapter = _make_adapter(
+        FakeTransport(_FakeServer()),
+        max_queue=1,
+        store_backpressure_timeout=0.01,
+    )
+    adapter._jobs = adapter_mod.queue.Queue(maxsize=1)  # noqa: SLF001
+    adapter._jobs.put(("noop", None))  # noqa: SLF001
+
+    request = _request("r1", load_prefix_end=0, store_prefix_end=TOKENS)
+    started = time.monotonic()
+    adapter.submit_group_store("g20", ("r1",), _step(request))
+    assert time.monotonic() - started < 1.0
+    assert adapter.metrics["queue_full"] >= 1
+
+    # queued=False means the worker never read the rows: flush must be a
+    # no-op rather than waiting out the source-read timeout.
+    started = time.monotonic()
+    assert adapter.flush_source_reads({"r1"}, timeout=0.01) == set()
+    assert time.monotonic() - started < 0.5
+
+    adapter.drain_stores()
+    assert adapter.metrics["group_store_failed"] >= 1
+    assert adapter.take_finished(finished_req_ids={"r1"})[0] == {"r1"}
+    # The worker thread is parked on the original queue; closing would block
+    # on a sentinel the replaced queue can never deliver.
+
+
+def test_worker_failure_releases_source_read_ownership():
+    """t80 F2: a dead store worker cannot keep a request un-reportable."""
+    adapter = _make_adapter(FakeTransport(_FakeServer()))
+    event = adapter_mod.GroupEvent("g20", "r1", "store")
+    batch = adapter_mod._StoreBatch(event)
+    adapter._store_batches.append(batch)  # noqa: SLF001
+
+    adapter._record_worker_failure(  # noqa: SLF001
+        "store", batch, RuntimeError("worker died")
+    )
+    assert batch.read_done.is_set()
+    assert adapter.flush_source_reads({"r1"}, timeout=0.01) == set()
+    adapter.drain_stores()
+    assert adapter.take_finished(finished_req_ids={"r1"})[0] == {"r1"}
+    assert adapter.metrics["source_read_forced"] >= 1
+    adapter.close()
+
+
+def test_repeated_source_read_timeouts_force_the_batch_done():
+    """t80 F2 fallback: repeated timeouts must not wedge the scheduler."""
+    adapter = _make_adapter(
+        FakeTransport(_FakeServer()), store_timeout=60.0
+    )
+    event = adapter_mod.GroupEvent("g20", "r9", "store")
+    batch = adapter_mod._StoreBatch(event)
+    adapter._store_batches.append(batch)  # noqa: SLF001
+
+    # O-A: the flush wait is independently bounded, not the 60s store timeout.
+    assert adapter_mod._SOURCE_READ_FLUSH_TIMEOUT_S <= 5.0
+    for _ in range(adapter_mod._SOURCE_READ_FORCE_AFTER - 1):
+        assert adapter.flush_source_reads({"r9"}, timeout=0.005) == {"r9"}
+        assert not batch.read_done.is_set()
+    assert adapter.flush_source_reads({"r9"}, timeout=0.005) == set()
+    assert batch.read_done.is_set()
+    assert adapter.metrics["source_read_forced"] >= 1
     adapter.close()

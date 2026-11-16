@@ -102,6 +102,12 @@ BOUNDARY_PAYLOAD_MAGIC = _wire.BOUNDARY_PAYLOAD_MAGIC
 _ASYNC_STORE_ENV = "DSV41_LW_V3_ASYNC_STORE"
 _STORE_RETRIES_ENV = "DSV41_LW_V3_STORE_RETRIES"
 _STORE_BACKPRESSURE_ENV = "DSV41_LW_V3_STORE_BACKPRESSURE_TIMEOUT"
+# ``flush_source_reads`` may run inside ``get_finished`` on the scheduler
+# thread; an unbounded 60s wait there would stall the engine loop.  Keep the
+# default independently small and force the read-done fallback only after a
+# request has timed out repeatedly (live worker is presumed gone/stuck).
+_SOURCE_READ_FLUSH_TIMEOUT_S = 5.0
+_SOURCE_READ_FORCE_AFTER = 3
 
 
 def _read_flag_env(name: str, default: bool) -> bool:
@@ -593,6 +599,7 @@ class DSV41LwV2GroupAdapter:
         self._trace_store_done: set[tuple[str, str, int, str]] = set()
         self._trace_rpc_started: dict[str, int] = {}
         self._staged_ends: dict[tuple[str, str], int] = {}
+        self._source_read_timeouts: dict[str, int] = {}
         self._boundary_group_by_resource: dict[str, str] = {
             group.boundary_resource.resource_id: group.group_id
             for group in plan.groups
@@ -651,6 +658,7 @@ class DSV41LwV2GroupAdapter:
             "store_async_fallbacks": 0,
             "source_read_done": 0,
             "source_read_timeout": 0,
+            "source_read_forced": 0,
         }
 
         self._jobs: queue.Queue[Any] = queue.Queue(maxsize=self._max_queue)
@@ -986,6 +994,12 @@ class DSV41LwV2GroupAdapter:
                     queued=queued,
                 )
             if not queued:
+                # The worker never picked this batch up, so it cannot be
+                # reading the source rows: source ownership is trivially
+                # released here.  Without this, flush_source_reads would
+                # wait out its timeout on every get_finished and the request
+                # would never be reported as finished_sending.
+                batch.read_done.set()
                 self._fail_event(
                     event,
                     resource_id=None,
@@ -1086,23 +1100,48 @@ class DSV41LwV2GroupAdapter:
             ]
         if not batches:
             return set()
-        deadline = time.monotonic() + (
-            self._store_timeout if timeout is None else float(timeout)
-        )
+        if timeout is None:
+            timeout = min(self._store_timeout, _SOURCE_READ_FLUSH_TIMEOUT_S)
+        deadline = time.monotonic() + float(timeout)
         timed_out: set[str] = set()
         for batch in batches:
             remaining = max(0.0, deadline - time.monotonic())
-            if not batch.read_done.wait(remaining):
+            if batch.read_done.wait(remaining):
+                self._source_read_timeouts.pop(batch.event.request_id, None)
+            else:
                 timed_out.add(batch.event.request_id)
+        forced: set[str] = set()
         if timed_out:
             with self._lock:
                 self._counters["source_read_timeout"] += len(timed_out)
+                for request_id in timed_out:
+                    count = self._source_read_timeouts.get(request_id, 0) + 1
+                    self._source_read_timeouts[request_id] = count
+                    if count >= _SOURCE_READ_FORCE_AFTER:
+                        forced.add(request_id)
+                        self._source_read_timeouts.pop(request_id, None)
+                if forced:
+                    self._counters["source_read_forced"] += len(forced)
+                    for batch in batches:
+                        if batch.event.request_id in forced:
+                            # The worker never finished reading (or died).
+                            # After repeated timeouts, stop pinning the
+                            # source: the batch is already terminal, so the
+                            # request must be allowed to report finished.
+                            batch.read_done.set()
             logger_warning(
                 "dsv41 lw v2 source read did not finish for requests %s; "
                 "keeping their blocks alive",
-                sorted(timed_out),
+                sorted(timed_out - forced),
             )
-        return timed_out
+            if forced:
+                logger_warning(
+                    "dsv41 lw v2 source read forced done for requests %s "
+                    "after %d consecutive timeouts",
+                    sorted(forced),
+                    _SOURCE_READ_FORCE_AFTER,
+                )
+        return timed_out - forced
 
     def flush_stores(self, request_ids: set[str] | None = None) -> set[str]:
         """Finish source reads and collect commit state for the given requests.
@@ -3013,6 +3052,14 @@ class DSV41LwV2GroupAdapter:
             )
         elif kind == "store":
             batch: _StoreBatch = payload
+            # The worker died while (possibly) reading the source rows and
+            # will not touch this batch again.  Releasing read ownership is
+            # required for liveness; the failure itself still fails the
+            # batch closed.
+            if not batch.read_done.is_set():
+                batch.read_done.set()
+                with self._lock:
+                    self._counters["source_read_forced"] += 1
             self._fail_event(
                 batch.event,
                 resource_id=None,
