@@ -502,6 +502,7 @@ def test_batch_callback_span_reports_the_receive_loop_components(
     ):
         assert field in callback
         assert callback[field] >= 0
+    assert callback["response_decode_status"] == "unavailable"
     assert adapter.metrics["load_callback_count"] >= 1
     assert adapter.metrics["load_callback_total_ns"] > 0
 
@@ -535,3 +536,170 @@ def test_single_and_batch_paths_apply_identical_bytes(monkeypatch):
         assert torch.equal(tensor, caches_batch[name]), name
     assert adapter_single._boundary_payloads == adapter_batch._boundary_payloads
     assert transport_batch.batch_calls
+
+
+# ---------------------------------------------------------------------------
+# t92: trace-off zero-clock and W0 37-chunk parity
+# ---------------------------------------------------------------------------
+
+LONG_CHUNKS = 37
+LONG_BLOCKS = 74
+LONG_TOKENS = LONG_CHUNKS * helpers.CHUNK_SIZE
+
+
+def _long_request():
+    return helpers._request(
+        "r1",
+        step_id=1,
+        load_prefix_end=LONG_TOKENS,
+        blocks=(tuple(range(LONG_BLOCKS)),),
+    )
+
+
+def _long_caches() -> dict:
+    caches = {}
+    for index, (resource_id, resource) in enumerate(
+        sorted(helpers.PLAN_RESOURCES.items())
+    ):
+        if resource.storage_kind == "boundary_state":
+            continue
+        base = torch.arange(
+            LONG_BLOCKS * 2 * 3, dtype=torch.float32
+        ).reshape(LONG_BLOCKS, 2, 3)
+        caches[resource_id] = (base + float(index)).contiguous()
+    return caches
+
+
+def _seed_long(server, request, caches) -> None:
+    for resource_id, resource in helpers.PLAN_RESOURCES.items():
+        if resource.storage_kind != "token_range":
+            continue
+        plane = caches[resource_id]
+        for chunk_index in range(LONG_CHUNKS):
+            start = chunk_index * helpers.CHUNK_SIZE
+            end = start + helpers.CHUNK_SIZE
+            blocks = request.block_ids_by_engine_group[0][
+                start // helpers.BLOCK_SIZE : end // helpers.BLOCK_SIZE
+            ]
+            spec = adapter_mod.ResourceBlockSpec(
+                operation_id="seed",
+                direction="load",
+                instance_id="instance-1",
+                request_id=request.request_id,
+                step_id=request.step_id,
+                registration_epoch=0,
+                server_generation=0,
+                plan_hash=helpers.PLAN_HASH,
+                layout_hash=helpers.LAYOUT_HASH,
+                stock_key=request.stock_key,
+                resource_id=resource_id,
+                engine_group_id=resource.engine_group_id,
+                block_ids=blocks,
+                start_token=start,
+                end_token=end,
+                prefix_end=LONG_TOKENS,
+                skip_first_n_tokens=0,
+            )
+            payload = adapter_mod.encode_token_payload(
+                resource_id=resource_id,
+                block_ids=blocks,
+                planes=(plane[list(blocks)].clone(),),
+            )
+            server.blocks[server._token_key(spec, start, end)] = payload
+
+    for group_id in ("g2", "g8", "g14"):
+        group = helpers.PLAN.group_by_id(group_id)
+        spec = adapter_mod.ResourceBlockSpec(
+            operation_id="seed-boundary",
+            direction="load",
+            instance_id="instance-1",
+            request_id=request.request_id,
+            step_id=request.step_id,
+            registration_epoch=0,
+            server_generation=0,
+            plan_hash=helpers.PLAN_HASH,
+            layout_hash=helpers.LAYOUT_HASH,
+            stock_key=request.stock_key,
+            resource_id=group.boundary_resource.resource_id,
+            engine_group_id=None,
+            block_ids=(),
+            start_token=LONG_TOKENS,
+            end_token=LONG_TOKENS,
+            prefix_end=LONG_TOKENS,
+            skip_first_n_tokens=0,
+        )
+        server.boundaries[server._boundary_key(spec)] = (
+            adapter_mod.BOUNDARY_PAYLOAD_MAGIC + b"seed-long-" + group_id.encode()
+        )
+
+
+def test_trace_off_reads_no_host_clock_and_passes_no_timings(monkeypatch):
+    """t92 F1: the load path must not sample the host clock when trace is off."""
+    request = _request()
+    server = BatchServer()
+    _seed(server, request)
+    transport = BatchTransport(server)
+    monkeypatch.delenv("DSV41_LW_V2_MASK_TRACE", raising=False)
+    adapter_mod.mask_trace.reset_state()
+    adapter = helpers._make_adapter(transport)
+    adapter.register()
+
+    calls = {"count": 0}
+    real_monotonic_ns = adapter_mod.time.monotonic_ns
+
+    def counting_monotonic_ns():
+        calls["count"] += 1
+        return real_monotonic_ns()
+
+    monkeypatch.setattr(
+        adapter_mod.time, "monotonic_ns", counting_monotonic_ns
+    )
+    seen_timings = []
+    original_apply = adapter._apply_retrieve
+
+    def recording_apply(**kwargs):
+        seen_timings.append(kwargs.get("timings", "missing"))
+        return original_apply(**kwargs)
+
+    monkeypatch.setattr(adapter, "_apply_retrieve", recording_apply)
+    for group_id in ("g2", "g8", "g14", "g20"):
+        _load(adapter, request, group_id)
+
+    assert seen_timings
+    assert all(timings is None for timings in seen_timings)
+    assert calls["count"] == 0
+
+
+def test_long_37_chunk_single_and_batch_parity(monkeypatch):
+    """t92/O-2: 299 items, 8 batch RPCs and byte parity at W0 long shape."""
+    request = _long_request()
+
+    server = BatchServer()
+    caches_single = _long_caches()
+    _seed_long(server, request, caches_single)
+    transport_single = BatchTransport(server)
+    adapter_single = helpers._make_adapter(
+        transport_single, caches=caches_single
+    )
+    adapter_single.register()
+    for group_id in ("g2", "g8", "g14", "g20"):
+        _load(adapter_single, request, group_id)
+    assert len(server.retrieve_calls) == 299
+
+    monkeypatch.setenv(adapter_mod._BATCH_RETRIEVE_ENV, "1")
+    caches_batch = _long_caches()
+    transport_batch = BatchTransport(server)
+    adapter_batch = helpers._make_adapter(transport_batch, caches=caches_batch)
+    adapter_batch.register()
+    for group_id in ("g2", "g8", "g14", "g20"):
+        _load(adapter_batch, request, group_id)
+
+    assert len(transport_batch.batch_calls) == 8
+    assert len(server.retrieve_calls) == 299
+    lengths = [len(call.items) for call in transport_batch.batch_calls]
+    assert lengths == [64, 11, 64, 11, 64, 11, 64, 10]
+    assert sum(lengths) == 299
+
+    for name, tensor in caches_single.items():
+        assert torch.equal(tensor, caches_batch[name]), name
+    assert adapter_single._boundary_payloads == adapter_batch._boundary_payloads

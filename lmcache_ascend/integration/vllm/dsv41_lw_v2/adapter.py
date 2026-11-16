@@ -1883,7 +1883,8 @@ class DSV41LwV2GroupAdapter:
                 )
                 return
             cursor = end
-        timings: dict[str, int] = {}
+        trace = _mask_trace_enabled()
+        timings: dict[str, int] | None = {} if trace else None
         for item in items:
             start, end = slices[item.spec.operation_id]
             try:
@@ -2015,8 +2016,9 @@ class DSV41LwV2GroupAdapter:
         operation_id: str,
         future: Future,
     ) -> None:
-        started_callback = time.monotonic_ns() if _mask_trace_enabled() else 0
-        timings: dict[str, int] = {}
+        trace = _mask_trace_enabled()
+        started_callback = time.monotonic_ns() if trace else 0
+        timings: dict[str, int] | None = {} if trace else None
         key = (group_id, request.request_id, request.step_id)
         event = self._load_events.get(key)
         if event is None or event.is_terminal:
@@ -2511,17 +2513,24 @@ class DSV41LwV2GroupAdapter:
         submitted_key: str,
         status: str,
         started: int,
-        timings: dict[str, int],
+        timings: dict[str, int] | None,
     ) -> None:
         """Emit the receive-loop callback span and maintain HOL counters.
 
         ``submit_to_ready_ns`` is the time between the RPC submit and the
-        callback entry (future already ready).  The remaining buckets cover
-        response/payload decode, host apply and the device copy.  All of it is
-        host-clock only and exists only when the mask trace is enabled.
+        callback entry (future already ready).  ``payload_decode_ns``,
+        ``host_apply_ns`` and ``device_copy_ns`` come from the apply path.
+
+        Response-frame decode is not instrumented here yet, so
+        ``response_decode_ns`` is emitted as 0 together with
+        ``response_decode_status="unavailable"``; join the transport's
+        ``client_response_decode`` event instead of reading that placeholder.
+        All buckets are host-clock only and exist only when the mask trace is
+        enabled.
         """
         if not _mask_trace_enabled() or not started:
             return
+        timings = timings or {}
         now = time.monotonic_ns()
         submitted = self._trace_load_submitted.pop(submitted_key, 0)
         total = max(0, now - started)
@@ -2545,6 +2554,7 @@ class DSV41LwV2GroupAdapter:
                 max(0, started - submitted) if submitted else 0
             ),
             response_decode_ns=int(timings.get("response_decode_ns", 0)),
+            response_decode_status="unavailable",
             payload_decode_ns=int(timings.get("payload_decode_ns", 0)),
             host_apply_ns=int(timings.get("host_apply_ns", 0)),
             device_copy_ns=int(timings.get("row_copy_ns", 0)),
