@@ -70,6 +70,20 @@ from lmcache.v1.multiprocess.resource_block_protocol import (
     ResourceBlockResult,
     ResourceBlockSpec,
 )
+
+try:  # pragma: no cover - branch depends on the installed server version
+    # First Party
+    from lmcache.v1.multiprocess.resource_block_protocol import (
+        ResourceBlockBatchItem,
+        ResourceBlockBatchItemResult,
+        ResourceBlockBatchRequest,
+        ResourceBlockBatchResult,
+    )
+except ImportError:  # older server: batch retrieve stays unavailable
+    ResourceBlockBatchItem = None  # type: ignore[assignment]
+    ResourceBlockBatchItemResult = None  # type: ignore[assignment]
+    ResourceBlockBatchRequest = None  # type: ignore[assignment]
+    ResourceBlockBatchResult = None  # type: ignore[assignment]
 from lmcache_ascend.integration.vllm.dsv41_lw_v2.plan import (
     GroupedTransferPlan,
     TransferGroup,
@@ -88,7 +102,14 @@ from lmcache_ascend.integration.vllm.dsv41_lw_v2 import mask_trace
 
 RESOURCE_BLOCK_PROTOCOL_VERSION = _wire.RESOURCE_BLOCK_PROTOCOL_VERSION
 RESOURCE_BLOCK_LAYOUT_ENCODINGS = _wire.RESOURCE_BLOCK_ENCODINGS
-REQUIRED_CAPABILITIES = _wire.RESOURCE_BLOCK_CAPABILITIES
+_BATCH_RETRIEVE_CAPABILITY = "resource_blocks_batch_v1"
+# The batch capability is negotiated separately: a compliant v2 server does
+# not have to support it, so it must not be a hard registration requirement.
+REQUIRED_CAPABILITIES = tuple(
+    capability
+    for capability in _wire.RESOURCE_BLOCK_CAPABILITIES
+    if capability != _BATCH_RETRIEVE_CAPABILITY
+)
 
 def _mask_trace_enabled() -> bool:
     """Cached switch read for the mask timeline (one env lookup per process)."""
@@ -102,6 +123,11 @@ BOUNDARY_PAYLOAD_MAGIC = _wire.BOUNDARY_PAYLOAD_MAGIC
 _ASYNC_STORE_ENV = "DSV41_LW_V3_ASYNC_STORE"
 _STORE_RETRIES_ENV = "DSV41_LW_V3_STORE_RETRIES"
 _STORE_BACKPRESSURE_ENV = "DSV41_LW_V3_STORE_BACKPRESSURE_TIMEOUT"
+# v3 warm batch retrieve.  The switch is experimental and defaults off; the
+# client only uses the batched RPC when the server negotiated the capability.
+_BATCH_RETRIEVE_ENV = "DSV41_LW_V3_BATCH_RETRIEVE"
+_BATCH_MAX_ITEMS = 64
+_BATCH_MAX_TOTAL_BYTES = 64 * 1024 * 1024
 # ``flush_source_reads`` may run inside ``get_finished`` on the scheduler
 # thread; an unbounded 60s wait there would stall the engine loop.  Keep the
 # default independently small and force the read-done fallback only after a
@@ -116,6 +142,14 @@ def _read_flag_env(name: str, default: bool) -> bool:
     if raw is None or not raw.strip():
         return default
     return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _read_strict_flag_env(name: str, default: bool = False) -> bool:
+    """Read an opt-in switch; only explicit truthy values enable it."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _read_int_env(name: str, default: int, *, minimum: int = 0) -> int:
@@ -193,6 +227,13 @@ class ResourceBlockTransport(Protocol):
     ) -> Future: ...
 
 
+@runtime_checkable
+class BatchResourceBlockTransport(Protocol):
+    """Optional batched retrieve extension of the resource-block client."""
+
+    def retrieve_resource_blocks(self, request: Any) -> Future: ...
+
+
 _RESOURCE_BLOCK_CLIENT_METHODS = (
     "register_resource_blocks",
     "store_resource_block",
@@ -240,6 +281,9 @@ class MPResourceBlockTransport:
         self._client = client
         self._typed = bool(typed)
         self._timeout = float(timeout)
+        self._has_batch = callable(
+            getattr(client, "retrieve_resource_blocks", None)
+        )
 
     def _submit(self, operation: str, *payloads: Any) -> Future:
         return self._client.submit_request(operation, list(payloads))
@@ -272,6 +316,17 @@ class MPResourceBlockTransport:
         if self._typed:
             return self._client.lookup_resource_blocks(request)
         return self._submit("lookup_resource_blocks", request)
+
+    def retrieve_resource_blocks(self, request: Any) -> Future:
+        """Submit one batched retrieve; never loop the single RPC here."""
+        if self._has_batch:
+            return self._client.retrieve_resource_blocks(request)
+        if callable(getattr(self._client, "submit_request", None)):
+            return self._submit("retrieve_resource_blocks", request)
+        raise TypeError(
+            "request client cannot submit retrieve_resource_blocks; "
+            "the batch capability cannot be used"
+        )
 
 
 def resource_block_lookup_request(
@@ -511,6 +566,14 @@ class DSV41LwV2GroupAdapter:
         store_timeout: ``drain_stores`` wait budget in seconds.
         max_queue: Bound of queued worker jobs; queue-full fails loads and
             drops stores instead of blocking the scheduler.
+        async_store: Run store extraction/encoding on the adapter worker.
+        store_retries: Transport retry budget for one store payload.
+        store_backpressure_timeout: Seconds a store submit may wait for a
+            queue slot before it is failed closed.
+        batch_retrieve: Enable the experimental group-level batch retrieve.
+            ``None`` reads ``DSV41_LW_V3_BATCH_RETRIEVE`` (default off); the
+            switch still requires the server ``resource_blocks_batch_v1``
+            capability and the batched client RPC.
     """
 
     def __init__(
@@ -536,6 +599,7 @@ class DSV41LwV2GroupAdapter:
         async_store: bool | None = None,
         store_retries: int | None = None,
         store_backpressure_timeout: float | None = None,
+        batch_retrieve: bool | None = None,
     ) -> None:
         if not isinstance(plan, GroupedTransferPlan):
             raise TypeError("plan must be a GroupedTransferPlan")
@@ -587,6 +651,17 @@ class DSV41LwV2GroupAdapter:
             if store_backpressure_timeout is not None
             else _read_float_env(_STORE_BACKPRESSURE_ENV, 1.0)
         )
+        # v3 warm batch retrieve: default off, capability-gated.  A batch is
+        # only used when the server negotiated ``resource_blocks_batch_v1``;
+        # a flag set against an older server silently stays on the single
+        # path (and the failure path never retries single).
+        self._batch_retrieve_requested = (
+            bool(batch_retrieve)
+            if batch_retrieve is not None
+            else _read_strict_flag_env(_BATCH_RETRIEVE_ENV, False)
+        )
+        self._server_capabilities: tuple[str, ...] = ()
+        self._batch_protocol_available = ResourceBlockBatchRequest is not None
 
         self._lock = threading.RLock()
         self._cv = threading.Condition(self._lock)
@@ -610,6 +685,7 @@ class DSV41LwV2GroupAdapter:
         self._trace_load_ready: set[tuple[str, str, int]] = set()
         self._trace_store_done: set[tuple[str, str, int, str]] = set()
         self._trace_rpc_started: dict[str, int] = {}
+        self._trace_load_submitted: dict[str, int] = {}
         self._staged_ends: dict[tuple[str, str], int] = {}
         self._source_read_timeouts: dict[str, int] = {}
         self._boundary_group_by_resource: dict[str, str] = {
@@ -671,6 +747,13 @@ class DSV41LwV2GroupAdapter:
             "source_read_done": 0,
             "source_read_timeout": 0,
             "source_read_forced": 0,
+            "batch_load_rpcs": 0,
+            "batch_load_items": 0,
+            "batch_partial_failures": 0,
+            "single_load_rpcs": 0,
+            "load_callback_count": 0,
+            "load_callback_total_ns": 0,
+            "load_callback_max_ns": 0,
         }
 
         self._jobs: queue.Queue[Any] = queue.Queue(maxsize=self._max_queue)
@@ -707,6 +790,25 @@ class DSV41LwV2GroupAdapter:
     def async_store(self) -> bool:
         """Whether store extraction runs on the worker (v3 async store)."""
         return self._async_store
+
+    @property
+    def batch_retrieve(self) -> bool:
+        """Whether this adapter may use the batched retrieve RPC.
+
+        All of the following must hold: the experimental switch is on, the
+        installed server protocol has the batch DTOs, the registration ack
+        advertised ``resource_blocks_batch_v1``, and the transport exposes the
+        typed batched RPC.  A capability mismatch keeps the single path; it is
+        not an error.
+        """
+        return bool(
+            self._batch_retrieve_requested
+            and self._batch_protocol_available
+            and _BATCH_RETRIEVE_CAPABILITY in self._server_capabilities
+            and callable(
+                getattr(self._transport, "retrieve_resource_blocks", None)
+            )
+        )
 
     @property
     def boundary_resource_ids(self) -> tuple[str, ...]:
@@ -783,6 +885,7 @@ class DSV41LwV2GroupAdapter:
             )
         with self._lock:
             self._server_generation = int(ack.server_generation)
+            self._server_capabilities = tuple(ack.capabilities)
         return ack
 
     def set_generations(
@@ -1386,6 +1489,9 @@ class DSV41LwV2GroupAdapter:
         )
         if event is None or event.is_terminal:
             return
+        if self.batch_retrieve:
+            self._run_load_batched(job, event)
+            return
         for resource in group.token_range_resources:
             layout = self._layouts.get(resource.resource_id)
             if layout is None:
@@ -1445,6 +1551,419 @@ class DSV41LwV2GroupAdapter:
                 boundary=True,
             )
 
+    def _run_load_batched(
+        self, job: "_LoadJob", event: GroupEvent
+    ) -> None:
+        """Plan and submit the group's loads as bounded batched RPCs.
+
+        The batching container only groups RPCs: every logical item still owns
+        its single-path spec/operation_id, its own payload and its own apply.
+        A batch failure (status, table mismatch, corrupt slice) fails the whole
+        group and is never retried through the single path.
+        """
+        group = job.group
+        request = job.request
+        try:
+            items = self._build_load_items(job)
+        except _LoadPrepareError as exc:
+            event.fail(
+                resource_id=exc.resource_id,
+                error_code=exc.error_code,
+                message=exc.message,
+            )
+            return
+        if not items:
+            return
+        try:
+            batches = self._plan_batches(items)
+        except ValueError as exc:
+            event.fail(
+                resource_id=items[0].spec.resource_id,
+                error_code=LAYOUT_MISMATCH,
+                message=str(exc),
+            )
+            return
+        for batch_items in batches:
+            self._submit_load_batch(
+                group_id=group.group_id,
+                request=request,
+                event=event,
+                items=batch_items,
+            )
+
+    def _build_load_items(self, job: "_LoadJob") -> list[_LoadItem]:
+        """Build logical items in stable long-by-chunk → index → boundary order."""
+        group = job.group
+        request = job.request
+        items: list[_LoadItem] = []
+        for resource in group.token_range_resources:
+            layout = self._layouts.get(resource.resource_id)
+            if layout is None:
+                raise _LoadPrepareError(
+                    resource.resource_id,
+                    LAYOUT_MISMATCH,
+                    "resource has no registered layout",
+                )
+            for chunk in job.chunks:
+                try:
+                    resolved = self._chunk_with_blocks(
+                        request, resource, chunk
+                    )
+                except ValueError as exc:
+                    raise _LoadPrepareError(
+                        resource.resource_id, PREFIX_INCOMPLETE, str(exc)
+                    ) from exc
+                spec = self._spec(
+                    direction=_LOAD,
+                    request=request,
+                    step=job.step,
+                    resource_id=resource.resource_id,
+                    engine_group_id=resource.engine_group_id,
+                    chunk=resolved,
+                    prefix_end=request.load_prefix_end,
+                )
+                items.append(_LoadItem(spec=spec, chunk=resolved, boundary=False))
+        if group.has_boundary:
+            assert group.boundary_resource is not None
+            resource = group.boundary_resource
+            spec = self._spec(
+                direction=_LOAD,
+                request=request,
+                step=job.step,
+                resource_id=resource.resource_id,
+                engine_group_id=resource.engine_group_id,
+                chunk=None,
+                prefix_end=request.load_prefix_end,
+            )
+            items.append(_LoadItem(spec=spec, chunk=None, boundary=True))
+        return items
+
+    def _plan_batches(self, items: list[_LoadItem]) -> list[list[_LoadItem]]:
+        """Split items into stable 64-item / 64 MiB RPC containers.
+
+        Budgets come from the registered layout, never from observed payload
+        sizes; a missing or zero budget disables batching for the group rather
+        than guessing.
+        """
+        batches: list[list[_LoadItem]] = []
+        current: list[_LoadItem] = []
+        used = 0
+        for item in items:
+            layout = self._layouts.get(item.spec.resource_id)
+            if layout is None or int(layout.max_payload_bytes) <= 0:
+                raise ValueError(
+                    f"resource {item.spec.resource_id} has no positive layout "
+                    "budget; refusing to plan a batch"
+                )
+            size = int(layout.max_payload_bytes)
+            if current and (
+                len(current) >= _BATCH_MAX_ITEMS
+                or used + size > _BATCH_MAX_TOTAL_BYTES
+            ):
+                batches.append(current)
+                current = []
+                used = 0
+            current.append(item)
+            used += size
+        if current:
+            batches.append(current)
+        return batches
+
+    def _submit_load_batch(
+        self,
+        *,
+        group_id: str,
+        request: TransferRequest,
+        event: GroupEvent,
+        items: list[_LoadItem],
+    ) -> None:
+        assert ResourceBlockBatchRequest is not None
+        batch_id = uuid.uuid4().hex
+        try:
+            batch_request = ResourceBlockBatchRequest(
+                batch_id=batch_id,
+                instance_id=self._instance_id,
+                request_id=request.request_id,
+                step_id=int(request.step_id),
+                registration_epoch=self._registration_epoch,
+                server_generation=self._server_generation,
+                plan_hash=self._plan_hash,
+                layout_hash=self._layout_hash,
+                stock_key=self._spec_stock_key(request.stock_key),
+                items=tuple(
+                    ResourceBlockBatchItem(
+                        operation_id=item.spec.operation_id,
+                        resource_id=item.spec.resource_id,
+                        engine_group_id=item.spec.engine_group_id,
+                        block_ids=item.spec.block_ids,
+                        start_token=item.spec.start_token,
+                        end_token=item.spec.end_token,
+                        prefix_end=item.spec.prefix_end,
+                        skip_first_n_tokens=item.spec.skip_first_n_tokens,
+                        boundary=item.spec.boundary,
+                    )
+                    for item in items
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - fail closed per group
+            event.fail(
+                resource_id=items[0].spec.resource_id,
+                error_code=INVALID_SPEC,
+                message=f"batch request construction failed: {exc}",
+            )
+            return
+        if _mask_trace_enabled():
+            self._trace_load_submitted[batch_id] = time.monotonic_ns()
+        try:
+            future = self._transport.retrieve_resource_blocks(batch_request)
+        except Exception as exc:  # noqa: BLE001 - reported through the event
+            event.fail(
+                resource_id=items[0].spec.resource_id,
+                error_code=IO_ERROR,
+                message=f"batch retrieve submit failed: {exc}",
+            )
+            return
+        with self._lock:
+            self._counters["batch_load_rpcs"] += 1
+            self._counters["batch_load_items"] += len(items)
+        future.add_done_callback(
+            lambda done: self._on_batch_retrieve_done(
+                group_id=group_id,
+                request=request,
+                event=event,
+                items=items,
+                batch_id=batch_id,
+                future=done,
+            )
+        )
+
+    def _batch_item_matches(
+        self, spec: ResourceBlockSpec, item_result: Any
+    ) -> bool:
+        """Require the response row to echo the submitted logical item."""
+        return (
+            getattr(item_result, "operation_id", None) == spec.operation_id
+            and getattr(item_result, "resource_id", None) == spec.resource_id
+            and getattr(item_result, "engine_group_id", None)
+            == spec.engine_group_id
+            and int(getattr(item_result, "start_token", -1))
+            == int(spec.start_token)
+            and int(getattr(item_result, "end_token", -1))
+            == int(spec.end_token)
+            and int(getattr(item_result, "prefix_end", -1))
+            == int(spec.prefix_end)
+        )
+
+    def _on_batch_retrieve_done(
+        self,
+        *,
+        group_id: str,
+        request: TransferRequest,
+        event: GroupEvent,
+        items: list[_LoadItem],
+        batch_id: str,
+        future: Future,
+    ) -> None:
+        if event.is_terminal:
+            return
+        started = time.monotonic_ns() if _mask_trace_enabled() else 0
+        try:
+            result, payload = future.result()
+        except Exception as exc:  # noqa: BLE001 - transport/result failure
+            self._fail_batch(
+                event, items, request, IO_ERROR, f"batch retrieve failed: {exc}"
+            )
+            return
+        if not isinstance(result, ResourceBlockBatchResult):
+            self._fail_batch(
+                event,
+                items,
+                request,
+                INVALID_SPEC,
+                "batch result is not a ResourceBlockBatchResult",
+            )
+            return
+        if (
+            result.registration_epoch != self._registration_epoch
+            or result.server_generation != self._server_generation
+        ):
+            self._fail_batch(
+                event,
+                items,
+                request,
+                STALE_GENERATION,
+                "batch result does not echo this generation",
+            )
+            return
+        if result.status != STATUS_OK:
+            if result.status == "partial":
+                with self._lock:
+                    self._counters["batch_partial_failures"] += 1
+            code = _batch_error_code(result.status, result.error_code)
+            self._fail_batch(
+                event, items, request, code, f"batch status {result.status}"
+            )
+            return
+        if not isinstance(payload, (bytes, bytearray)):
+            self._fail_batch(
+                event, items, request, PAYLOAD_CORRUPT, "batch payload is not bytes"
+            )
+            return
+        raw = bytes(payload)
+        if int(result.total_bytes) != len(raw):
+            self._fail_batch(
+                event,
+                items,
+                request,
+                PAYLOAD_CORRUPT,
+                f"batch declared {result.total_bytes} bytes but returned {len(raw)}",
+            )
+            return
+        table = result.items or ()
+        if len(table) != len(items):
+            self._fail_batch(
+                event,
+                items,
+                request,
+                INVALID_SPEC,
+                "batch item table does not match the submitted item count",
+            )
+            return
+        slices: dict[str, tuple[int, int]] = {}
+        spans: list[tuple[int, int]] = []
+        for item, item_result in zip(items, table):
+            if not self._batch_item_matches(item.spec, item_result):
+                self._fail_batch(
+                    event,
+                    items,
+                    request,
+                    INVALID_SPEC,
+                    "batch item result does not echo the submitted item",
+                )
+                return
+            if item_result.status != STATUS_OK:
+                if item_result.status == "partial":
+                    with self._lock:
+                        self._counters["batch_partial_failures"] += 1
+                code = _batch_error_code(
+                    item_result.status, item_result.error_code
+                )
+                self._fail_batch(
+                    event,
+                    items,
+                    request,
+                    code,
+                    f"batch item {item.spec.operation_id} status "
+                    f"{item_result.status}",
+                )
+                return
+            offset = int(item_result.offset)
+            length = int(item_result.length)
+            if offset < 0 or length <= 0 or offset + length > len(raw):
+                self._fail_batch(
+                    event,
+                    items,
+                    request,
+                    PAYLOAD_CORRUPT,
+                    "batch item slice is outside the response payload",
+                )
+                return
+            slices[item.spec.operation_id] = (offset, offset + length)
+            spans.append((offset, offset + length))
+        spans.sort()
+        cursor = 0
+        for start, end in spans:
+            if start < cursor:
+                self._fail_batch(
+                    event,
+                    items,
+                    request,
+                    PAYLOAD_CORRUPT,
+                    "batch item slices overlap",
+                )
+                return
+            cursor = end
+        timings: dict[str, int] = {}
+        for item in items:
+            start, end = slices[item.spec.operation_id]
+            try:
+                self._apply_retrieve(
+                    event=event,
+                    group_id=group_id,
+                    request=request,
+                    resource_id=item.spec.resource_id,
+                    chunk=item.chunk,
+                    boundary=item.boundary,
+                    payload=raw[start:end],
+                    timings=timings,
+                )
+            except (ValueError, RuntimeError, IndexError, KeyError) as exc:
+                with self._lock:
+                    self._counters["payload_corrupt"] += 1
+                self._fail_batch(
+                    event,
+                    items,
+                    request,
+                    PAYLOAD_CORRUPT,
+                    f"retrieved payload rejected: {exc}",
+                )
+                return
+            self._terminal_ops.add(self._load_terminal_key(
+                group_id, request, item
+            ))
+        # Each logical item still resolves the group's outstanding-unit count;
+        # the batch only replaces the transport calls.
+        for _ in items:
+            event.complete()
+        self._trace_load_terminal(event, request.step_id, "ok")
+        self._trace_load_callback(
+            group_id=group_id,
+            request=request,
+            resource_id=items[0].spec.resource_id,
+            item_count=len(items),
+            batch_id=batch_id,
+            submitted_key=batch_id,
+            status="ok",
+            started=started,
+            timings=timings,
+        )
+
+    def _fail_batch(
+        self,
+        event: GroupEvent,
+        items: list[_LoadItem],
+        request: TransferRequest,
+        error_code: str,
+        message: str,
+    ) -> None:
+        """Fail the whole group; late items in this batch stay terminal too."""
+        for item in items:
+            self._terminal_ops.add(
+                self._load_terminal_key(event.group_id, request, item)
+            )
+        event.fail(
+            resource_id=items[0].spec.resource_id,
+            error_code=error_code,
+            message=message,
+        )
+
+    def _load_terminal_key(
+        self, group_id: str, request: TransferRequest, item: _LoadItem
+    ) -> tuple[str, str, str, int, str, int]:
+        chunk_start = (
+            item.chunk.start_token
+            if item.chunk is not None
+            else int(request.load_prefix_end)
+        )
+        return (
+            group_id,
+            request.request_id,
+            _LOAD,
+            request.step_id,
+            item.spec.resource_id,
+            chunk_start,
+        )
+
     def _submit_retrieve(
         self,
         *,
@@ -1458,6 +1977,8 @@ class DSV41LwV2GroupAdapter:
         event = self._load_events[
             (group_id, request.request_id, spec.step_id)
         ]
+        if _mask_trace_enabled():
+            self._trace_load_submitted[spec.operation_id] = time.monotonic_ns()
         try:
             future = self._transport.retrieve_resource_block(spec)
         except Exception as exc:  # noqa: BLE001 - reported through the event
@@ -1467,14 +1988,19 @@ class DSV41LwV2GroupAdapter:
                 message=f"retrieve submit failed: {exc}",
             )
             return
+        with self._lock:
+            self._counters["single_load_rpcs"] += 1
         future.add_done_callback(
-            lambda done, rid=resource_id: self._on_retrieve_done(
-                group_id=group_id,
-                request=request,
-                resource_id=rid,
-                chunk=chunk,
-                boundary=boundary,
-                future=done,
+            lambda done, rid=resource_id, oid=spec.operation_id: (
+                self._on_retrieve_done(
+                    group_id=group_id,
+                    request=request,
+                    resource_id=rid,
+                    chunk=chunk,
+                    boundary=boundary,
+                    operation_id=oid,
+                    future=done,
+                )
             )
         )
 
@@ -1486,8 +2012,11 @@ class DSV41LwV2GroupAdapter:
         resource_id: str,
         chunk: _ChunkRef | None,
         boundary: bool,
+        operation_id: str,
         future: Future,
     ) -> None:
+        started_callback = time.monotonic_ns() if _mask_trace_enabled() else 0
+        timings: dict[str, int] = {}
         key = (group_id, request.request_id, request.step_id)
         event = self._load_events.get(key)
         if event is None or event.is_terminal:
@@ -1553,6 +2082,7 @@ class DSV41LwV2GroupAdapter:
                 chunk=chunk,
                 boundary=boundary,
                 payload=payload,
+                timings=timings,
             )
         except (ValueError, RuntimeError, IndexError, KeyError) as exc:
             self._terminal_ops.add(terminal)
@@ -1567,6 +2097,17 @@ class DSV41LwV2GroupAdapter:
         self._terminal_ops.add(terminal)
         event.complete()
         self._trace_load_terminal(event, request.step_id, "ok")
+        self._trace_load_callback(
+            group_id=group_id,
+            request=request,
+            resource_id=resource_id,
+            item_count=1,
+            batch_id="",
+            submitted_key=operation_id,
+            status="ok",
+            started=started_callback,
+            timings=timings,
+        )
 
     def _apply_retrieve(
         self,
@@ -1578,12 +2119,14 @@ class DSV41LwV2GroupAdapter:
         chunk: _ChunkRef | None,
         boundary: bool,
         payload: Any,
+        timings: dict[str, int] | None = None,
     ) -> None:
         if not isinstance(payload, (bytes, bytearray)):
             raise ValueError("retrieved payload is not bytes")
         if boundary:
             if not bytes(payload).startswith(BOUNDARY_PAYLOAD_MAGIC):
                 raise ValueError("boundary payload has no schema-2 envelope")
+            started_apply = time.monotonic_ns() if timings is not None else 0
             with self._lock:
                 self._boundary_payloads[
                     (
@@ -1592,9 +2135,22 @@ class DSV41LwV2GroupAdapter:
                         int(request.load_prefix_end),
                     )
                 ] = bytes(payload)
+            if timings is not None:
+                timings["host_apply_ns"] = (
+                    timings.get("host_apply_ns", 0)
+                    + time.monotonic_ns()
+                    - started_apply
+                )
             return
         assert chunk is not None
+        started_decode = time.monotonic_ns() if timings is not None else 0
         planes = decode_token_payload(bytes(payload), resource_id=resource_id)
+        if timings is not None:
+            timings["payload_decode_ns"] = (
+                timings.get("payload_decode_ns", 0)
+                + time.monotonic_ns()
+                - started_decode
+            )
         expected_rows = len(chunk.block_ids)
         if not planes:
             raise ValueError("token payload has no planes")
@@ -1621,11 +2177,18 @@ class DSV41LwV2GroupAdapter:
                 value = plane.reshape((expected_rows, *target.shape[1:]))
             device = target.device
             index = torch.as_tensor(chunk.block_ids, dtype=torch.long)
+            started_copy = time.monotonic_ns() if timings is not None else 0
             if device.type == "cuda":
                 stream = self._copy_stream_for(device)
                 copy_events.append(_copy_rows(target, index, value, stream=stream))
             else:
                 _copy_rows(target, index, value)
+            if timings is not None:
+                timings["row_copy_ns"] = (
+                    timings.get("row_copy_ns", 0)
+                    + time.monotonic_ns()
+                    - started_copy
+                )
         for copy_event in copy_events:
             event.add_copy_event(copy_event)
 
@@ -1936,6 +2499,57 @@ class DSV41LwV2GroupAdapter:
     # ------------------------------------------------------------------
     # Default-off mask timeline (see mask_trace.py)
     # ------------------------------------------------------------------
+
+    def _trace_load_callback(
+        self,
+        *,
+        group_id: str,
+        request: TransferRequest,
+        resource_id: str,
+        item_count: int,
+        batch_id: str,
+        submitted_key: str,
+        status: str,
+        started: int,
+        timings: dict[str, int],
+    ) -> None:
+        """Emit the receive-loop callback span and maintain HOL counters.
+
+        ``submit_to_ready_ns`` is the time between the RPC submit and the
+        callback entry (future already ready).  The remaining buckets cover
+        response/payload decode, host apply and the device copy.  All of it is
+        host-clock only and exists only when the mask trace is enabled.
+        """
+        if not _mask_trace_enabled() or not started:
+            return
+        now = time.monotonic_ns()
+        submitted = self._trace_load_submitted.pop(submitted_key, 0)
+        total = max(0, now - started)
+        with self._lock:
+            self._counters["load_callback_count"] += 1
+            self._counters["load_callback_total_ns"] += total
+            if total > self._counters["load_callback_max_ns"]:
+                self._counters["load_callback_max_ns"] = total
+        mask_trace.emit(
+            "load_callback",
+            phase="load",
+            step_id=int(request.step_id),
+            group_id=group_id,
+            request_id=request.request_id,
+            resource_id=resource_id,
+            batch=bool(batch_id),
+            batch_id=batch_id,
+            items=int(item_count),
+            status=status,
+            submit_to_ready_ns=(
+                max(0, started - submitted) if submitted else 0
+            ),
+            response_decode_ns=int(timings.get("response_decode_ns", 0)),
+            payload_decode_ns=int(timings.get("payload_decode_ns", 0)),
+            host_apply_ns=int(timings.get("host_apply_ns", 0)),
+            device_copy_ns=int(timings.get("row_copy_ns", 0)),
+            total_ns=total,
+        )
 
     def _trace_load_terminal(
         self, event: GroupEvent, step_id: int, status: str
@@ -3472,3 +4086,35 @@ class _LoadJob:
     request: TransferRequest
     step: StepView
     chunks: tuple[_ChunkRef, ...]
+
+
+@dataclass(frozen=True)
+class _LoadItem:
+    """One logical retrieve item; the batching container only groups RPCs."""
+
+    spec: ResourceBlockSpec
+    chunk: _ChunkRef | None
+    boundary: bool
+
+
+class _LoadPrepareError(Exception):
+    """A logical load item could not be built; fail the group closed."""
+
+    def __init__(self, resource_id: str, error_code: str, message: str):
+        super().__init__(message)
+        self.resource_id = resource_id
+        self.error_code = error_code
+        self.message = message
+
+
+def _batch_error_code(status: str, code: str) -> str:
+    """Map a batch status to the single-path error vocabulary."""
+    if code:
+        return code
+    if status == STATUS_MISS:
+        return RESOURCE_MISSING
+    if status == STATUS_INVALID:
+        return INVALID_SPEC
+    if status == "partial":
+        return PREFIX_INCOMPLETE
+    return IO_ERROR
